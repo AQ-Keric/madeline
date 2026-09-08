@@ -1,0 +1,27 @@
+# Secretos
+.env
+
+# Entorno virtual Python
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Flutter / Dart
+jarvis_mobile/.dart_tool/
+jarvis_mobile/build/
+jarvis_mobile/.flutter-plugins
+jarvis_mobile/.flutter-plugins-dependencies
+
+# IDE
+.idea/
+.vscode/
+
+# Temporales
+tmp/
+temp/
+*.log
