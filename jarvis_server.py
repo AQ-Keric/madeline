@@ -4,21 +4,25 @@ import os
 import random
 import re
 import json
+import secrets
+import shlex
 import shutil
 import subprocess
+import sys
+import threading
 import time
 import urllib.parse
 import base64
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 import edge_tts
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from groq import Groq
-from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, BackgroundTasks
-from fastapi.responses import FileResponse
+from groq import Groq, RateLimitError
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -37,24 +41,25 @@ if not GROQ_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# Modelo pequeño para interpretar comandos ambiguos.
-# Los comandos simples se resuelven localmente y NO llegan a Groq.
+# Modelo para lo que el router local no resuelve (preguntas libres,
+# comandos ambiguos). Los comandos simples NO llegan a Groq.
 MODEL = "openai/gpt-oss-120b"
 # llama-3.3-70b-versatile fue dado de baja por Groq (anunciado el 17
 # de junio de 2026). Este es el reemplazo que ellos mismos recomiendan
 # para casos con function calling — sigue soportando tools igual.
 
-# Solo mantenemos un turno anterior para conversaciones que realmente
-# necesiten contexto. Los comandos locales no usan esta memoria.
+# Último turno completo (pregunta + respuesta) más el mensaje actual.
+# Con 2 se perdía la pregunta anterior y Groq veía solo su propia
+# respuesta, así que las preguntas de seguimiento no funcionaban.
+# Los comandos locales no usan esta memoria.
 historial_chat = []
-MAX_HISTORIAL = 2
+MAX_HISTORIAL = 3
 
 # Memoria contextual ligera: no se envía a Groq salvo que una pregunta
 # realmente necesite contexto.
 memoria_contexto = {
     "cancion": None,
     "ultimo_resultado": None,
-    "ultimo_tema": None,
     # Acción destructiva esperando un "sí"/"no" del usuario antes de
     # ejecutarse (ver sección de energía en router_local). None = no
     # hay nada pendiente.
@@ -70,6 +75,40 @@ app = FastAPI(title="Jarvis API", description="API para el asistente Jarvis opti
 CARPETA_AUDIOS = "/tmp/jarvis_audios"
 os.makedirs(CARPETA_AUDIOS, exist_ok=True)
 app.mount("/audios", StaticFiles(directory=CARPETA_AUDIOS), name="audios")
+
+# ------------------------------------------------------------
+# AUTENTICACIÓN
+# ------------------------------------------------------------
+# Sin esto, cualquiera en tu WiFi podía apagar el PC o sacar capturas
+# de tu pantalla. Con JARVIS_TOKEN en el .env, toda petición que venga
+# de la red tiene que traer el header X-Jarvis-Token.
+#
+# Exentos:
+# - lo que viene del mismo PC (jarvis_mic.sh, la bienvenida de Hyprland),
+# - /audios/ y /captura/: los nombres son aleatorios, duran pocos
+#   minutos, y el reproductor de audio de la app no puede mandar headers.
+JARVIS_TOKEN = os.getenv("JARVIS_TOKEN", "").strip()
+RUTAS_SIN_TOKEN = ("/audios/", "/captura/")
+
+if not JARVIS_TOKEN:
+    print("[!] JARVIS_TOKEN no está en el .env: el servidor queda ABIERTO a toda la red local.")
+
+
+@app.middleware("http")
+async def verificar_token(request: Request, call_next):
+    if not JARVIS_TOKEN:
+        return await call_next(request)
+
+    cliente = request.client.host if request.client else ""
+    if cliente in ("127.0.0.1", "::1") or request.url.path.startswith(RUTAS_SIN_TOKEN):
+        return await call_next(request)
+
+    token = request.headers.get("x-jarvis-token", "")
+    if not secrets.compare_digest(token.encode(), JARVIS_TOKEN.encode()):
+        print(f"[!] Petición rechazada sin token válido desde {cliente}: {request.url.path}")
+        return JSONResponse(status_code=401, content={"detail": "Token de Jarvis inválido."})
+
+    return await call_next(request)
 
 class ChatRequest(BaseModel):
     message: str
@@ -154,7 +193,11 @@ def cerrar_aplicacion(app_name: str) -> str:
     y PROCESOS_CIERRE para los casos donde el proceso real a matar no
     es el mismo binario que se ejecutó al abrir (ej: Minecraft corre
     como "java" aunque se abra con "prismlauncher")."""
-    nombre_tecnico = DICCIONARIO_APPS.get(app_name.lower(), app_name.lower())
+    nombre_tecnico = resolver_app(app_name)
+
+    if not nombre_tecnico:
+        return mensaje_app_desconocida("cerrar", app_name)
+
     procesos = PROCESOS_CIERRE.get(nombre_tecnico, [nombre_tecnico])
 
     cerrado_alguno = False
@@ -250,14 +293,7 @@ def abrir_radio_musica() -> str:
             stderr=subprocess.DEVNULL,
         )
 
-        nombre_tecnico = DICCIONARIO_APPS.get("navegador", "zen-browser")
-
-        # "-new-tab": pestaña nueva EN LA VENTANA QUE YA ESTÁ ABIERTA,
-        # no una ventana aparte.
-        subprocess.Popen([
-            "hyprctl", "dispatch", "exec",
-            f'{nombre_tecnico} -new-tab "{RADIO_YOUTUBE_MUSIC}"',
-        ])
+        abrir_url_en_navegador(RADIO_YOUTUBE_MUSIC)
 
         return "Abriendo tu radio en YouTube Music"
 
@@ -265,24 +301,25 @@ def abrir_radio_musica() -> str:
         return f"No pude abrir la radio: {e}"
 
 
-def reiniciar_servidor_jarvis() -> str:
-    """Reinicia el PROCESO de Jarvis (no el sistema operativo) a
-    través de systemd, para poder aplicar cambios de código después
-    de editar el archivo, sin necesitar una terminal.
+def _reemplazar_proceso_jarvis():
+    print("[*] Reiniciando el proceso de Jarvis...", flush=True)
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
-    Necesita que el server corra como servicio systemd --user llamado
-    'jarvis-server' (ver instrucciones de instalación) — si no está
-    armado así, esto no hace nada."""
-    try:
-        subprocess.Popen(
-            ["systemctl", "--user", "restart", "jarvis-server"]
-        )
-        return (
-            "Reiniciando el servidor de Jarvis. "
-            "Va a tardar unos segundos en volver."
-        )
-    except Exception as e:
-        return f"No pude reiniciar el servidor: {e}"
+
+def reiniciar_servidor_jarvis() -> str:
+    """Reinicia el PROCESO de Jarvis (no el sistema operativo), para
+    aplicar cambios de código sin necesitar una terminal.
+
+    Antes usaba systemctl --user restart jarvis-server, pero ese
+    servicio no existe: Jarvis arranca con un exec-once de Hyprland.
+    os.execv reemplaza este proceso por uno nuevo con el código
+    actualizado (mismo PID, así que sigue colgado del exec-once).
+    Se espera unos segundos para que alcance a responder y hablar."""
+    threading.Timer(6, _reemplazar_proceso_jarvis).start()
+    return (
+        "Reiniciando el servidor de Jarvis. "
+        "Va a tardar unos segundos en volver."
+    )
 
 
 def control_energia(accion: str) -> str:
@@ -344,25 +381,33 @@ def actualizar_sistema() -> str:
 def verificar_actualizaciones() -> str:
     """Cuenta cuántos paquetes tienen actualización pendiente, SIN
     aplicarlas — para responder '¿tengo actualizaciones pendientes?'
-    sin disparar la actualización completa."""
+    sin disparar la actualización completa.
+
+    checkupdates solo mira los repos oficiales, así que los paquetes
+    del AUR se cuentan aparte con paru/yay -Qua."""
+    def contar(comando: list) -> int:
+        resultado = subprocess.run(
+            comando, capture_output=True, text=True, timeout=30
+        )
+        return len([l for l in resultado.stdout.splitlines() if l.strip()])
+
     try:
         gestor = gestor_paquetes_disponible()
 
         if shutil.which("checkupdates"):
-            resultado = subprocess.run(
-                ["checkupdates"], capture_output=True, text=True, timeout=20
-            )
-            lineas = [l for l in resultado.stdout.strip().splitlines() if l]
+            oficiales = contar(["checkupdates"])
         else:
-            resultado = subprocess.run(
-                [gestor, "-Qu"], capture_output=True, text=True, timeout=20
-            )
-            lineas = [l for l in resultado.stdout.strip().splitlines() if l]
+            oficiales = contar(["pacman", "-Qu"])
 
-        if not lineas:
+        aur = contar([gestor, "-Qua"]) if gestor != "pacman" else 0
+
+        if not oficiales and not aur:
             return "El sistema ya está al día, no hay actualizaciones pendientes."
 
-        return f"Hay {len(lineas)} paquetes con actualización pendiente."
+        texto = f"Hay {oficiales + aur} paquetes con actualización pendiente"
+        if aur:
+            texto += f", {aur} de ellos del AUR"
+        return texto + "."
 
     except subprocess.TimeoutExpired:
         return "Se tardó demasiado revisando actualizaciones."
@@ -387,139 +432,202 @@ async def recordatorio_en_segundo_plano(segundos: int, mensaje: str):
     await hablar_por_parlantes(texto)
 
 
+# asyncio solo guarda referencias DÉBILES a las tareas: sin este set,
+# el recolector de basura podía borrar un recordatorio antes de que
+# sonara.
+RECORDATORIOS_ACTIVOS = set()
+
+
 def programar_recordatorio(cantidad: int, unidad: str, mensaje: str) -> str:
     """Programa el recordatorio en background y confirma de inmediato."""
     segundos = segundos_desde_unidad(cantidad, unidad)
-    asyncio.create_task(recordatorio_en_segundo_plano(segundos, mensaje))
+    tarea = asyncio.create_task(recordatorio_en_segundo_plano(segundos, mensaje))
+    RECORDATORIOS_ACTIVOS.add(tarea)
+    tarea.add_done_callback(RECORDATORIOS_ACTIVOS.discard)
     return f"Recordatorio programado para dentro de {cantidad} {unidad}: {mensaje}."
 
 
+APPS_CERRAR_TODO = ["navegador", "minecraft", "bottles"]
+
+
 def cerrar_todo() -> str:
-    """Mata todas las aplicaciones comunes de una pasada."""
-    apps_a_cerrar = ["zen", "zen-browser", "prismlauncher", "java", "bottles"]
+    """Cierra navegador y juegos de una pasada, reusando
+    cerrar_aplicacion (y por lo tanto PROCESOS_CIERRE) en vez de
+    mantener una lista de procesos aparte."""
+    cerradas = [
+        app for app in APPS_CERRAR_TODO
+        if cerrar_aplicacion(app).startswith("Se cerró")
+    ]
 
+    if not cerradas:
+        return "No había nada que cerrar."
+
+    return f"Protocolo de limpieza ejecutado. Cerré: {', '.join(cerradas)}."
+
+
+URL_CLIMA = "https://wttr.in/Villa+Alegre,Chile?format=j1&lang=es"
+
+# wttr.in da pronóstico de hoy + 2 días. Con lang=es la condición ya
+# viene en español (campo "lang_es"), así que no hace falta un
+# diccionario de traducción propio.
+DIAS_PRONOSTICO = {"hoy": 0, "mañana": 1, "pasado mañana": 2}
+
+
+def _condicion_es(bloque: dict) -> str:
     try:
-        for app_name in apps_a_cerrar:
-            subprocess.run(["killall", app_name], stderr=subprocess.DEVNULL)
-
-        return "Protocolo de limpieza ejecutado. Se cerraron navegadores y juegos."
-
-    except Exception as e:
-        return f"Hubo un drama cerrando todo: {e}"
+        return bloque["lang_es"][0]["value"].strip().lower()
+    except (KeyError, IndexError):
+        return bloque["weatherDesc"][0]["value"].strip().lower()
 
 
-# wttr.in devuelve la condición del clima en inglés. Diccionario de
-# traducción para las condiciones más comunes que devuelve la API.
-TRADUCCION_CLIMA = {
-    "clear": "despejado",
-    "sunny": "soleado",
-    "partly cloudy": "parcialmente nublado",
-    "cloudy": "nublado",
-    "overcast": "muy nublado",
-    "mist": "neblina",
-    "fog": "niebla",
-    "freezing fog": "niebla helada",
-    "patchy rain possible": "posibilidad de lluvia aislada",
-    "patchy rain nearby": "lluvia aislada cerca",
-    "patchy light rain": "lluvia ligera aislada",
-    "light rain": "lluvia ligera",
-    "light rain shower": "chubascos ligeros",
-    "moderate rain": "lluvia moderada",
-    "moderate rain at times": "lluvia moderada intermitente",
-    "heavy rain": "lluvia fuerte",
-    "heavy rain at times": "lluvia fuerte intermitente",
-    "torrential rain shower": "lluvia torrencial",
-    "patchy light drizzle": "llovizna ligera aislada",
-    "light drizzle": "llovizna ligera",
-    "thundery outbreaks possible": "posibilidad de tormenta eléctrica",
-    "patchy light snow": "nieve ligera aislada",
-    "light snow": "nieve ligera",
-    "moderate snow": "nieve moderada",
-    "heavy snow": "nieve fuerte",
-    "blizzard": "ventisca",
-    "patchy sleet possible": "posibilidad de aguanieve aislada",
-    "ice pellets": "granizo",
-    "moderate or heavy rain shower": "chubascos moderados o fuertes",
-    "moderate or heavy snow showers": "nevadas moderadas o fuertes",
-    "patchy freezing drizzle possible": "posibilidad de llovizna helada aislada",
-}
-
-
-def traducir_condicion_clima(condicion: str) -> str:
-    """Traduce una condición climática de wttr.in (inglés) al español.
-    Si no está en el diccionario, devuelve la original tal cual
-    (mejor mostrar algo en inglés que romper la respuesta)."""
-    return TRADUCCION_CLIMA.get(condicion.strip().lower(), condicion)
-
-
-def reporte_clima() -> str:
-    """Obtiene el clima de Villa Alegre mediante wttr.in, en español."""
+def reporte_clima(dia: str = "ahora") -> str:
+    """Clima de Villa Alegre: el actual ("ahora") o el pronóstico de
+    "hoy", "mañana" o "pasado mañana" (mínima, máxima y probabilidad
+    de lluvia). Todo local, sin gastar tokens de Groq."""
     try:
-        # %C = condición (texto, en inglés) / %t = temperatura
-        url = (
-            "https://wttr.in/Villa+Alegre,Chile"
-            "?format=%C|%t"
-        )
+        respuesta = requests.get(URL_CLIMA, timeout=8)
 
-        respuesta = requests.get(url, timeout=5)
-
-        if respuesta.status_code != 200 or "|" not in respuesta.text:
+        if respuesta.status_code != 200:
             return "No pude conectar con el satélite del clima."
 
-        condicion_cruda, temperatura = respuesta.text.strip().split("|", 1)
-        condicion_es = traducir_condicion_clima(condicion_cruda)
-        temperatura = temperatura.replace("+", "").strip()
+        datos = respuesta.json()
+        dia = (dia or "ahora").strip().lower().replace("_", " ")
 
-        return (
-            f"Actualmente está {condicion_es} en Villa Alegre, "
-            f"con una temperatura de {temperatura}."
+        if dia not in DIAS_PRONOSTICO:
+            actual = datos["current_condition"][0]
+            return (
+                f"Ahora mismo en Villa Alegre: {_condicion_es(actual)}, "
+                f"con {actual['temp_C']} grados."
+            )
+
+        pronostico = datos["weather"][DIAS_PRONOSTICO[dia]]
+        horas = pronostico["hourly"]
+        # El bloque de las 12:00 representa bien "cómo va a estar el día".
+        mediodia = horas[len(horas) // 2]
+        lluvia = max(int(h.get("chanceofrain", 0)) for h in horas)
+
+        texto = (
+            f"Para {dia} en Villa Alegre: {_condicion_es(mediodia)}, "
+            f"mínima de {pronostico['mintempC']} y máxima de "
+            f"{pronostico['maxtempC']} grados."
         )
+
+        if lluvia >= 20:
+            texto += f" Probabilidad de lluvia de hasta {lluvia}%."
+        else:
+            texto += " No se espera lluvia."
+
+        return texto
 
     except Exception as e:
         return f"Error consultando el clima: {e}"
 
 
+# ------------------------------------------------------------
+# SENSORES (compartido por estado_sistema y /sensores)
+# ------------------------------------------------------------
+# Se leen /proc y /sys directo en vez de "free | awk", "top -bn1" y
+# "cat" con shell=True: es más rápido (top tardaba ~0.5 s en cada
+# consulta del celular, cada 2 s) y más preciso (el primer muestreo
+# de top -bn1 no refleja bien el uso actual).
+
+_MUESTRA_CPU = None  # (momento, total, inactivo) de la lectura anterior
+
+
+def _leer_proc_stat():
+    with open("/proc/stat") as f:
+        # Solo los 8 primeros campos: guest y guest_nice ya vienen
+        # incluidos dentro de user y nice.
+        valores = [int(x) for x in f.readline().split()[1:9]]
+    # idle + iowait cuentan como tiempo inactivo
+    return sum(valores), valores[3] + valores[4]
+
+
+def uso_cpu() -> float:
+    """% de uso de CPU desde la lectura anterior. Si no hay una
+    lectura reciente (< 10 s), mide durante 0.2 s."""
+    global _MUESTRA_CPU
+
+    ahora = time.monotonic()
+    total, inactivo = _leer_proc_stat()
+
+    if _MUESTRA_CPU is None or ahora - _MUESTRA_CPU[0] > 10:
+        time.sleep(0.2)
+        total_previo, inactivo_previo = total, inactivo
+        ahora = time.monotonic()
+        total, inactivo = _leer_proc_stat()
+    else:
+        _, total_previo, inactivo_previo = _MUESTRA_CPU
+
+    _MUESTRA_CPU = (ahora, total, inactivo)
+
+    delta_total = total - total_previo
+    if delta_total <= 0:
+        return 0.0
+    return round(100 * (1 - (inactivo - inactivo_previo) / delta_total), 1)
+
+
+def leer_sensores() -> dict:
+    """RAM (MB), CPU (% y °C) y GPU NVIDIA (% y °C, None si está
+    apagada por el sistema híbrido o no hay nvidia-smi)."""
+    memoria = {}
+    with open("/proc/meminfo") as f:
+        for linea in f:
+            clave, valor = linea.split(":", 1)
+            memoria[clave] = int(valor.split()[0])  # en kB
+
+    ram_total = memoria["MemTotal"] // 1024
+    ram_usada = ram_total - memoria["MemAvailable"] // 1024
+
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            cpu_temp = int(f.read().strip()) // 1000
+    except Exception:
+        cpu_temp = None
+
+    try:
+        gpu_info = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3, check=True,
+        ).stdout.strip()
+        gpu_uso, gpu_temp = [x.strip() for x in gpu_info.split(",")]
+    except Exception:
+        gpu_uso, gpu_temp = None, None
+
+    return {
+        "ram_usada": ram_usada,
+        "ram_total": ram_total,
+        "cpu_uso": uso_cpu(),
+        "cpu_temp": cpu_temp,
+        "gpu_uso": gpu_uso,
+        "gpu_temp": gpu_temp,
+    }
+
+
+def _gb(megas: int) -> str:
+    # Con coma decimal, para que la voz lo lea "cinco coma dos".
+    return f"{megas / 1024:.1f}".replace(".", ",")
+
+
 def estado_sistema() -> str:
     """Lee la memoria RAM, porcentaje de CPU y temperaturas para que Jarvis hable."""
     try:
-        # RAM
-        ram = subprocess.check_output(
-            "free -h | awk '/^Mem:/ {print $3 \" ocupadas de \" $2}'",
-            shell=True
-        ).decode("utf-8").strip()
+        s = leer_sensores()
 
-        # CPU Uso
-        cpu = subprocess.check_output(
-            "top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'",
-            shell=True
-        ).decode("utf-8").strip()
+        cpu_temp = f"{s['cpu_temp']}°C" if s["cpu_temp"] is not None else "desconocida"
 
-        # CPU Temp
-        try:
-            cpu_temp_raw = subprocess.check_output(
-                "cat /sys/class/thermal/thermal_zone0/temp", shell=True
-            ).decode().strip()
-            cpu_temp = f"{int(cpu_temp_raw) // 1000}°C"
-        except Exception:
-            cpu_temp = "desconocida"
-
-        # GPU NVIDIA
-        try:
-            gpu_info = subprocess.check_output(
-                "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu "
-                "--format=csv,noheader,nounits",
-                shell=True
-            ).decode("utf-8").strip()
-            gpu_uso, gpu_temp = gpu_info.split(', ')
+        if s["gpu_uso"] is not None:
             info_gpu = (
-                f"La tarjeta gráfica NVIDIA está al {gpu_uso}% "
-                f"de uso con {gpu_temp}°C."
+                f"La tarjeta gráfica NVIDIA está al {s['gpu_uso']}% "
+                f"de uso con {s['gpu_temp']}°C."
             )
-        except Exception:
+        else:
             info_gpu = "La tarjeta de video dedicada está en reposo."
 
         return (
-            f"Estado actual: RAM {ram}. Procesador al {cpu}% "
+            f"Estado actual: RAM {_gb(s['ram_usada'])} gigas ocupadas de "
+            f"{_gb(s['ram_total'])}. Procesador al {s['cpu_uso']:.0f}% "
             f"con una temperatura de {cpu_temp}. {info_gpu}"
         )
 
@@ -527,7 +635,7 @@ def estado_sistema() -> str:
         return f"No pude leer los sensores: {e}"
 
 
-def tomar_captura() -> str:
+def tomar_captura(ancho_max: int = 1920) -> str:
     """Saca la captura usando grim en Hyprland y la comprime a JPEG.
 
     Cada captura se guarda con un ID único (uuid) en vez de un nombre
@@ -552,10 +660,10 @@ def tomar_captura() -> str:
             with Image.open(ruta_png) as img:
                 img = img.convert("RGB")
 
-                if img.width > 1920:
-                    ratio = 1920 / img.width
+                if img.width > ancho_max:
+                    ratio = ancho_max / img.width
                     img = img.resize(
-                        (1920, int(img.height * ratio))
+                        (ancho_max, int(img.height * ratio))
                     )
 
                 img.save(
@@ -598,7 +706,7 @@ def ruta_captura_disponible(captura_id: str) -> str | None:
 MODEL_VISION = "qwen/qwen3.6-27b"
 
 # ID de la captura de la última llamada a analizar_pantalla(), para
-# que chat_endpoint pueda devolverla como imagen junto con la
+# que procesar_mensaje pueda devolverla como imagen junto con la
 # respuesta hablada. None = no hay ninguna pendiente de devolver.
 ULTIMA_CAPTURA_ANALISIS = None
 
@@ -709,13 +817,16 @@ def analizar_pantalla(pregunta: str) -> str:
     cualquier otra tool — nada fuera de lo normal.
 
     A diferencia de antes, NO borra la captura al terminar: la deja
-    disponible para que chat_endpoint también te la devuelva como
+    disponible para que procesar_mensaje también te la devuelva como
     imagen (ver ULTIMA_CAPTURA_ANALISIS más abajo), igual que ya hace
     el comando de captura normal."""
     global ULTIMA_CAPTURA_ANALISIS
     ULTIMA_CAPTURA_ANALISIS = None
 
-    resultado_captura = tomar_captura()
+    # 1280 px en vez de 1920: el modelo de visión cobra por
+    # resolución, así gasta ~la mitad de tokens y el texto en
+    # pantalla se sigue leyendo bien.
+    resultado_captura = tomar_captura(ancho_max=1280)
 
     if not resultado_captura.startswith("CAPTURA_LISTA"):
         return resultado_captura
@@ -772,7 +883,7 @@ def analizar_pantalla(pregunta: str) -> str:
                 "alcanza."
             )
 
-        # Guardamos el ID para que chat_endpoint devuelva también la
+        # Guardamos el ID para que procesar_mensaje devuelva también la
         # foto analizada. El archivo se borra recién cuando el
         # cliente la pida por /captura/{id} (mismo mecanismo que la
         # captura normal, ver /captura/{captura_id} más abajo).
@@ -802,10 +913,19 @@ def enviar_captura_telegram(captura_id: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     try:
         with open(ruta, "rb") as foto:
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID}, files={"photo": foto})
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID}, files={"photo": foto}, timeout=15)
         print("[*] Captura enviada exitosamente a Telegram.")
     except Exception as e:
         print(f"[!] Error enviando captura a Telegram: {e}")
+
+
+HEADERS_BUSQUEDA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 
 def buscar_en_web(consulta: str) -> str:
@@ -816,17 +936,9 @@ def buscar_en_web(consulta: str) -> str:
         query = urllib.parse.quote(consulta)
         url = f"https://html.duckduckgo.com/html/?q={query}"
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-
         respuesta = requests.get(
             url,
-            headers=headers,
+            headers=HEADERS_BUSQUEDA,
             timeout=10
         )
 
@@ -853,15 +965,6 @@ def buscar_en_web(consulta: str) -> str:
         error_msg = f"Error crítico en el módulo de búsqueda: {e}"
         print(f"[*] {error_msg}")
         return error_msg
-
-
-HEADERS_BUSQUEDA = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
-}
 
 
 def buscar_urls_duckduckgo(consulta: str, cantidad: int = 3) -> list:
@@ -924,16 +1027,31 @@ def buscar_urls_arxiv(consulta: str, cantidad: int = 3) -> list:
         return []
 
 
+def abrir_url_en_navegador(url: str) -> bool:
+    """Abre UNA URL como pestaña nueva en la ventana ya abierta del
+    navegador ("-new-tab", no una ventana aparte).
+
+    hyprctl dispatch exec le pasa su argumento a una shell, y las URLs
+    vienen de resultados de búsqueda (o sea, de páginas ajenas): una
+    URL con comillas o $(...) podía ejecutar comandos. Por eso solo se
+    aceptan http/https y la URL va escapada con shlex.quote."""
+    if not url.startswith(("http://", "https://")):
+        print(f"[!] URL descartada (no es http/https): {url}")
+        return False
+
+    nombre_tecnico = DICCIONARIO_APPS.get("navegador", "zen-browser")
+    subprocess.Popen([
+        "hyprctl", "dispatch", "exec",
+        f"{nombre_tecnico} -new-tab {shlex.quote(url)}",
+    ])
+    return True
+
+
 def abrir_pestanas_navegador(urls: list):
     """Abre cada URL como pestaña nueva, en la ventana que ya está
     abierta (no una ventana por URL)."""
-    nombre_tecnico = DICCIONARIO_APPS.get("navegador", "zen-browser")
-
     for url in urls:
-        subprocess.Popen([
-            "hyprctl", "dispatch", "exec",
-            f'{nombre_tecnico} -new-tab "{url}"',
-        ])
+        abrir_url_en_navegador(url)
         # Un respiro entre pestañas para no saturar al navegador
         # abriendo todas de una en el mismo instante.
         time.sleep(0.3)
@@ -1007,6 +1125,9 @@ DISPOSITIVOS_BLUETOOTH = {
     # "alexa": "AA:BB:CC:DD:EE:FF",
     # "auriculares": "11:22:33:44:55:66",
     "alexa": "2C:71:FF:6D:CD:88",
+    "audífonos": "7C:7B:BF:B3:3E:7D",
+    "audifonos": "7C:7B:BF:B3:3E:7D",
+    "buds": "7C:7B:BF:B3:3E:7D",
 }
 
 
@@ -1110,6 +1231,36 @@ def clase_ventana(nombre_tecnico: str) -> str:
     return CLASES_VENTANA.get(nombre_tecnico, nombre_tecnico)
 
 
+# Lista blanca: solo se abre/cierra/mueve lo que está en
+# DICCIONARIO_APPS. Antes, un nombre desconocido se usaba tal cual,
+# y como app_name puede venir de Groq (o sea, del texto que sea), eso
+# terminaba en hyprctl exec (que corre en una shell) o en pkill -f
+# (donde "." mata todos tus procesos).
+APPS_PERMITIDAS = set(DICCIONARIO_APPS.values())
+
+
+def resolver_app(app_name: str) -> str | None:
+    """Devuelve el nombre técnico de una app conocida, o None si no
+    está en la lista blanca. Acepta tanto el alias ("discord") como
+    el nombre técnico directo ("vesktop")."""
+    nombre = (app_name or "").strip().lower()
+
+    if nombre in DICCIONARIO_APPS:
+        return DICCIONARIO_APPS[nombre]
+    if nombre in APPS_PERMITIDAS:
+        return nombre
+    return None
+
+
+def mensaje_app_desconocida(verbo: str, app_name: str) -> str:
+    # Empieza con "No pude" para que respuesta_local lo trate como
+    # error y no le anteponga un "Por supuesto, señor."
+    return (
+        f"No pude {verbo} '{app_name}': no está en mi lista de "
+        f"aplicaciones. Agrégala a DICCIONARIO_APPS si la quiere usar."
+    )
+
+
 VERBOS_APP = {
     "abrir": [
         "abre", "abres", "abrir", "ábreme",
@@ -1161,20 +1312,31 @@ def extraer_apps_de_fragmento(fragmento: str) -> list:
 
 def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
     """Abre una aplicación y opcionalmente la mueve a un escritorio."""
-    try:
-        nombre_tecnico = DICCIONARIO_APPS.get(app_name.lower(), app_name.lower())
+    nombre_tecnico = resolver_app(app_name)
 
+    if not nombre_tecnico:
+        return mensaje_app_desconocida("abrir", app_name)
+
+    try:
         if escritorio:
+            escritorio = int(escritorio)
             clase = clase_ventana(nombre_tecnico)
 
-            comando_magico = (
-                f"hyprctl dispatch exec {nombre_tecnico} && "
-                f"sleep 2 && "
-                f"hyprctl dispatch movetoworkspacesilent "
-                f"{escritorio},class:.*{clase}.*"
+            subprocess.Popen(
+                ["hyprctl", "dispatch", "exec", nombre_tecnico]
             )
 
-            subprocess.Popen(comando_magico, shell=True)
+            # Antes era un "exec && sleep 2 && move" con shell=True.
+            # Mismo efecto, pero sin shell: el movimiento se agenda en
+            # un hilo aparte para no bloquear el servidor esos 2 s.
+            threading.Timer(
+                2,
+                subprocess.run,
+                args=([
+                    "hyprctl", "dispatch", "movetoworkspacesilent",
+                    f"{escritorio},class:.*{clase}.*",
+                ],),
+            ).start()
 
             return (
                 f"{app_name} se está abriendo "
@@ -1193,8 +1355,13 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
 
 def mover_ventana(app_name: str, escritorio: int) -> str:
     """Mueve una ventana a un escritorio específico."""
+    nombre_tecnico = resolver_app(app_name)
+
+    if not nombre_tecnico:
+        return mensaje_app_desconocida("mover", app_name)
+
     try:
-        nombre_tecnico = DICCIONARIO_APPS.get(app_name.lower(), app_name.lower())
+        escritorio = int(escritorio)
         clase = clase_ventana(nombre_tecnico)
 
         argumento_hyprland = (
@@ -1333,10 +1500,15 @@ tools = [
         "type": "function",
         "function": {
             "name": "reporte_clima",
-            "description": "Obtiene el clima actual de Villa Alegre.",
+            "description": "Clima actual o pronóstico (hasta pasado mañana) de Villa Alegre.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "dia": {
+                        "type": "string",
+                        "enum": ["ahora", "hoy", "mañana", "pasado mañana"],
+                    },
+                },
             },
         },
     },
@@ -1579,6 +1751,37 @@ tools = [
 ]
 
 
+# Nombre de la tool (el mismo del schema de arriba) -> función.
+# Reemplaza la cadena de if/elif que repetía cada nombre a mano.
+# control_energia NO está acá a propósito: pasa siempre por la
+# confirmación (ver procesar_mensaje).
+TOOLS_FUNCIONES = {
+    "ajustar_volumen": ajustar_volumen,
+    "cerrar_aplicacion": cerrar_aplicacion,
+    "control_multimedia": control_multimedia,
+    "info_cancion": info_cancion,
+    "cerrar_todo": cerrar_todo,
+    "reporte_clima": reporte_clima,
+    "estado_sistema": estado_sistema,
+    "tomar_captura": tomar_captura,
+    "buscar_en_web": buscar_en_web,
+    "abrir_aplicacion": abrir_aplicacion,
+    "mover_ventana": mover_ventana,
+    "controlar_bluetooth": controlar_bluetooth,
+    "conectar_bluetooth": conectar_bluetooth,
+    "desconectar_bluetooth": desconectar_bluetooth,
+    "actualizar_sistema": actualizar_sistema,
+    "verificar_actualizaciones": verificar_actualizaciones,
+    "abrir_radio_musica": abrir_radio_musica,
+    "abrir_pestanas_busqueda": abrir_pestanas_busqueda,
+    "analizar_pantalla": analizar_pantalla,
+}
+
+assert set(TOOLS_FUNCIONES) | {"control_energia"} == {
+    t["function"]["name"] for t in tools
+}, "TOOLS_FUNCIONES y el schema de tools no coinciden"
+
+
 # ============================================================
 # ROUTER LOCAL
 # ============================================================
@@ -1759,6 +1962,138 @@ def extraer_recordatorio(texto_original: str):
     return cantidad, unidad, mensaje
 
 
+# ------------------------------------------------------------
+# PATRONES DE ÓRDENES CORTAS (música, volumen, captura, clima)
+# ------------------------------------------------------------
+# Antes bastaba con que la palabra APARECIERA en cualquier parte:
+# "¿cuál es el siguiente feriado?" saltaba de canción, "sube el
+# brillo" subía el volumen y "¿qué es una pausa activa?" pausaba la
+# música — y como el router local corta antes de Groq, esas preguntas
+# nunca recibían respuesta. Ahora la orden tiene que estar al INICIO
+# (del mensaje o después de "y"/coma) y TERMINAR ahí (fin, puntuación
+# u otra orden con "y").
+
+INICIO_ORDEN = (
+    r"(?:^|[,;.]\s*|\by\s+|\be\s+)"
+    r"[¿¡]?\s*(?:oye\s+)?(?:jarvis\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
+    r"(?:(?:puedes|podr[ií]as)\s+)?"
+)
+FIN_ORDEN = r"(?=\s*(?:[.,;!?]|\by\b|\be\b|$))"
+OBJETO_MUSICA = (
+    r"(?:\s+(?:la\s+|el\s+|de\s+)?"
+    r"(?:m[uú]sica|canci[oó]n|video|reproducci[oó]n|tema))?"
+)
+
+VERBOS_MULTIMEDIA = {
+    "pausar": r"pausa|pausar|pon pausa|det[eé]n|para",
+    "reproducir": r"reanuda|reanudar|contin[uú]a|dale play|play|reproduce|reproducir",
+    "siguiente": r"siguiente|la siguiente|next|pasa|cambia|otra|siguiente canci[oó]n",
+    "anterior": r"anterior|la anterior|previous|vuelve atr[aá]s|retrocede|canci[oó]n anterior",
+}
+
+PATRON_CAPTURA = (
+    r"\b(?:screenshot|pantallazo)\b"
+    r"|\b(?:toma|tómame|tomame|saca|sácame|sacame|haz|hazme|tomar|sacar|hacer)\s+"
+    r"(?:una\s+|un\s+)?captura\b"
+    + "|" + INICIO_ORDEN + r"captura(?:\s+(?:de\s+)?(?:la\s+)?pantalla)?" + FIN_ORDEN
+)
+
+VERBOS_SUBIR = r"sube|subir|s[uú]bele|aumenta|incrementa|dale m[aá]s|m[aá]s"
+VERBOS_BAJAR = r"baja|bajar|b[aá]jale|disminuye|reduce|dale menos|menos"
+VERBOS_FIJAR = r"pon|ponme|deja|ajusta|fija|setea|cambia"
+
+PATRON_VOLUMEN = (
+    INICIO_ORDEN
+    + rf"(?P<verbo>{VERBOS_SUBIR}|{VERBOS_BAJAR}|{VERBOS_FIJAR})?"
+    + r"\s*(?P<objeto>(?:el\s+)?(?:volumen|audio|sonido))?"
+    + r"(?:\s+un\s+(?:poco|poquito)(?:\s+m[aá]s)?)?"
+    + r"(?:\s*(?P<prep>en|un|a|al)?\s*(?P<numero>\d{1,3})\s*(?:%|por\s*ciento)?)?"
+    + FIN_ORDEN
+)
+
+
+def extraer_orden_volumen(t: str):
+    """Devuelve los argumentos de ajustar_volumen, o None.
+
+    "sube el volumen 20" / "súbele" -> subir; "baja el volumen al 30"
+    -> setear 30 (antes bajaba 30 puntos); "sube el brillo" -> None."""
+    for match in re.finditer(PATRON_VOLUMEN, t):
+        verbo, objeto, prep, numero = match.group("verbo", "objeto", "prep", "numero")
+
+        if not verbo and not objeto:
+            continue
+
+        es_fijar = verbo and re.fullmatch(VERBOS_FIJAR, verbo)
+
+        if numero and (prep in ("a", "al") or es_fijar or not verbo):
+            if not objeto:
+                continue
+            return {"accion": "setear", "porcentaje": max(0, min(100, int(numero)))}
+
+        if es_fijar or not verbo:
+            continue
+
+        accion = "subir" if re.fullmatch(VERBOS_SUBIR, verbo) else "bajar"
+        return {"accion": accion, "porcentaje": int(numero or 10)}
+
+    return None
+
+
+def extraer_pedido_clima(t: str):
+    """Devuelve "ahora", "hoy", "mañana" o "pasado mañana" si el
+    mensaje pide el clima, o None. El pronóstico (hasta pasado
+    mañana) también se resuelve local: antes "¿llueve mañana?" se
+    mandaba a Groq, que solo tenía el clima actual para responder."""
+    if not re.search(
+        r"\b(?:clima|pron[oó]stico|qu[eé] tiempo hace|"
+        r"c[oó]mo est[aá] el tiempo|el tiempo (?:para |de )?(?:hoy|mañana)|"
+        r"va a llover|llover[aá]|llueve (?:hoy|mañana))\b",
+        t,
+    ):
+        return None
+
+    # wttr.in solo da 3 días: "la semana" u otros días van a Groq.
+    if re.search(r"\b(?:semana|noticias?|lunes|martes|miércoles|miercoles|"
+                 r"jueves|viernes|sábado|sabado|domingo)\b", t):
+        return None
+
+    if "pasado mañana" in t:
+        return "pasado mañana"
+    if re.search(r"\bmañana\b", t) and "esta mañana" not in t:
+        return "mañana"
+    if re.search(r"\b(?:hoy|pron[oó]stico|llover|lloverá|llueve)", t):
+        return "hoy"
+    return "ahora"
+
+
+# Charla corta que no necesita a Groq: "gracias" o "hola" gastaban
+# una llamada completa (prompt + tools) para contestar una frase.
+PATRON_CHARLA = re.compile(
+    r"^(?:oye\s+)?(?:jarvis\s*,?\s*)?"
+    r"(?P<tipo>(?:muchas\s+)?gracias|hola|buenas|buenos d[ií]as|buenas tardes|"
+    r"buenas noches|ok|okay|vale|listo|perfecto|genial|excelente)"
+    r"(?:\s*,?\s*jarvis)?[\s.!¡¿?]*$"
+)
+
+RESPUESTAS_CHARLA = {
+    "gracias": ["A su servicio, señor.", "Para eso estoy.", "Siempre es un placer, señor."],
+    "saludo": ["Hola, señor. ¿En qué puedo ayudarle?", "A sus órdenes, señor.", "Aquí estoy, señor."],
+    "ok": ["Perfecto.", "Aquí estaré si me necesita, señor.", "Muy bien, señor."],
+}
+
+
+def tipo_charla(t: str):
+    match = PATRON_CHARLA.match(t.strip())
+    if not match:
+        return None
+    palabra = match.group("tipo")
+    if "gracias" in palabra:
+        return "gracias"
+    if palabra.startswith(("hola", "buen")):
+        return "saludo"
+    return "ok"
+
+
 def router_local(texto: str):
     """Detecta múltiples comandos locales dentro del mismo mensaje."""
 
@@ -1789,6 +2124,10 @@ def router_local(texto: str):
 
         # Si no fue ni sí ni no, seguimos procesando el mensaje como
         # un comando nuevo y normal (no lo perdemos).
+
+    charla = tipo_charla(t_crudo)
+    if charla:
+        return [("charla", {"tipo": charla})]
 
     pregunta_pantalla = extraer_pedido_analisis_pantalla(texto)
     if pregunta_pantalla:
@@ -1821,49 +2160,16 @@ def router_local(texto: str):
             comandos.extend(pasos)
             break
 
-    if re.search(r"\b(clima|tiempo)\b", t) and not any(
-        palabra in t
-        for palabra in [
-            "noticia", "pronóstico", "pronostico",
-            "mañana", "semana"
-        ]
-    ):
-        comandos.append(("clima", {}))
+    clima = extraer_pedido_clima(t)
+    if clima:
+        comandos.append(("clima", {"dia": clima}))
 
-    if re.search(
-        r"\b(captura|screenshot|captura de pantalla|"
-        r"toma una captura|haz una captura|saca una captura)\b",
-        t
-    ):
+    if re.search(PATRON_CAPTURA, t):
         comandos.append(("captura", {}))
 
-    if re.search(
-        r"\b(pausa|pausar|pausa la música|pausa la musica|"
-        r"detén la música|deten la musica|para la música|para la musica)\b",
-        t
-    ):
-        comandos.append(("multimedia", {"accion": "pausar"}))
-
-    if re.search(
-        r"\b(reproduce|reproducir|reanuda|reanudar|"
-        r"continúa|continua|dale play)\b",
-        t
-    ):
-        comandos.append(("multimedia", {"accion": "reproducir"}))
-
-    if re.search(
-        r"\b(siguiente|siguiente canción|siguiente cancion|next|"
-        r"pasa la canción|pasa la cancion|otra canción|otra cancion)\b",
-        t
-    ):
-        comandos.append(("multimedia", {"accion": "siguiente"}))
-
-    if re.search(
-        r"\b(anterior|canción anterior|cancion anterior|previous|"
-        r"vuelve atrás|vuelve atras|retrocede)\b",
-        t
-    ):
-        comandos.append(("multimedia", {"accion": "anterior"}))
+    for accion, verbos in VERBOS_MULTIMEDIA.items():
+        if re.search(INICIO_ORDEN + rf"(?:{verbos}){OBJETO_MUSICA}{FIN_ORDEN}", t):
+            comandos.append(("multimedia", {"accion": accion}))
 
     if (
         "qué canción" in t
@@ -1875,49 +2181,15 @@ def router_local(texto: str):
     ):
         comandos.append(("info_cancion", {}))
 
-    match_subir = re.search(
-        r"\b(sub(?:e|ir)|s[uú]bele|aumenta|incrementa|"
-        r"dale m[aá]s volumen|m[aá]s volumen|aumenta el audio)\b"
-        r"(?:.{0,20}?(\d{1,3})\s*%?)?",
-        t
-    )
-
-    if match_subir:
-        porcentaje = int(match_subir.group(2) or 10)
-        comandos.append(("volumen", {
-            "accion": "subir",
-            "porcentaje": porcentaje,
-        }))
-
-    match_bajar = re.search(
-        r"\b(baja|bajar|b[aá]jale|disminuye|reduce|"
-        r"dale menos volumen|menos volumen)\b"
-        r"(?:.{0,20}?(\d{1,3})\s*%?)?",
-        t
-    )
-
-    if match_bajar:
-        porcentaje = int(match_bajar.group(2) or 10)
-        comandos.append(("volumen", {
-            "accion": "bajar",
-            "porcentaje": porcentaje,
-        }))
-
-    if not match_subir and not match_bajar:
-        match = re.search(
-            r"(?:volumen|volume).{0,20}?\b(?:a|al|en)?\s*(\d{1,3})\s*%?",
-            t
-        )
-
-        if match:
-            porcentaje = max(0, min(100, int(match.group(1))))
-            comandos.append(("volumen", {
-                "accion": "setear",
-                "porcentaje": porcentaje,
-            }))
+    orden_volumen = extraer_orden_volumen(t)
+    if orden_volumen:
+        comandos.append(("volumen", orden_volumen))
 
     if re.search(
-        r"\b(mute|mutear|silencia|silenciar|desmutea|desmutear)\b",
+        INICIO_ORDEN
+        + r"(?:mute|mutea|mutear|silencia|silenciar|desmutea|desmutear)"
+        + r"(?:\s+(?:el\s+|la\s+)?(?:volumen|audio|sonido|m[uú]sica|todo))?"
+        + FIN_ORDEN,
         t
     ):
         comandos.append(("volumen", {"accion": "mutear"}))
@@ -2189,11 +2461,18 @@ NUCLEOS = {
 }
 
 
+PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
+
+# Respuestas que ya son una frase completa (una pregunta, un aviso, un
+# saludo): envolverlas con "Por supuesto, señor. ¿Desea...?" suena raro.
+RESPUESTAS_COMPLETAS = (
+    "confirmar_accion", "confirmacion_cancelada", "charla", "respuesta_busqueda",
+)
+
+
 def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
     """Devuelve solo el 'núcleo' de la respuesta."""
-    if resultado.startswith(
-        ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
-    ):
+    if resultado.startswith(PREFIJOS_ERROR):
         return resultado
 
     clave = (
@@ -2210,32 +2489,14 @@ def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
 
 def respuesta_local(nombre: str, args: dict, resultado: str) -> str:
     """Genera una respuesta carismática sin gastar tokens de Groq."""
-    if resultado.startswith(("Error", "Pucha", "Falló", "No pude", "Hubo un drama")):
+    if resultado.startswith(PREFIJOS_ERROR) or nombre in RESPUESTAS_COMPLETAS:
         return resultado
-
-    if nombre in ("confirmar_accion", "confirmacion_cancelada"):
-        return resultado
-
-    if nombre == "clima":
-        return f"{random.choice(MULETILLAS)} {resultado}"
-
-    if nombre == "info_cancion":
-        return f"{random.choice(MULETILLAS)} {resultado}"
 
     if nombre == "estado_sistema":
         return f"Señor, estos son los parámetros actuales. {resultado}"
 
-    if nombre in ("captura", "multimedia", "volumen", "bluetooth"):
-        nucleo = nucleo_local(nombre, args, resultado)
-        return f"{random.choice(MULETILLAS)} {nucleo}."
-
-    if nombre in (
-        "abrir_aplicacion", "cerrar_aplicacion", "mover_ventana",
-        "cerrar_todo", "energia", "conectar_bluetooth", "desconectar_bluetooth",
-    ):
-        return f"{random.choice(MULETILLAS)} {resultado}"
-
-    return f"{random.choice(MULETILLAS)} {resultado}"
+    nucleo = nucleo_local(nombre, args, resultado).rstrip(". ")
+    return f"{random.choice(MULETILLAS)} {nucleo}."
 
 
 def ejecutar_comandos_locales(comandos):
@@ -2254,7 +2515,6 @@ def ejecutar_comandos_locales(comandos):
                 ).strip()
 
         memoria_contexto["ultimo_resultado"] = resultado
-        memoria_contexto["ultimo_tema"] = nombre
 
     return resultados
 
@@ -2264,17 +2524,12 @@ def resumir_resultados_locales(resultados):
     frases = []
 
     for nombre, args, resultado in resultados:
-        if nombre == "clima":
-            frases.append(resultado)
-            continue
-
-        # Estas dos son frases completas por sí mismas (una pregunta o
-        # un aviso de cancelación) — envolverlas con una muletilla
-        # tipo "Por supuesto, señor. ¿Desea...?" suena raro.
-        if nombre in ("confirmar_accion", "confirmacion_cancelada"):
+        if nombre in RESPUESTAS_COMPLETAS:
             return resultado
 
-        frases.append(nucleo_local(nombre, args, resultado))
+        # Sin el punto final: se agrega uno solo al armar la frase
+        # (antes quedaba "...grados.." en el texto).
+        frases.append(nucleo_local(nombre, args, resultado).rstrip(". "))
 
     if not frases:
         return "Entendido, señor."
@@ -2456,8 +2711,11 @@ def ejecutar_comando_local(nombre: str, args: dict):
     if nombre == "confirmacion_cancelada":
         return "Cancelado, señor. No se hizo ningún cambio."
 
+    if nombre == "charla":
+        return random.choice(RESPUESTAS_CHARLA[args["tipo"]])
+
     if nombre == "clima":
-        return reporte_clima()
+        return reporte_clima(**args)
 
     if nombre == "captura":
         return tomar_captura()
@@ -2573,8 +2831,126 @@ async def obtener_captura(captura_id: str, background_tasks: BackgroundTasks):
 
     return FileResponse(ruta, media_type=media_type, background=background_tasks)
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(
+# ============================================================
+# GROQ (plan gratuito: cada token cuenta)
+# ============================================================
+# Consumo aproximado por pregunta que llega a Groq: ~170 tokens de
+# este prompt + ~90 de tools (tools_necesarias manda solo las que
+# hacen falta) + historial + respuesta. Lo que resuelve el router
+# local (órdenes, clima, charla corta) no gasta nada.
+
+SYSTEM_PROMPT = """Eres J.A.R.V.I.S., el asistente de escritorio del señor Keric. \
+Responde en español, con elegancia, calma e ingenio, algo británico; \
+usa "señor" con naturalidad, no en cada frase.
+Sé breve: máximo 3 frases salvo que pida más detalle. Mejor corto y \
+completo que largo y cortado.
+Tu respuesta se lee en voz alta: nunca uses markdown, listas ni \
+tablas; habla en prosa corrida.
+Usa herramientas solo si te piden una acción o un dato que no sabes \
+(buscar_en_web solo para información reciente). Nunca inventes resultados."""
+
+SYSTEM_PROMPT_BUSQUEDA = """Eres J.A.R.V.I.S. Responde la pregunta en \
+español, en 1 a 3 frases de prosa sin markdown (se lee en voz alta), \
+usando solo los resultados de búsqueda. Si no alcanzan, dilo."""
+
+DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+         "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+def system_prompt_con_fecha(prompt: str) -> str:
+    # En español a mano: strftime("%A %B") sale en inglés sin locale.
+    ahora = datetime.now()
+    fecha = (
+        f"{DIAS_SEMANA[ahora.weekday()]} {ahora.day} de "
+        f"{MESES[ahora.month - 1]} de {ahora.year}, {ahora:%H:%M}"
+    )
+    return f"{prompt}\nFecha y hora: {fecha}"
+
+
+class SinCuotaGroq(Exception):
+    """Se agotó el límite del plan gratuito (HTTP 429)."""
+
+
+async def llamar_groq(parametros: dict):
+    """Llama a Groq en un hilo aparte, para no congelar el servidor
+    (el panel de sensores, cortar la voz, etc.) mientras responde.
+
+    Si gpt-oss alucina una herramienta inexistente (bug conocido),
+    reintenta UNA vez sin herramientas. Si se agotó la cuota,
+    lanza SinCuotaGroq para responder con una frase en vez de un 500."""
+    try:
+        return await asyncio.to_thread(client.chat.completions.create, **parametros)
+    except RateLimitError as e:
+        print(f"[!] Groq sin cuota (429): {e}")
+        raise SinCuotaGroq() from e
+    except Exception as e:
+        error_texto = str(e)
+
+        if "tool_use_failed" not in error_texto and "Tool choice is none" not in error_texto:
+            print(f"[ERROR GROQ] {e}")
+            raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e}")
+
+        print(f"[!] Groq alucinó un tool inexistente, reintentando sin tools: {e}")
+        sin_tools = {k: v for k, v in parametros.items() if k not in ("tools", "tool_choice")}
+
+        try:
+            return await asyncio.to_thread(client.chat.completions.create, **sin_tools)
+        except RateLimitError as e2:
+            raise SinCuotaGroq() from e2
+        except Exception as e2:
+            print(f"[ERROR GROQ] {e2}")
+            raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e2}")
+
+
+async def resumir_busqueda(pregunta: str, resultados_web: str) -> str:
+    """Segunda llamada, lo más barata posible: sin historial, sin
+    tools, prompt corto y snippets recortados (~500 tokens en total)."""
+    parametros = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt_con_fecha(SYSTEM_PROMPT_BUSQUEDA)},
+            {"role": "user", "content": f"Pregunta: {pregunta}\n\n{resultados_web[:1500]}"},
+        ],
+        "temperature": 0.2,
+        "max_completion_tokens": 250,
+        "reasoning_effort": "low",
+    }
+
+    try:
+        respuesta = await llamar_groq(parametros)
+        texto = limpiar_texto_para_voz(respuesta.choices[0].message.content or "")
+        if respuesta.choices[0].finish_reason == "length":
+            texto = recortar_a_oracion_completa(texto)
+        if texto:
+            return texto
+    except (SinCuotaGroq, HTTPException):
+        pass
+
+    # Sin cuota o sin respuesta: al menos el primer resultado, limpio.
+    lineas = [l for l in resultados_web.splitlines()[1:] if l.strip()]
+    primero = re.sub(r"^\d+\.\s*", "", lineas[0]) if lineas else ""
+    return f"Esto es lo que encontré, señor: {primero}" if primero else "No encontré nada útil, señor."
+
+
+MENSAJE_SIN_CUOTA = (
+    "Señor, se agotó la cuota gratuita de Groq por ahora. Las órdenes "
+    "directas siguen funcionando; las preguntas tendrán que esperar un poco."
+)
+
+
+async def responder_sin_cuota(origen: str) -> ChatResponse:
+    # El mensaje del usuario ya quedó en el historial sin respuesta:
+    # se saca, para no mandarlo dos veces en la próxima pregunta.
+    if historial_chat and historial_chat[-1]["role"] == "user":
+        historial_chat.pop()
+
+    print(f"[Jarvis] {MENSAJE_SIN_CUOTA}")
+    audio = await procesar_salida_de_voz(MENSAJE_SIN_CUOTA, origen)
+    return ChatResponse(response=MENSAJE_SIN_CUOTA, audio_path=audio)
+
+
+async def procesar_mensaje(
     request: ChatRequest,
     origen: str = "pc"
 ):
@@ -2626,7 +3002,10 @@ async def chat_endpoint(
 
         if captura_id_local and ruta_captura_disponible(captura_id_local):
             image_path_response = f"/captura/{captura_id_local}"
-            enviar_captura_telegram(captura_id_local)
+            # Desde el celular la app ya la guarda en la galería:
+            # Telegram solo cuando la pides en el PC.
+            if origen == "pc":
+                enviar_captura_telegram(captura_id_local)
 
         # --------------------------------------------------------
         # ANÁLISIS DE PANTALLA (también devuelve la foto analizada)
@@ -2657,37 +3036,12 @@ async def chat_endpoint(
         )
 
     # 3. SOLO SI NO ES UN COMANDO LOCAL: usamos Groq con contexto mínimo.
-    fecha_hora_actual = datetime.now().strftime("%A %d de %B de %Y, a las %I:%M %p")
-    system_prompt = f"""Eres J.A.R.V.I.S., asistente de escritorio del usuario.
-
-Responde en español, con personalidad elegante y carismática, ligeramente británica.
-Sé calmado, ingenioso y profesional. Puedes usar "señor" o "señor Keric"
-de forma natural, sin repetirlo en cada frase.
-Habla de forma natural, no robótica. Sé breve: como máximo 3-4 frases,
-salvo que el usuario te pida explícitamente más detalle. Preferí una
-explicación corta y clara antes que una completa y larga — tenés un
-límite de tokens, y una respuesta cortada a mitad es peor que una
-corta pero completa.
-Usa herramientas solo cuando el usuario solicite una acción.
-No ejecutes herramientas ante agradecimientos o conversación casual.
-Nunca inventes resultados de herramientas.
-
-IMPORTANTE: tu respuesta se convierte a voz y se lee en alto, nunca se
-lee en pantalla. Por eso, NUNCA uses markdown: nada de tablas (|),
-negritas (**), encabezados (#), ni listas con guiones o viñetas.
-Respondé siempre en prosa corrida, como hablarías en una conversación
-real. Si la información tiene varias partes, decilas como una frase
-fluida ("hay tres tipos: A, que hace tal cosa; B, que hace tal otra...")
-en vez de una lista o tabla.
-
-Fecha y hora actual: {fecha_hora_actual}"""
-
     historial_chat.append({"role": "user", "content": mensaje_usuario})
 
     if len(historial_chat) > MAX_HISTORIAL:
         historial_chat = historial_chat[-MAX_HISTORIAL:]
 
-    mensajes = [{"role": "system", "content": system_prompt}]
+    mensajes = [{"role": "system", "content": system_prompt_con_fecha(SYSTEM_PROMPT)}]
 
     contexto = contexto_para_pregunta(mensaje_usuario)
     if contexto:
@@ -2700,15 +3054,10 @@ Fecha y hora actual: {fecha_hora_actual}"""
         "model": MODEL,
         "messages": mensajes,
         "temperature": 0.2,
-        # openai/gpt-oss-120b (y los modelos de razonamiento en
-        # general) esperan max_completion_tokens, no max_tokens — el
-        # nombre viejo del parámetro. Con el modelo anterior daba lo
-        # mismo, con este probablemente esté siendo la causa del 500.
-        # 220 se quedaba corto seguido para preguntas que necesitan
-        # una explicación de verdad (se cortaba a mitad de frase).
-        # 350 da más margen sin ser un cheque en blanco — la
-        # instrucción de brevedad en el system_prompt sigue haciendo
-        # que la mayoría de las respuestas cortas no lo usen igual.
+        # gpt-oss espera max_completion_tokens (no max_tokens), y ese
+        # límite incluye los tokens de razonamiento. 350 deja margen
+        # para explicaciones sin ser un cheque en blanco: la regla de
+        # brevedad del prompt hace que casi nunca se use entero.
         "max_completion_tokens": 350,
         "reasoning_effort": "low",
     }
@@ -2718,29 +3067,11 @@ Fecha y hora actual: {fecha_hora_actual}"""
         parametros["tool_choice"] = "auto"
 
     try:
-        response = client.chat.completions.create(**parametros)
-        response_message = response.choices[0].message
-    except Exception as e:
-        error_texto = str(e)
+        response = await llamar_groq(parametros)
+    except SinCuotaGroq:
+        return await responder_sin_cuota(origen)
 
-        # Defensa extra por si el bug de gpt-oss (alucinar un tool
-        # que no existe) se repite en algún otro caso: en vez de
-        # tirar 500 directo, reintentamos UNA vez sin herramientas —
-        # sin nada que "confundir" al modelo, suele responder normal.
-        if "tool_use_failed" in error_texto or "Tool choice is none" in error_texto:
-            print(f"[!] Groq alucinó un tool inexistente, reintentando sin tools: {e}")
-            parametros.pop("tools", None)
-            parametros.pop("tool_choice", None)
-
-            try:
-                response = client.chat.completions.create(**parametros)
-                response_message = response.choices[0].message
-            except Exception as e2:
-                print(f"[ERROR GROQ] {e2}")
-                raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e2}")
-        else:
-            print(f"[ERROR GROQ] {e}")
-            raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e}")
+    response_message = response.choices[0].message
 
     # Si el modelo se quedó sin tokens antes de terminar la idea,
     # esto queda en "length" en vez de "stop" — lo usamos más abajo
@@ -2753,65 +3084,59 @@ Fecha y hora actual: {fecha_hora_actual}"""
 
         for tool_call in response_message.tool_calls:
             fn_name = tool_call.function.name
-            fn_args = json.loads(tool_call.function.arguments or "{}")
+            try:
+                fn_args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                fn_args = {}
 
             print(f"[*] Tool call: {fn_name} {fn_args}")
 
-            if fn_name == "ajustar_volumen":
-                resultado = ajustar_volumen(**fn_args)
-            elif fn_name == "abrir_aplicacion":
-                resultado = abrir_aplicacion(**fn_args)
-            elif fn_name == "cerrar_aplicacion":
-                resultado = cerrar_aplicacion(**fn_args)
-            elif fn_name == "control_multimedia":
-                resultado = control_multimedia(**fn_args)
-            elif fn_name == "info_cancion":
-                resultado = info_cancion()
-                if resultado.startswith("Actualmente está sonando:"):
-                    memoria_contexto["cancion"] = resultado.replace(
-                        "Actualmente está sonando:", ""
-                    ).strip()
-            elif fn_name == "control_energia":
-                resultado = control_energia(**fn_args)
-            elif fn_name == "cerrar_todo":
-                resultado = cerrar_todo()
-            elif fn_name == "reporte_clima":
-                resultado = reporte_clima()
-            elif fn_name == "estado_sistema":
-                resultado = estado_sistema()
-            elif fn_name == "tomar_captura":
-                resultado = tomar_captura()
-                if resultado.startswith("CAPTURA_LISTA"):
-                    captura_id_groq = resultado.split(":", 1)[1]
-                    if ruta_captura_disponible(captura_id_groq):
-                        image_path_response = f"/captura/{captura_id_groq}"
-                        enviar_captura_telegram(captura_id_groq)
-            elif fn_name == "buscar_en_web":
-                resultado = buscar_en_web(**fn_args)
-            elif fn_name == "mover_ventana":
-                resultado = mover_ventana(**fn_args)
-            elif fn_name == "controlar_bluetooth":
-                resultado = controlar_bluetooth(**fn_args)
-            elif fn_name == "conectar_bluetooth":
-                resultado = conectar_bluetooth(**fn_args)
-            elif fn_name == "desconectar_bluetooth":
-                resultado = desconectar_bluetooth(**fn_args)
-            elif fn_name == "actualizar_sistema":
-                resultado = actualizar_sistema()
-            elif fn_name == "verificar_actualizaciones":
-                resultado = verificar_actualizaciones()
-            elif fn_name == "abrir_radio_musica":
-                resultado = abrir_radio_musica()
-            elif fn_name == "abrir_pestanas_busqueda":
-                resultado = abrir_pestanas_busqueda(**fn_args)
-            elif fn_name == "analizar_pantalla":
-                resultado = analizar_pantalla(**fn_args)
+            if fn_name == "control_energia":
+                # Igual que en router_local: apagar/reiniciar NUNCA se
+                # ejecuta directo, queda pendiente hasta que el usuario
+                # diga "sí". Antes, una frase que no matcheaba el regex
+                # local ("apaga todo por favor") llegaba acá y apagaba
+                # sin preguntar.
+                accion = fn_args.get("accion")
+                if accion in ("apagar", "reiniciar"):
+                    memoria_contexto["confirmacion_pendiente"] = {"accion": accion}
+                    fn_name = "confirmar_accion"
+                    resultado = ejecutar_comando_local(
+                        "confirmar_accion", {"accion": accion}
+                    )
+                else:
+                    resultado = "No pude entender la acción de energía."
+            elif fn_name in TOOLS_FUNCIONES:
+                try:
+                    resultado = TOOLS_FUNCIONES[fn_name](**fn_args)
+                except TypeError as e:
+                    # Groq a veces inventa un argumento que la función
+                    # no acepta: mejor un error hablado que un 500.
+                    resultado = f"Error: argumentos inválidos para {fn_name}: {e}"
             else:
                 resultado = "Error: Herramienta no encontrada."
 
+            if fn_name == "info_cancion" and resultado.startswith("Actualmente está sonando:"):
+                memoria_contexto["cancion"] = resultado.replace(
+                    "Actualmente está sonando:", ""
+                ).strip()
+
+            if fn_name == "tomar_captura" and resultado.startswith("CAPTURA_LISTA"):
+                captura_id_groq = resultado.split(":", 1)[1]
+                if ruta_captura_disponible(captura_id_groq):
+                    image_path_response = f"/captura/{captura_id_groq}"
+                    if origen == "pc":
+                        enviar_captura_telegram(captura_id_groq)
+
+            if fn_name == "buscar_en_web" and not resultado.startswith(PREFIJOS_ERROR):
+                # Antes los snippets se leían en bruto ("Resultados web
+                # para X: 1. ... 2. ..."). Ahora una segunda llamada,
+                # mínima, los convierte en una respuesta de verdad.
+                resultado = await resumir_busqueda(mensaje_usuario, resultado)
+                fn_name = "respuesta_busqueda"
+
             resultados_tool.append((fn_name, fn_args, resultado))
             memoria_contexto["ultimo_resultado"] = str(resultado)
-            memoria_contexto["ultimo_tema"] = fn_name
 
         texto_final = " ".join(
             respuesta_local(nombre, args, resultado)
@@ -2870,6 +3195,140 @@ Fecha y hora actual: {fecha_hora_actual}"""
 PROCESO_VOZ_PC = None
 
 
+VOZ_EDGE = "es-DO-EmilioNeural"
+
+# Desde octubre de 2026 speech.platform.bing.com responde 403 a la
+# síntesis y Jarvis quedaba mudo (edge-tts issue #490). Edge 155 usa
+# api.msedgeservices.com con el mismo token (arreglo del PR #491).
+# Solo se aplica si la librería sigue con el host viejo: cuando salga
+# una versión de edge-tts arreglada, esto deja de hacer nada.
+import edge_tts.communicate as _edge_tts_communicate
+
+if "speech.platform.bing.com" in _edge_tts_communicate.WSS_URL:
+    _edge_tts_communicate.WSS_URL = (
+        "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+        "?Ocp-Apim-Subscription-Key=6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+    )
+
+# Efecto "Jarvis de la película" sobre la voz de Emilio: tono un poco
+# más grave, eco corto de sala y brillo en los agudos. No clona ninguna
+# voz real, solo procesa la de edge-tts. Se elige en el .env con
+# JARVIS_EFECTO_VOZ=sutil | holografico | ninguno. Cuesta ~0.25 s.
+FILTROS_VOZ = {
+    "sutil": (
+        "asetrate=24000*0.96,aresample=24000,atempo=1.0417,"
+        "highpass=f=90,equalizer=f=250:t=q:w=1:g=2,"
+        "equalizer=f=3500:t=q:w=1.2:g=2.5,"
+        "aecho=0.8:0.6:28|47:0.16|0.09,volume=1.4,alimiter=limit=0.9"
+    ),
+    "holografico": (
+        "asetrate=24000*0.94,aresample=24000,atempo=1.0638,"
+        "highpass=f=110,equalizer=f=3000:t=q:w=1:g=3,"
+        "chorus=0.7:0.9:20|32:0.25|0.18:0.3|0.25:2|2.3,"
+        "aecho=0.8:0.7:35|60:0.22|0.12,volume=1.3,alimiter=limit=0.9"
+    ),
+}
+EFECTO_VOZ = os.getenv("JARVIS_EFECTO_VOZ", "sutil").strip().lower()
+
+
+# Voz de respaldo para cuando edge-tts falla (sin internet, o Microsoft
+# cambia algo como en octubre de 2026 y Jarvis quedó mudo). Usa Piper si
+# está instalado (piper-tts-bin del AUR + un modelo .onnx en
+# JARVIS_PIPER_MODELO) y si no espeak-ng. Es binario "piper-tts" y no
+# "piper": en Arch "piper" es el configurador de ratones gamer.
+PIPER_MODELO = os.getenv("JARVIS_PIPER_MODELO", "").strip()
+
+
+async def generar_voz_local(texto: str, ruta_salida: str) -> bool:
+    """Genera la voz con un motor local en ruta_salida. Devuelve False
+    si no hay ningún motor instalado o si falló."""
+    ruta_wav = f"{ruta_salida}.local.wav"
+
+    if PIPER_MODELO and shutil.which("piper-tts"):
+        comando = ["piper-tts", "--model", PIPER_MODELO, "--output_file", ruta_wav]
+        entrada = texto.encode()
+    elif shutil.which("espeak-ng"):
+        comando = ["espeak-ng", "-v", "es-419", "-s", "165", "-w", ruta_wav, texto]
+        entrada = None
+    else:
+        print("[!] No hay voz local de respaldo: instala espeak-ng o piper-tts.")
+        return False
+
+    try:
+        proceso = await asyncio.create_subprocess_exec(
+            *comando,
+            stdin=subprocess.PIPE if entrada else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        await proceso.communicate(entrada)
+
+        if proceso.returncode != 0 or not os.path.exists(ruta_wav):
+            return False
+
+        # Se pasa a MP3 porque el archivo se llama .mp3 y el teléfono lo
+        # pide así. Sin ffmpeg queda el WAV: mpv lo reproduce igual.
+        if not shutil.which("ffmpeg"):
+            os.replace(ruta_wav, ruta_salida)
+            return True
+
+        proceso = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", ruta_wav, "-c:a", "libmp3lame", "-q:a", "3", ruta_salida,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        await proceso.communicate()
+        return proceso.returncode == 0
+
+    finally:
+        if os.path.exists(ruta_wav):
+            os.remove(ruta_wav)
+
+
+async def generar_voz(texto: str, ruta_salida: str):
+    """Genera la voz de Jarvis en ruta_salida con edge-tts y, si falla,
+    con la voz local de respaldo. Solo lanza la excepción de edge-tts
+    si tampoco hay voz local."""
+    try:
+        await generar_voz_edge(texto, ruta_salida)
+    except Exception as e:
+        print(f"[!] edge-tts falló, uso la voz local de respaldo: {e}")
+        if not await generar_voz_local(texto, ruta_salida):
+            raise
+
+
+async def generar_voz_edge(texto: str, ruta_salida: str):
+    """Genera la voz de Emilio en ruta_salida (MP3), con el efecto de
+    EFECTO_VOZ si hay ffmpeg. Si el efecto falla, queda la voz limpia:
+    nunca te quedas sin respuesta por culpa del filtro."""
+    voz = edge_tts.Communicate(texto, voice=VOZ_EDGE, rate="+10%")
+    filtro = FILTROS_VOZ.get(EFECTO_VOZ)
+
+    if not filtro or not shutil.which("ffmpeg"):
+        await voz.save(ruta_salida)
+        return
+
+    ruta_cruda = f"{ruta_salida}.crudo.mp3"
+
+    try:
+        await voz.save(ruta_cruda)
+
+        proceso = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", ruta_cruda, "-af", filtro,
+            "-c:a", "libmp3lame", "-q:a", "3", ruta_salida,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        _, error = await proceso.communicate()
+
+        if proceso.returncode != 0:
+            print(f"[!] Falló el efecto de voz, uso la voz limpia: {error.decode()[:200]}")
+            os.replace(ruta_cruda, ruta_salida)
+
+    finally:
+        if os.path.exists(ruta_cruda):
+            os.remove(ruta_cruda)
+
+
 def interrumpir_voz_pc():
     """Corta lo que Jarvis esté diciendo en el PC ahora mismo, si hay
     algo sonando. Se llama apenas arranca una grabación nueva, para
@@ -2894,17 +3353,13 @@ async def hablar_por_parlantes(texto: str):
     if not texto:
         return
 
-    ruta_respuesta = "/tmp/respuesta_jarvis_pc.ogg"
+    # Nombre único: si un recordatorio sonaba mientras Jarvis hablaba,
+    # los dos escribían (y borraban) el mismo archivo.
+    ruta_respuesta = f"/tmp/respuesta_jarvis_pc_{uuid.uuid4().hex[:12]}.mp3"
     proceso = None
 
     try:
-        voz_jarvis = edge_tts.Communicate(
-            texto,
-            voice="es-DO-EmilioNeural",
-            rate="+10%"
-        )
-
-        await voz_jarvis.save(ruta_respuesta)
+        await generar_voz(texto, ruta_respuesta)
 
         # Popen (no subprocess.run) + espera con asyncio.sleep: así NO
         # se bloquea el event loop mientras habla, y el servidor puede
@@ -2935,6 +3390,29 @@ async def hablar_por_parlantes(texto: str):
                 pass
 
 
+MINUTOS_VIDA_ARCHIVOS = 10
+
+
+def limpiar_archivos_viejos():
+    """Borra audios para el teléfono y capturas con más de 10 minutos.
+    Antes los audios se acumulaban para siempre en /tmp/jarvis_audios,
+    y las capturas pedidas desde el PC (que nadie descarga por
+    /captura/{id}) también quedaban en /tmp."""
+    limite = time.time() - MINUTOS_VIDA_ARCHIVOS * 60
+    candidatos = [os.path.join(CARPETA_AUDIOS, n) for n in os.listdir(CARPETA_AUDIOS)]
+    candidatos += [
+        os.path.join("/tmp", n) for n in os.listdir("/tmp")
+        if n.startswith("captura_jarvis_")
+    ]
+
+    for ruta in candidatos:
+        try:
+            if os.path.getmtime(ruta) < limite:
+                os.remove(ruta)
+        except OSError:
+            pass
+
+
 async def generar_audio_para_telefono(texto: str) -> str | None:
     """
     Genera la voz de Jarvis para el teléfono.
@@ -2946,7 +3424,9 @@ async def generar_audio_para_telefono(texto: str) -> str | None:
     if not texto:
         return None
 
-    nombre_archivo = f"respuesta_jarvis_{uuid.uuid4().hex[:12]}.ogg"
+    limpiar_archivos_viejos()
+
+    nombre_archivo = f"respuesta_jarvis_{uuid.uuid4().hex[:12]}.mp3"
 
     ruta_archivo = os.path.join(
         CARPETA_AUDIOS,
@@ -2954,20 +3434,14 @@ async def generar_audio_para_telefono(texto: str) -> str | None:
     )
 
     try:
-        voz_jarvis = edge_tts.Communicate(
-            texto,
-            voice="es-DO-EmilioNeural",
-            rate="+10%"
-        )
-
-        await voz_jarvis.save(ruta_archivo)
+        await generar_voz(texto, ruta_archivo)
 
         print(
             f"[*] Audio para teléfono generado: "
             f"{ruta_archivo}"
         )
 
-        # /tmp está montado como /audios
+        # CARPETA_AUDIOS está montada como /audios
         return f"/audios/{nombre_archivo}"
 
     except Exception as e:
@@ -3009,6 +3483,31 @@ async def procesar_salida_de_voz(
 
     return None
 
+PISTA_VOCABULARIO = (
+    "Uso a Jarvis para controlar mi computadora: "
+    "abro Steam, Discord, Zen Browser, "
+    "Visual Studio Code, Heroic y Prism Launcher; "
+    "conecto el Bluetooth a mi Alexa o a mis audífonos Buds; "
+    "controlo el volumen, tomo capturas "
+    "y muevo ventanas entre escritorios."
+)
+
+ALUCINACIONES_WHISPER = (
+    r"^\W*(?:subt[ií]tulos (?:realizados|por)|amara\.org|"
+    r"suscr[ií]bete|gracias por ver|¡?gracias por ver el video)"
+)
+
+
+@app.post("/callar")
+async def callar_endpoint():
+    """Corta lo que Jarvis esté diciendo en el PC. Lo llama
+    jarvis_mic.sh apenas presionas Win+J: antes la voz recién se
+    cortaba cuando TERMINABAS de grabar (al llegar el audio), así que
+    el micrófono grababa a Jarvis hablando encima de tu orden."""
+    interrumpir_voz_pc()
+    return {"ok": True}
+
+
 @app.post(
     "/comando_audio",
     response_model=ChatResponse
@@ -3037,78 +3536,41 @@ async def comando_audio_endpoint(
             detail="El origen debe ser 'pc' o 'telefono'."
         )
 
-    # Apenas arranca una grabación nueva, cortamos lo que Jarvis
-    # estuviera diciendo en el PC — así no se solapa la respuesta
-    # vieja con la nueva. Solo tiene sentido para origen=pc: el
-    # teléfono reproduce su propio audio del lado de Flutter, Jarvis
-    # no tiene control sobre eso desde acá.
+    # Por si el cliente no llamó a /callar al empezar a grabar.
     if origen == "pc":
         interrumpir_voz_pc()
 
-    ruta_audio = f"/tmp/temp_{audio.filename}"
-
     try:
+        # Los bytes van directo a Whisper: antes se escribían a /tmp y
+        # se volvían a leer, usando además el nombre de archivo que
+        # mandaba el cliente.
+        contenido = await audio.read()
 
-        # ----------------------------------------------------
-        # 1. GUARDAR AUDIO
-        # ----------------------------------------------------
-
-        with open(ruta_audio, "wb") as buffer:
-            buffer.write(
-                await audio.read()
-            )
-
-        pista_vocabulario = (
-            "Uso a Jarvis para controlar mi computadora: "
-            "abro Steam, Discord, Zen Browser, "
-            "Visual Studio Code, Heroic y Prism Launcher; "
-            "conecto el Bluetooth a mi Alexa; "
-            "controlo el volumen, tomo capturas "
-            "y muevo ventanas entre escritorios."
+        transcripcion = await asyncio.to_thread(
+            client.audio.transcriptions.create,
+            file=(audio.filename or "audio.wav", contenido),
+            model="whisper-large-v3",
+            language="es",
+            prompt=PISTA_VOCABULARIO,
         )
 
-        # ----------------------------------------------------
-        # 2. WHISPER
-        # ----------------------------------------------------
+        mensaje_usuario = transcripcion.text.strip()
 
-        with open(ruta_audio, "rb") as f:
-
-            transcripcion = (
-                client.audio.transcriptions.create(
-                    file=(
-                        ruta_audio,
-                        f.read()
-                    ),
-                    model="whisper-large-v3",
-                    language="es",
-                    prompt=pista_vocabulario,
-                )
-            )
-
-        mensaje_usuario = (
-            transcripcion.text.strip()
-        )
+    except RateLimitError:
+        return await responder_sin_cuota(origen)
 
     except Exception as e:
-
-        print(
-            f"[ERROR WHISPER] {e}"
-        )
-
+        print(f"[ERROR WHISPER] {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Error procesando el audio: {e}"
         )
 
-    finally:
-
-        if os.path.exists(ruta_audio):
-
-            try:
-                os.remove(ruta_audio)
-
-            except Exception:
-                pass
+    # Whisper "alucina" estas frases con audio vacío o puro ruido. Sin
+    # este filtro, una grabación en silencio terminaba en una llamada
+    # a Groq por "Subtítulos realizados por la comunidad de Amara.org".
+    if re.search(ALUCINACIONES_WHISPER, mensaje_usuario, re.IGNORECASE):
+        mensaje_usuario = ""
 
     # --------------------------------------------------------
     # 3. VALIDAR TRANSCRIPCIÓN
@@ -3133,7 +3595,7 @@ async def comando_audio_endpoint(
         message=mensaje_usuario
     )
 
-    resultado = await chat_endpoint(
+    resultado = await procesar_mensaje(
         request_data,
         origen=origen
     )
@@ -3144,7 +3606,7 @@ async def comando_audio_endpoint(
     #
     # await hablar_por_parlantes(...)
     #
-    # porque chat_endpoint() ya decidió dónde
+    # porque procesar_mensaje() ya decidió dónde
     # debe salir la voz.
     #
 
@@ -3183,7 +3645,7 @@ async def recibir_texto(
         message=comando.texto
     )
 
-    resultado = await chat_endpoint(
+    resultado = await procesar_mensaje(
         request_data,
         origen=origen
     )
@@ -3191,40 +3653,22 @@ async def recibir_texto(
     return resultado
 
 @app.get("/sensores")
-async def leer_sensores():
-    """Devuelve el estado de hardware en tiempo real para el Dashboard móvil."""
+def sensores_endpoint():
+    """Estado de hardware en tiempo real para el panel del celular.
+
+    Es "def" (no "async def") a propósito: FastAPI lo corre en un hilo
+    aparte, así la consulta cada 2 s del celular no frena al resto del
+    servidor. Mantiene el formato de siempre (strings, "N/A" si no hay
+    dato) para no tener que cambiar la app."""
     try:
-        # RAM en Megabytes
-        ram_usada = subprocess.check_output("free -m | awk '/^Mem:/ {print $3}'", shell=True).decode().strip()
-        ram_total = subprocess.check_output("free -m | awk '/^Mem:/ {print $2}'", shell=True).decode().strip()
-        
-        # Uso de CPU
-        cpu_uso = subprocess.check_output("top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'", shell=True).decode().strip()
-        
-        # Temperatura de CPU (En Arch/CachyOS suele estar aquí, lo dividimos por 1000)
-        try:
-            cpu_temp_raw = subprocess.check_output("cat /sys/class/thermal/thermal_zone0/temp", shell=True).decode().strip()
-            cpu_temp = str(int(cpu_temp_raw) // 1000)
-        except Exception:
-            cpu_temp = "N/A"
-
-        # Uso y Temp de NVIDIA
-        try:
-            gpu_info = subprocess.check_output(
-                "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits", 
-                shell=True
-            ).decode().strip()
-            gpu_uso, gpu_temp = gpu_info.split(', ')
-        except Exception:
-            gpu_uso, gpu_temp = "0", "N/A" # Por si está apagada por el sistema híbrido
-
+        s = leer_sensores()
         return {
-            "ram_usada": ram_usada,
-            "ram_total": ram_total,
-            "cpu_uso": cpu_uso,
-            "cpu_temp": cpu_temp,
-            "gpu_uso": gpu_uso,
-            "gpu_temp": gpu_temp
+            "ram_usada": str(s["ram_usada"]),
+            "ram_total": str(s["ram_total"]),
+            "cpu_uso": str(s["cpu_uso"]),
+            "cpu_temp": str(s["cpu_temp"]) if s["cpu_temp"] is not None else "N/A",
+            "gpu_uso": s["gpu_uso"] or "0",
+            "gpu_temp": s["gpu_temp"] or "N/A",
         }
     except Exception as e:
         return {"error": str(e)}
