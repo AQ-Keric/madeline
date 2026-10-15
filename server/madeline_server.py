@@ -3195,24 +3195,11 @@ async def procesar_mensaje(
 PROCESO_VOZ_PC = None
 
 
-# Voz femenina dominicana; se puede cambiar con MADELINE_VOZ en el .env
+# Voz femenina mexicana (la más natural en las pruebas); se puede cambiar con MADELINE_VOZ en el .env
 # (edge-tts --list-voices | grep es-).
-VOZ_EDGE = os.getenv("MADELINE_VOZ", "es-DO-RamonaNeural").strip()
+VOZ_EDGE = os.getenv("MADELINE_VOZ", "es-MX-DaliaNeural").strip()
 
-# Desde octubre de 2026 speech.platform.bing.com responde 403 a la
-# síntesis y Madeline quedaba muda (edge-tts issue #490). Edge 155 usa
-# api.msedgeservices.com con el mismo token (arreglo del PR #491).
-# Solo se aplica si la librería sigue con el host viejo: cuando salga
-# una versión de edge-tts arreglada, esto deja de hacer nada.
-import edge_tts.communicate as _edge_tts_communicate
-
-if "speech.platform.bing.com" in _edge_tts_communicate.WSS_URL:
-    _edge_tts_communicate.WSS_URL = (
-        "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
-        "?Ocp-Apim-Subscription-Key=6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    )
-
-# Efecto de "asistente digital" sobre la voz de Ramona: eco corto de
+# Efecto de "asistente digital" sobre la voz: eco corto de
 # sala y brillo en los agudos (sin bajarle el tono, para que siga
 # sonando como ella). No clona ninguna
 # voz real, solo procesa la de edge-tts. Se elige en el .env con
@@ -3229,7 +3216,7 @@ FILTROS_VOZ = {
         "aecho=0.8:0.7:35|60:0.22|0.12,volume=1.3,alimiter=limit=0.9"
     ),
 }
-EFECTO_VOZ = os.getenv("MADELINE_EFECTO_VOZ", "sutil").strip().lower()
+EFECTO_VOZ = os.getenv("MADELINE_EFECTO_VOZ", "ninguno").strip().lower()
 
 
 # Voz de respaldo para cuando edge-tts falla (sin internet, o Microsoft
@@ -3301,7 +3288,7 @@ async def generar_voz_edge(texto: str, ruta_salida: str):
     """Genera la voz de Madeline en ruta_salida (MP3), con el efecto de
     EFECTO_VOZ si hay ffmpeg. Si el efecto falla, queda la voz limpia:
     nunca te quedas sin respuesta por culpa del filtro."""
-    voz = edge_tts.Communicate(texto, voice=VOZ_EDGE, rate="+10%")
+    voz = edge_tts.Communicate(texto, voice=VOZ_EDGE)
     filtro = FILTROS_VOZ.get(EFECTO_VOZ)
 
     if not filtro or not shutil.which("ffmpeg"):

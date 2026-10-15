@@ -22,7 +22,7 @@ sin gastar tokens.
   detectan con expresiones regulares y no llaman al LLM. Pensado para el plan gratuito de Groq.
 - **Herramientas (tool calling)** cuando hace falta el LLM: abrir/cerrar apps, mover ventanas,
   Bluetooth, buscar en la web, reporte del sistema, actualizaciones, captura y análisis de pantalla.
-- **Voz natural** con `edge-tts` (`es-DO-RamonaNeural`) y efecto de audio opcional; voz local de
+- **Voz natural** con `edge-tts` (`es-MX-DaliaNeural`) y efecto de audio opcional; voz local de
   respaldo con Piper o `espeak-ng` si no hay internet.
 - **App móvil (Flutter)**: hablarle desde el celular, recibir la respuesta en audio, ver capturas
   y un panel de sensores del PC en tiempo real.
@@ -134,8 +134,8 @@ Las peticiones que no vienen del propio PC necesitan el header `X-Madeline-Token
 |--------------------------|-----------------------------------------------------------|----------------------|
 | `GROQ_API_KEY`           | API key de Groq (obligatoria)                             | —                    |
 | `MADELINE_TOKEN`         | Token para peticiones desde la red                        | vacío (sin auth)     |
-| `MADELINE_VOZ`           | Voz de edge-tts                                           | `es-DO-RamonaNeural` |
-| `MADELINE_EFECTO_VOZ`    | `sutil`, `holografico` o `ninguno`                        | `sutil`              |
+| `MADELINE_VOZ`           | Voz de edge-tts                                           | `es-MX-DaliaNeural`  |
+| `MADELINE_EFECTO_VOZ`    | `sutil`, `holografico` o `ninguno`                        | `ninguno`            |
 | `MADELINE_PIPER_MODELO`  | Modelo `.onnx` de Piper para la voz offline               | vacío                |
 | `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` | Enviar capturas a Telegram (opcional)        | vacío                |
 
