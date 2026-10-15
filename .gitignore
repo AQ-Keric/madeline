@@ -27,3 +27,6 @@ mobile/.flutter-plugins-dependencies
 tmp/
 temp/
 *.log
+
+# Memoria de Madeline (datos personales)
+data/

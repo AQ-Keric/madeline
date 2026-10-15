@@ -13,13 +13,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
-os.environ.setdefault("GROQ_API_KEY", "test")
-
+import entorno  # noqa: E402,F401  (memoria temporal, sin Ollama)
 import madeline_server as j  # noqa: E402
 
 
 def reiniciar_estado():
+    entorno.vaciar_memoria()
     j.historial_chat.clear()
     for clave in j.memoria_contexto:
         j.memoria_contexto[clave] = None

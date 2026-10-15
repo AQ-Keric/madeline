@@ -32,6 +32,9 @@ from pydantic import BaseModel
 
 load_dotenv(override=True)
 
+# Después de load_dotenv: memoria lee su configuración del .env.
+import memoria  # noqa: E402
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -2082,6 +2085,72 @@ RESPUESTAS_CHARLA = {
 }
 
 
+# Memoria a largo plazo: se resuelve en local (0 tokens de Groq).
+# "recuerda que" no choca con los recordatorios: esos dicen
+# "recuérdame en N minutos".
+_PREFIJO_MEMORIA = (
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel(?:ine|eine|aine|in)\s*,?\s*)?"
+    r"(?:por\s+favor\s*,?\s*)?"
+)
+PATRON_MEMORIA_GUARDAR = re.compile(
+    _PREFIJO_MEMORIA
+    + r"(?:recuerda|acu[eé]rdate(?:\s+de)?|no\s+olvides|anota|guarda\s+en\s+(?:tu\s+)?memoria)"
+    r"\s*(?:que|esto|lo\s+siguiente)?\s*:?\s+(?P<dato>.{3,})",
+    re.IGNORECASE,
+)
+PATRON_MEMORIA_OLVIDAR = re.compile(
+    _PREFIJO_MEMORIA
+    + r"(?:olvida|olv[ií]date\s+de|borra\s+(?:de\s+tu\s+memoria|el\s+recuerdo\s+de))"
+    r"\s+(?:lo\s+de\s+|eso\s+de\s+|que\s+)?(?P<tema>.{3,})",
+    re.IGNORECASE,
+)
+PATRON_MEMORIA_CONSULTAR = re.compile(
+    _PREFIJO_MEMORIA
+    + r"qu[eé]\s+(?:(?:recuerdas|sabes)\s+(?:de|sobre)\s+m[ií](?:\s+mism[oa])?"
+    r"|recuerdas\s+(?:de|sobre|acerca\s+de)\s+(?P<tema>.+))\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+
+def pedido_de_memoria(texto: str):
+    """("memoria_guardar"|"memoria_olvidar"|"memoria_consultar", args) o None."""
+    texto = texto.strip()
+    match = PATRON_MEMORIA_GUARDAR.match(texto)
+    if match:
+        return "memoria_guardar", {"dato": match.group("dato").strip(" .!¡")}
+    match = PATRON_MEMORIA_OLVIDAR.match(texto)
+    if match:
+        return "memoria_olvidar", {"tema": match.group("tema").strip(" .!¡?¿")}
+    match = PATRON_MEMORIA_CONSULTAR.match(texto)
+    if match:
+        return "memoria_consultar", {"tema": (match.group("tema") or "").strip(" .!¡?¿")}
+    return None
+
+
+def memoria_guardar(dato: str) -> str:
+    memoria.guardar(dato)
+    return random.choice(["Anotado, Keric.", "Lo tendré presente.", "Guardado en mi memoria.", "No se me olvida."])
+
+
+def memoria_olvidar(tema: str) -> str:
+    borrado = memoria.olvidar(tema)
+    if not borrado:
+        return f"No tenía nada guardado sobre {tema}."
+    return f"Listo, olvidé que {borrado}." if len(borrado) < 120 else "Listo, ya lo olvidé."
+
+
+def memoria_consultar(tema: str) -> str:
+    recuerdos = memoria.recuerdos_sobre(tema)
+    if not recuerdos:
+        return f"No tengo nada guardado sobre {tema}." if tema else "Todavía no me has contado nada de ti."
+    # Solo datos cortos se leen enteros; de una conversación basta la pregunta.
+    frases = [
+        r.split(" — ")[0].replace("Keric preguntó:", "me preguntaste").strip()
+        for r in recuerdos[:3]
+    ]
+    return "Recuerdo que " + "; ".join(frases) + "."
+
+
 def tipo_charla(t: str):
     match = PATRON_CHARLA.match(t.strip())
     if not match:
@@ -2128,6 +2197,10 @@ def router_local(texto: str):
     charla = tipo_charla(t_crudo)
     if charla:
         return [("charla", {"tipo": charla})]
+
+    pedido_memoria = pedido_de_memoria(texto)
+    if pedido_memoria:
+        return [pedido_memoria]
 
     pregunta_pantalla = extraer_pedido_analisis_pantalla(texto)
     if pregunta_pantalla:
@@ -2467,6 +2540,7 @@ PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
 # saludo): envolverlas con "Claro, Keric. ¿Quieres...?" suena raro.
 RESPUESTAS_COMPLETAS = (
     "confirmar_accion", "confirmacion_cancelada", "charla", "respuesta_busqueda",
+    "memoria_guardar", "memoria_olvidar", "memoria_consultar",
 )
 
 
@@ -2713,6 +2787,15 @@ def ejecutar_comando_local(nombre: str, args: dict):
 
     if nombre == "charla":
         return random.choice(RESPUESTAS_CHARLA[args["tipo"]])
+
+    if nombre == "memoria_guardar":
+        return memoria_guardar(**args)
+
+    if nombre == "memoria_olvidar":
+        return memoria_olvidar(**args)
+
+    if nombre == "memoria_consultar":
+        return memoria_consultar(**args)
 
     if nombre == "clima":
         return reporte_clima(**args)
@@ -2974,6 +3057,14 @@ async def procesar_mensaje(
     # 2. ROUTER LOCAL
     comandos = router_local(mensaje_usuario)
 
+    # Datos que Keric cuenta al pasar ("estoy aprendiendo Flutter"):
+    # se guardan sin interrumpir lo que sea que pidió.
+    if not any(nombre == "memoria_guardar" for nombre, _ in comandos or []):
+        dato = memoria.dato_personal(mensaje_usuario)
+        if dato:
+            print(f"[*] Memoria: dato personal -> {dato}")
+            memoria.guardar_en_segundo_plano(dato)
+
     if comandos:
         print(f"[*] Router local: {comandos}")
 
@@ -3046,6 +3137,12 @@ async def procesar_mensaje(
     contexto = contexto_para_pregunta(mensaje_usuario)
     if contexto:
         mensajes.append({"role": "system", "content": contexto})
+
+    # Recuerdos a largo plazo: solo los 2-3 relevantes, o nada.
+    recuerdos = await asyncio.to_thread(memoria.contexto_recuerdos, mensaje_usuario)
+    if recuerdos:
+        print(f"[*] Memoria: {recuerdos}")
+        mensajes.append({"role": "system", "content": recuerdos})
 
     mensajes.extend(historial_chat)
     tools_mensaje = tools_necesarias(mensaje_usuario)
@@ -3173,6 +3270,13 @@ async def procesar_mensaje(
 
     # 6. MEMORIA
     historial_chat.append({"role": "assistant", "content": texto_final})
+
+    # Se guardan las charlas y búsquedas, no las órdenes ("abre
+    # Firefox" por Groq no es algo que valga la pena recordar).
+    if not response_message.tool_calls or any(
+        nombre == "respuesta_busqueda" for nombre, _, _ in resultados_tool
+    ):
+        memoria.guardar_conversacion(mensaje_usuario, texto_final)
     if len(historial_chat) > MAX_HISTORIAL:
         historial_chat = historial_chat[-MAX_HISTORIAL:]
 
@@ -3664,4 +3768,6 @@ def sensores_endpoint():
 if __name__ == "__main__":
     import uvicorn
     print("Iniciando Madeline FastAPI en http://0.0.0.0:8000")
+    # Recuerdos guardados con Ollama apagado: se completan de fondo.
+    threading.Thread(target=memoria.rellenar_embeddings, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -24,6 +24,9 @@ sin gastar tokens.
   Bluetooth, buscar en la web, reporte del sistema, actualizaciones, captura y análisis de pantalla.
 - **Voz natural** con `edge-tts` (`es-MX-DaliaNeural`) y efecto de audio opcional; voz local de
   respaldo con Piper o `espeak-ng` si no hay internet.
+- **Memoria a largo plazo local**: recuerda lo que le pides ("recuerda que…"), los datos que
+  cuentas al pasar ("estoy aprendiendo Flutter") y las conversaciones. Todo se guarda en SQLite
+  con embeddings de Ollama en tu PC; a Groq solo llegan los 2–3 recuerdos relevantes, o ninguno.
 - **App móvil (Flutter)**: hablarle desde el celular, recibir la respuesta en audio, ver capturas
   y un panel de sensores del PC en tiempo real.
 - **Seguridad**: token obligatorio para peticiones desde la red (`X-Madeline-Token`), confirmación
@@ -49,12 +52,14 @@ flowchart LR
 ```
 .
 ├── server/
-│   └── madeline_server.py   # API FastAPI: router local, herramientas, Groq y voz
+│   ├── madeline_server.py   # API FastAPI: router local, herramientas, Groq y voz
+│   └── memoria.py           # Memoria a largo plazo (SQLite + embeddings locales)
 ├── mobile/                  # App Flutter compañera (Android)
 ├── scripts/
 │   └── madeline_mic.sh      # Atajo de micrófono para Hyprland (Super+J)
 ├── tests/
-│   └── test_madeline.py     # Tests del router y de la seguridad (sin red)
+│   ├── test_madeline.py     # Tests del router y de la seguridad (sin red)
+│   └── test_memoria.py      # Tests de la memoria
 ├── .env.example             # Variables de entorno de ejemplo
 └── requirements.txt
 ```
@@ -66,6 +71,8 @@ flowchart LR
 - Herramientas del sistema: `mpv`, `ffmpeg`, `grim`, `playerctl`, `parecord`, `jq`, `notify-send`,
   `bluetoothctl`. Opcionales: `espeak-ng` o `piper-tts` (voz offline), `checkupdates`, `paru`/`yay`.
 - Una API key de [Groq](https://console.groq.com/keys).
+- [Ollama](https://ollama.com) con el modelo de embeddings: `ollama pull embeddinggemma` (opcional:
+  sin él, la memoria busca por palabras clave).
 
 En Arch / CachyOS:
 
@@ -128,6 +135,21 @@ El celular debe estar en la misma red que el PC.
 
 Las peticiones que no vienen del propio PC necesitan el header `X-Madeline-Token`.
 
+## Memoria
+
+| Le dices                                   | Qué hace                                         | Tokens de Groq |
+|--------------------------------------------|--------------------------------------------------|----------------|
+| "Recuerda que mi hermana se llama Ana"     | Guarda el dato                                   | 0              |
+| "Estoy aprendiendo Flutter, ¿qué opinas?"  | Guarda el dato y responde normalmente            | lo de siempre  |
+| "¿Qué recuerdas de mi hermana?"            | Lee la memoria                                   | 0              |
+| "¿Qué sabes de mí?"                        | Lista los últimos datos                          | 0              |
+| "Olvida lo de mi hermana"                  | Borra el dato y las charlas que lo repiten       | 0              |
+| Cualquier pregunta que vaya a Groq         | Agrega los 2–3 recuerdos relevantes (si hay)     | ~30–60 extra   |
+
+Las órdenes ("sube el volumen") no se guardan. Los recuerdos viven en `data/memoria.db`, que no se
+sube al repositorio. El modelo de embeddings usa ~700 MB de RAM solo mientras está cargado (Ollama lo
+descarga tras `MADELINE_EMBED_KEEP_ALIVE` sin uso) y tarda ~25 ms por búsqueda en CPU.
+
 ## Configuración
 
 | Variable                 | Descripción                                               | Por defecto          |
@@ -138,6 +160,9 @@ Las peticiones que no vienen del propio PC necesitan el header `X-Madeline-Token
 | `MADELINE_EFECTO_VOZ`    | `sutil`, `holografico` o `ninguno`                        | `ninguno`            |
 | `MADELINE_PIPER_MODELO`  | Modelo `.onnx` de Piper para la voz offline               | vacío                |
 | `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` | Enviar capturas a Telegram (opcional)        | vacío                |
+| `MADELINE_MODELO_EMBED`  | Modelo de embeddings de Ollama                            | `embeddinggemma`     |
+| `MADELINE_EMBED_KEEP_ALIVE` | Tiempo que el modelo queda en RAM tras usarse          | `10m`                |
+| `MADELINE_MEMORIA_DB`    | Ruta de la base de datos de recuerdos                     | `data/memoria.db`    |
 
 ## Tests
 
