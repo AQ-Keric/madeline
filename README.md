@@ -17,6 +17,8 @@ sin gastar tokens.
 
 ## Características
 
+- **Palabra de activación**: di *"Madeline, …"* y te escucha, como Alexa. La detección es offline
+  (Vosk) y nada sale del PC hasta que oye su nombre.
 - **Control por voz** con un atajo global (`Super + J`): grabar, transcribir con Whisper y ejecutar.
 - **Router local**: las órdenes frecuentes (multimedia, volumen, apps, clima, charla corta) se
   detectan con expresiones regulares y no llaman al LLM. Pensado para el plan gratuito de Groq.
@@ -37,6 +39,7 @@ sin gastar tokens.
 ```mermaid
 flowchart LR
     Mic["Super+J<br/>scripts/madeline_mic.sh"] -->|audio| API
+    Wake["&quot;Madeline, …&quot;<br/>scripts/madeline_escucha.py (Vosk)"] -->|audio| API
     App["App Flutter<br/>(mobile/)"] -->|audio / texto + token| API
     API["FastAPI<br/>server/madeline_server.py"] --> Router{"Router local"}
     Router -->|orden conocida| Acciones["Acciones del sistema<br/>hyprctl · playerctl · grim · bluetoothctl"]
@@ -56,10 +59,13 @@ flowchart LR
 │   └── memoria.py           # Memoria a largo plazo (SQLite + embeddings locales)
 ├── mobile/                  # App Flutter compañera (Android)
 ├── scripts/
-│   └── madeline_mic.sh      # Atajo de micrófono para Hyprland (Super+J)
+│   ├── madeline_mic.sh      # Atajo de micrófono para Hyprland (Super+J)
+│   ├── madeline_escucha.py  # Palabra de activación "Madeline" (Vosk, offline)
+│   └── madeline_escucha_toggle.sh  # Pausar/reanudar la escucha (Super+Shift+J)
 ├── tests/
 │   ├── test_madeline.py     # Tests del router y de la seguridad (sin red)
-│   └── test_memoria.py      # Tests de la memoria
+│   ├── test_memoria.py      # Tests de la memoria
+│   └── test_escucha.py      # Tests de la palabra de activación
 ├── .env.example             # Variables de entorno de ejemplo
 └── requirements.txt
 ```
@@ -90,6 +96,11 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 cp .env.example .env   # y completa GROQ_API_KEY y MADELINE_TOKEN
+
+# Modelo de voz offline para la palabra de activación (~40 MB)
+mkdir -p data/modelos && cd data/modelos
+curl -LO https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip
+unzip vosk-model-small-es-0.42.zip && rm vosk-model-small-es-0.42.zip
 ```
 
 ## Uso
@@ -105,11 +116,21 @@ Para arrancarla con la sesión y tener el atajo de voz, en `hyprland.conf`:
 
 ```ini
 bind = SUPER, J, exec, /ruta/a/madeline/scripts/madeline_mic.sh
+bind = SUPER SHIFT, J, exec, /ruta/a/madeline/scripts/madeline_escucha_toggle.sh
 exec-once = bash -c 'cd /ruta/a/madeline && .venv/bin/python server/madeline_server.py'
+exec-once = bash -c 'cd /ruta/a/madeline && .venv/bin/python scripts/madeline_escucha.py'
 exec-once = bash -c 'sleep 8 && curl -s -X POST http://127.0.0.1:8000/bienvenida'
 ```
 
-Presiona `Super + J` para empezar a grabar y otra vez para enviar.
+Hay dos formas de hablarle:
+
+- Di **"Madeline, …"** (por ejemplo *"Madeline, pon música"*). Suena un aviso y graba hasta que te
+  callas. Si solo dices "Madeline", espera unos segundos a que digas la orden. `Super + Shift + J`
+  pausa o reanuda la escucha.
+- Presiona `Super + J` para empezar a grabar y otra vez para enviar.
+
+La escucha continua usa ~4 % de un núcleo y ~190 MB de RAM. Lo que dices antes de "Madeline" se
+procesa solo en tu PC y se descarta.
 
 ### App móvil
 

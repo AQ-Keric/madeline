@@ -10,6 +10,7 @@ beautifulsoup4==4.15.0
 python-dotenv==1.2.2
 pillow==12.3.0
 numpy==2.5.4
+vosk==0.3.45
 
 # Tests (TestClient de FastAPI)
 httpx==0.28.1
