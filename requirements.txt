@@ -1,0 +1,14 @@
+# Servidor de Madeline (Python 3.12+)
+fastapi==0.141.1
+uvicorn==0.52.1
+python-multipart==0.0.32
+pydantic==2.13.4
+groq==1.6.0
+edge-tts==7.2.8
+requests==2.34.2
+beautifulsoup4==4.15.0
+python-dotenv==1.2.2
+pillow==12.3.0
+
+# Tests (TestClient de FastAPI)
+httpx==0.28.1

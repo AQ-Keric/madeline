@@ -10,16 +10,18 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 
 # Flutter / Dart
-jarvis_mobile/.dart_tool/
-jarvis_mobile/build/
-jarvis_mobile/.flutter-plugins
-jarvis_mobile/.flutter-plugins-dependencies
+mobile/.dart_tool/
+mobile/build/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
 
 # IDE
 .idea/
 .vscode/
+*.iml
 
 # Temporales
 tmp/
