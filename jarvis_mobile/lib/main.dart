@@ -1,11 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:audioplayers/audioplayers.dart';
+
+// Se configuran al compilar, para no dejar el token escrito en el código:
+//   flutter build apk --dart-define=JARVIS_TOKEN=xxx --dart-define=JARVIS_IP=192.168.0.197
+const String kServerIp = String.fromEnvironment('JARVIS_IP', defaultValue: '192.168.0.197');
+const String kJarvisToken = String.fromEnvironment('JARVIS_TOKEN');
+const Map<String, String> kCabeceras = {'X-Jarvis-Token': kJarvisToken};
 
 void main() {
   runApp(const JarvisApp());
@@ -37,7 +45,7 @@ class JarvisHome extends StatefulWidget {
 }
 
 class _JarvisHomeState extends State<JarvisHome> {
-  final String serverIp = '192.168.0.197'; 
+  final String serverIp = kServerIp;
   final String serverPort = '8000';
 
   late final AudioRecorder _audioRecorder;
@@ -46,10 +54,20 @@ class _JarvisHomeState extends State<JarvisHome> {
   
   bool _isRecording = false;
   bool _isProcessing = false;
+  // Si el dedo sigue sobre el botón. La primera vez, el diálogo de
+  // permiso del micrófono hace que se suelte ANTES de que arranque la
+  // grabación; sin esto quedaba grabando sin fin.
+  bool _dedoAbajo = false;
+
+  // Sin límite, si el PC se colgaba la app quedaba "Procesando..."
+  // para siempre.
+  static const Duration _timeoutServidor = Duration(seconds: 60);
   
   String _statusText = 'Iniciando enlace...';
   String _responseText = 'Iniciando protocolo de conexión con CachyOS...';
-  String? _imageUrl;
+  // Bytes de la última captura: el servidor la borra apenas se
+  // descarga, así que se baja UNA vez y se usa para mostrar y guardar.
+  Uint8List? _imagenBytes;
 
   @override
   void initState() {
@@ -63,7 +81,7 @@ class _JarvisHomeState extends State<JarvisHome> {
     final uri = Uri.parse('http://$serverIp:$serverPort/');
     try {
       // Intentamos hacer un ping al PC. Si en 3 segundos no responde, asume que está caído.
-      final response = await http.get(uri).timeout(const Duration(seconds: 3));
+      final response = await http.get(uri, headers: kCabeceras).timeout(const Duration(seconds: 3));
       
       if (response.statusCode == 200) {
         setState(() {
@@ -104,11 +122,16 @@ class _JarvisHomeState extends State<JarvisHome> {
           path: path,
         );
 
+        if (!_dedoAbajo) {
+          await _audioRecorder.stop();
+          return;
+        }
+
         setState(() {
           _isRecording = true;
           _statusText = 'Escuchando...';
           _responseText = '';
-          _imageUrl = null;
+          _imagenBytes = null;
         });
       }
     } catch (e) {
@@ -117,6 +140,7 @@ class _JarvisHomeState extends State<JarvisHome> {
   }
 
   Future<void> _stopRecordingAndSend() async {
+    if (!_isRecording) return;
     try {
       final path = await _audioRecorder.stop();
       setState(() {
@@ -126,7 +150,12 @@ class _JarvisHomeState extends State<JarvisHome> {
       });
 
       if (path != null) await _sendAudioToServer(path);
-    } catch (e) {}
+    } catch (e) {
+      setState(() {
+        _isRecording = false;
+        _statusText = 'Error al detener la grabación: $e';
+      });
+    }
   }
 
   Future<void> _sendAudioToServer(String filePath) async {
@@ -134,9 +163,9 @@ class _JarvisHomeState extends State<JarvisHome> {
     try {
       var request = http.MultipartRequest('POST', uri);
       request.files.add(await http.MultipartFile.fromPath('audio', filePath));
-      request.headers.addAll({'accept': 'application/json'});
+      request.headers.addAll({'accept': 'application/json', ...kCabeceras});
 
-      var streamedResponse = await request.send();
+      var streamedResponse = await request.send().timeout(_timeoutServidor);
       var response = await http.Response.fromStream(streamedResponse);
       await _handleServerResponse(response);
     } catch (e) {
@@ -158,16 +187,16 @@ class _JarvisHomeState extends State<JarvisHome> {
       _isProcessing = true;
       _statusText = 'Enviando texto...';
       _responseText = '';
-      _imageUrl = null;
+      _imagenBytes = null;
     });
 
     final uri = Uri.parse('http://$serverIp:$serverPort/comando_texto?origen=telefono');
     try {
       var response = await http.post(
         uri,
-        headers: {"Content-Type": "application/json", "accept": "application/json"},
+        headers: {"Content-Type": "application/json", "accept": "application/json", ...kCabeceras},
         body: jsonEncode({"texto": text}),
-      );
+      ).timeout(_timeoutServidor);
       await _handleServerResponse(response);
     } catch (e) {
       setState(() => _responseText = 'Error de conexión por texto.');
@@ -184,13 +213,13 @@ class _JarvisHomeState extends State<JarvisHome> {
       final data = jsonDecode(utf8.decode(response.bodyBytes));
       setState(() {
         _responseText = data['response'] ?? 'Sin respuesta';
-        if (data['image_path'] != null) {
-          final time = DateTime.now().millisecondsSinceEpoch;
-          _imageUrl = 'http://$serverIp:$serverPort${data['image_path']}?t=$time';
-        } else {
-          _imageUrl = null;
-        }
+        _imagenBytes = null;
       });
+
+      if (data['image_path'] != null) {
+        // Sin await: el audio de Jarvis no tiene por qué esperar a la imagen.
+        _descargarYGuardarCaptura('http://$serverIp:$serverPort${data['image_path']}');
+      }
 
       if (data['audio_path'] != null) {
         final time = DateTime.now().millisecondsSinceEpoch;
@@ -203,8 +232,40 @@ class _JarvisHomeState extends State<JarvisHome> {
         }
       }
     } else {
-      setState(() => _responseText = 'Error del servidor: ${response.statusCode}');
+      // El servidor manda el motivo en "detail" (ej: "No se detectó voz.").
+      String mensaje = 'Error del servidor: ${response.statusCode}';
+      try {
+        final detalle = jsonDecode(utf8.decode(response.bodyBytes))['detail'];
+        if (detalle != null) mensaje = detalle.toString();
+      } catch (_) {}
+      setState(() => _responseText = mensaje);
     }
+  }
+
+  Future<void> _descargarYGuardarCaptura(String url) async {
+    try {
+      final respuesta = await http.get(Uri.parse(url)).timeout(_timeoutServidor);
+      if (respuesta.statusCode != 200) {
+        _avisar('La captura ya no está disponible en el PC.');
+        return;
+      }
+
+      final bytes = respuesta.bodyBytes;
+      setState(() => _imagenBytes = bytes);
+
+      if (!await Gal.hasAccess(toAlbum: true)) {
+        await Gal.requestAccess(toAlbum: true);
+      }
+      await Gal.putImageBytes(bytes, album: 'Jarvis');
+      _avisar('Captura guardada en la galería (álbum Jarvis).');
+    } catch (e) {
+      _avisar('No pude guardar la captura: $e');
+    }
+  }
+
+  void _avisar(String mensaje) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(mensaje)));
   }
 
   @override
@@ -245,10 +306,10 @@ class _JarvisHomeState extends State<JarvisHome> {
                       const SizedBox(height: 10),
                       Text(_responseText, style: const TextStyle(fontSize: 18, height: 1.5, color: Colors.white70)),
                       const SizedBox(height: 20),
-                      if (_imageUrl != null)
+                      if (_imagenBytes != null)
                         ClipRRect(
                           borderRadius: BorderRadius.circular(10),
-                          child: Image.network(_imageUrl!, fit: BoxFit.cover),
+                          child: Image.memory(_imagenBytes!, fit: BoxFit.cover),
                         ),
                     ],
                   ),
@@ -265,9 +326,18 @@ class _JarvisHomeState extends State<JarvisHome> {
                   ),
                   const SizedBox(height: 15),
                   GestureDetector(
-                    onTapDown: (_) => _startRecording(),
-                    onTapUp: (_) => _stopRecordingAndSend(),
-                    onTapCancel: () => _stopRecordingAndSend(),
+                    onTapDown: (_) {
+                      _dedoAbajo = true;
+                      _startRecording();
+                    },
+                    onTapUp: (_) {
+                      _dedoAbajo = false;
+                      _stopRecordingAndSend();
+                    },
+                    onTapCancel: () {
+                      _dedoAbajo = false;
+                      _stopRecordingAndSend();
+                    },
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 200),
                       height: _isRecording ? 100 : 85,
@@ -361,7 +431,7 @@ class _MonitorDrawerState extends State<MonitorDrawer> {
   Future<void> _fetchSensores() async {
     final uri = Uri.parse('http://${widget.serverIp}:${widget.serverPort}/sensores');
     try {
-      final response = await http.get(uri).timeout(const Duration(seconds: 2));
+      final response = await http.get(uri, headers: kCabeceras).timeout(const Duration(seconds: 2));
       if (response.statusCode == 200) {
         if (mounted) {
           setState(() {

@@ -16,6 +16,8 @@ dependencies:
   path_provider: ^2.1.3
   permission_handler: 11.3.0
   audioplayers: ^6.8.1
+  # Guardar capturas en la galería del teléfono
+  gal: ^2.3.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
