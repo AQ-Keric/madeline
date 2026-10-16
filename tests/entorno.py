@@ -12,7 +12,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 os.environ.setdefault("GROQ_API_KEY", "test")
-os.environ["MADELINE_MEMORIA_DB"] = os.path.join(tempfile.mkdtemp(prefix="madeline_test_"), "memoria.db")
+_TMP = tempfile.mkdtemp(prefix="madeline_test_")
+os.environ["MADELINE_MEMORIA_DB"] = os.path.join(_TMP, "memoria.db")
+os.environ["MADELINE_LOG_SIN_TEMA"] = os.path.join(_TMP, "frases_sin_tema.log")
 
 import memoria  # noqa: E402
 

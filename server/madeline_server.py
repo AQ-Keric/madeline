@@ -2924,123 +2924,122 @@ def resumir_resultados_locales(resultados):
     return f"{muletilla} " + "; ".join(frases) + "."
 
 
+# Temas para elegir qué schemas mandar a Groq cuando el router local no
+# entendió la orden. Con una sola palabra del tema, Groq recibe el
+# grupo completo (2-3 tools) y decide si ejecutar algo o si solo se le
+# está hablando del tema. Son fragmentos de regex que se buscan sin
+# tildes y al inicio de palabra, así "pausa" también toma "pausan" o
+# "pausar" (con \b al final cuando el prefijo choca, como "ram"). Evitar
+# palabras muy comunes ("para", "tema", "tiempo" sola) porque mandarían
+# tools de más en cada pregunta. Costo aproximado por grupo: música
+# ~220 tokens, apps ~170, volumen ~145.
+TEMAS_TOOLS = {
+    "musica": (
+        ("musica", "cancion", "sonando", "suena", "escuch", "play", "pausa",
+         "reproduc", "reanud", "despaus", "siguiente", "skip", "stop",
+         "deten", "spotify", "youtube music", "yt music", "radio",
+         "playlist", "artista", "cantante", "album", r"rolas?\b"),
+        ("control_multimedia", "info_cancion", "abrir_radio_musica"),
+    ),
+    "volumen": (
+        ("volumen", "silenci", "mute", "mutea", "mas fuerte", "mas bajito",
+         "mas alto", "mas bajo", "no se escucha", "no escucho"),
+        ("ajustar_volumen",),
+    ),
+    "apps": (
+        ("abre", "abrir", "ejecuta", "lanza", "cierra", "cerra", r"mata\b",
+         "matar", "termina", "quita"),
+        ("abrir_aplicacion", "cerrar_aplicacion"),
+    ),
+    "ventanas": (
+        ("mueve", "mover", "escritorio", "workspace", "ventana"),
+        ("mover_ventana",),
+    ),
+    "clima": (
+        ("clima", "temperatura", "lluvia", "llueve", "llov", "pronostico",
+         "hace frio", "hace calor", "que tiempo", "el tiempo", "nublado",
+         "paraguas"),
+        ("reporte_clima",),
+    ),
+    "sistema": (
+        ("estado del sistema", "estado del pc", r"ram\b", "cpu", "procesador",
+         "como esta el pc", "como va el pc", "temperatura del pc"),
+        ("estado_sistema",),
+    ),
+    "energia": (
+        ("apaga", "reinicia", "suspende", "cierra todo", "cerrar todo",
+         "modo panico"),
+        ("control_energia", "cerrar_todo"),
+    ),
+    "actualizaciones": (
+        ("actualiza", "paquetes", "update"),
+        ("actualizar_sistema", "verificar_actualizaciones"),
+    ),
+    "bluetooth": (
+        ("bluetooth", "audifono", "auricular", "parlante", "conect",
+         "desconect", "vincula"),
+        ("controlar_bluetooth", "conectar_bluetooth", "desconectar_bluetooth"),
+    ),
+    "pantalla": (
+        ("pantalla", "captura", "screenshot", "que ves", "mira esto"),
+        ("tomar_captura", "analizar_pantalla"),
+    ),
+    "busqueda": (
+        ("busca", "investiga", "internet", "en la web", "noticia",
+         "informacion reciente"),
+        ("buscar_en_web",),
+    ),
+    "pestanas": (
+        ("paper", "articulos", "fuentes", "imagenes", "pestana"),
+        ("abrir_pestanas_busqueda", "buscar_en_web"),
+    ),
+}
+
+PATRONES_TEMAS = {
+    tema: re.compile(r"\b(?:" + "|".join(palabras) + ")")
+    for tema, (palabras, _) in TEMAS_TOOLS.items()
+}
+
+# Frases que llegaron a Groq sin ningún tema: sirven para descubrir
+# formas de pedir las cosas que todavía no se reconocen.
+LOG_SIN_TEMA = os.getenv(
+    "MADELINE_LOG_SIN_TEMA",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "frases_sin_tema.log"),
+)
+
+
+def temas_del_mensaje(texto: str) -> list:
+    t = quitar_tildes(texto.lower())
+    return [tema for tema, patron in PATRONES_TEMAS.items() if patron.search(t)]
+
+
+def registrar_frase_sin_tema(texto: str):
+    try:
+        os.makedirs(os.path.dirname(LOG_SIN_TEMA), exist_ok=True)
+        with open(LOG_SIN_TEMA, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M}\t{texto}\n")
+    except OSError as e:
+        print(f"[!] No pude registrar la frase sin tema: {e}")
+
+
 def tools_necesarias(texto: str):
-    """Envía a Groq solo los schemas que podrían ser necesarios."""
-    t = texto.lower()
+    """Envía a Groq solo los schemas de los temas que aparecen en el texto."""
     nombres = set()
+    temas = temas_del_mensaje(texto)
+    for tema in temas:
+        nombres.update(TEMAS_TOOLS[tema][1])
 
-    if any(x in t for x in (
-        "busca en internet", "busca en la web", "búscalo en internet",
-        "buscalo en internet", "búscalo en la web", "buscalo en la web",
-        "investiga", "consulta internet", "en internet", "en la web",
-        "noticias de", "noticias sobre", "últimas noticias",
-        "ultimas noticias", "información reciente", "informacion reciente",
-    )):
-        nombres.add("buscar_en_web")
-
-    if any(x in t for x in (
-        "volumen", "sube el volumen", "baja el volumen",
-        "silencia", "silenciar", "mute",
-    )):
-        nombres.add("ajustar_volumen")
-
-    if any(x in t for x in (
-        "pausa", "pausar", "reproduce", "reproducir", "reanuda",
-        "reanudar", "siguiente canción", "siguiente cancion",
-        "canción anterior", "cancion anterior",
-    )):
-        nombres.add("control_multimedia")
-
-    if any(x in t for x in (
-        "qué canción", "que cancion", "qué está sonando",
-        "que esta sonando", "qué música", "que musica",
-    )):
-        nombres.add("info_cancion")
-
-    if any(x in t for x in (
-        "clima", "tiempo actual", "temperatura",
-        "lluvia", "llueve", "lloverá", "llovera", "pronóstico", "pronostico",
-    )):
-        nombres.add("reporte_clima")
-
-    if any(x in t for x in (
-        "estado del sistema", "estado del pc", "uso de ram",
-        "uso de cpu", "cuánta ram", "cuanta ram",
-    )):
-        nombres.add("estado_sistema")
-
-    if any(x in t for x in (
-        "captura", "screenshot", "captura de pantalla",
-    )):
-        nombres.add("tomar_captura")
-
-    if any(x in t for x in (
-        "abre ", "abrir ", "ejecuta ", "ejecutar ",
-        "lanza ", "lanzar ",
-    )):
-        nombres.add("abrir_aplicacion")
-
-    if any(x in t for x in (
-        "cierra ", "cerrar ", "mata ", "termina ",
-    )):
-        nombres.add("cerrar_aplicacion")
-
-    if any(x in t for x in (
-        "mueve ", "mover ", "escritorio", "workspace",
-    )):
-        nombres.add("mover_ventana")
-
-    if any(x in t for x in (
-        "apaga", "apagar", "reinicia", "reiniciar",
-    )):
-        nombres.add("control_energia")
-
-    if any(x in t for x in (
-        "cierra todo", "cerrar todo", "modo pánico", "modo panico",
-    )):
-        nombres.add("cerrar_todo")
-
-    if any(x in t for x in (
-        "bluetooth", "conecta", "conéctate", "conectate",
-        "desconecta", "desconéctate", "desconectate", "vincula",
-    )):
-        nombres.add("controlar_bluetooth")
-        nombres.add("conectar_bluetooth")
-        nombres.add("desconectar_bluetooth")
-
-    if any(x in t for x in (
-        "actualiza", "actualizar", "actualización", "actualizacion",
-        "paquetes",
-    )):
-        nombres.add("actualizar_sistema")
-        nombres.add("verificar_actualizaciones")
-
-    if any(x in t for x in (
-        "música", "musica", "youtube music", "yt music",
-    )):
-        nombres.add("abrir_radio_musica")
-
-    if any(x in t for x in (
-        "papers", "paper", "artículos", "articulos", "fuentes",
-        "imágenes", "imagenes", "pestañas", "pestanas",
-        "investigar", "investigación", "investigacion",
-    )):
-        nombres.add("abrir_pestanas_busqueda")
-        nombres.add("buscar_en_web")
-
-    if any(x in t for x in ("pantalla", "captura")):
-        nombres.add("analizar_pantalla")
-
-    if not nombres:
-        # Sin esto, si ninguna palabra clave matchea, la solicitud se
-        # manda a Groq sin NINGUNA herramienta. openai/gpt-oss-120b,
-        # al no tener herramientas pero sentir que la pregunta
-        # necesita info actual (como "¿a qué hora lloverá?"), a veces
-        # ALUCINA un tool interno de OpenAI (web.run) que no existe
-        # en esta API — Groq lo rechaza con 400 (bug conocido de los
-        # modelos gpt-oss cuando se quedan sin herramientas). Dándole
-        # siempre al menos buscar_en_web como opción real, tiene algo
-        # concreto para usar en vez de inventar algo que no existe.
+    if not temas:
+        registrar_frase_sin_tema(texto)
+        # Sin esto, si ningún tema matchea, la solicitud se manda a
+        # Groq sin NINGUNA herramienta. openai/gpt-oss-120b, al no
+        # tener herramientas pero sentir que la pregunta necesita info
+        # actual (como "¿a qué hora lloverá?"), a veces ALUCINA un tool
+        # interno de OpenAI (web.run) que no existe en esta API — Groq
+        # lo rechaza con 400 (bug conocido de los modelos gpt-oss
+        # cuando se quedan sin herramientas). Dándole siempre al menos
+        # buscar_en_web como opción real, tiene algo concreto para
+        # usar en vez de inventar algo que no existe.
         nombres.add("buscar_en_web")
 
     return [
