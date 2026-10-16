@@ -1,15 +1,13 @@
-"""Compara qué tan bien eligen tools distintas IAs, con las mismas
+"""Compara qué tan bien eligen tools distintas IAs (por ahora Groq), con las mismas
 frases, los mismos tools (según su tema) y el mismo prompt que usa
 Madeline. No ejecuta ninguna acción: solo compara la tool elegida con
 la esperada.
 
 Uso:
   .venv/bin/python scripts/comparar_ias.py groq
-  .venv/bin/python scripts/comparar_ias.py gemini
-  .venv/bin/python scripts/comparar_ias.py gemini --modelos   (lista los disponibles)
+  .venv/bin/python scripts/comparar_ias.py groq --modelos   (lista los disponibles)
 
-Las claves salen del .env: GROQ_API_KEY y GEMINI_API_KEY. El modelo de
-Gemini se cambia con GEMINI_MODELO (por defecto gemini-flash-lite-latest).
+La clave sale del .env (GROQ_API_KEY).
 """
 import json
 import os
@@ -33,14 +31,6 @@ PROVEEDORES = {
         # Mismos parámetros que procesar_mensaje.
         "extra": {"temperature": 0.2, "max_completion_tokens": 350, "reasoning_effort": "low"},
         "pausa": 2.5,
-    },
-    "gemini": {
-        "url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "clave": "GEMINI_API_KEY",
-        "modelo": os.getenv("GEMINI_MODELO", "gemini-flash-lite-latest"),
-        "extra": {"temperature": 0.2, "max_tokens": 350},
-        # El plan gratuito de Gemini permite pocas consultas por minuto.
-        "pausa": 7,
     },
 }
 
@@ -136,7 +126,10 @@ def preguntar(prov, clave, frase):
         cuerpo["tool_choice"] = "auto"
 
     inicio = time.time()
-    r = llamar(prov, cuerpo, clave)
+    try:
+        r = llamar(prov, cuerpo, clave)
+    except requests.RequestException as e:
+        return "ERROR", f"sin respuesta: {type(e).__name__}", time.time() - inicio, 0
     segundos = time.time() - inicio
     if r.status_code != 200:
         return "ERROR", r.text[:200], segundos, 0
@@ -200,6 +193,7 @@ def main():
         print(f"{n:2}. {'OK ' if ok else 'MAL'} {segundos:4.1f}s  {frase}", flush=True)
         if not ok:
             fallos.append(f"  {frase!r}: {nombre} {obtenidos}  (esperado {esperada} {args})")
+            print(f"       -> {nombre} {obtenidos}", flush=True)
         if n < len(CASOS):
             time.sleep(prov["pausa"])
 
