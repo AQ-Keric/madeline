@@ -25,6 +25,9 @@ MODELO = os.getenv(
     "MADELINE_VOSK_MODELO", os.path.join(RAIZ, "data", "modelos", "vosk-model-small-es-0.42")
 )
 URL_SERVIDOR = os.getenv("MADELINE_URL", "http://127.0.0.1:8000")
+# MADELINE_ESCUCHA_DEBUG=1 imprime todo lo que Vosk entiende, para
+# calibrar con tu voz. Apagado por defecto: no se registra lo que dices.
+DEBUG = os.getenv("MADELINE_ESCUCHA_DEBUG", "") == "1"
 
 # Mientras exista, no se escucha (lo crea/borra el toggle).
 ARCHIVO_PAUSA = "/tmp/madeline_escucha_pausada"
@@ -36,14 +39,23 @@ SONIDO_ACTIVACION = "/usr/share/sounds/freedesktop/stereo/message.oga"
 TASA = 16000
 BYTES_POR_SEGUNDO = TASA * 2
 BLOQUE = 4000  # 0.125 s
-# Audio previo a la detección que se manda igual: así "Madeline, sube
-# el volumen" dicho de corrido llega entero a Whisper.
-SEGUNDOS_PREVIOS = 2.5
+# Se guarda el audio de la frase en curso (desde el último silencio,
+# hasta este tope): así "Madeline, sube el volumen" dicho de corrido
+# llega entero a Whisper aunque se detecte recién al final de la frase.
+SEGUNDOS_PREVIOS = 10
 # Si dices solo "Madeline" y haces una pausa, cuánto espera la orden.
 SEGUNDOS_ESPERA_ORDEN = 6
 SEGUNDOS_MAX_ORDEN = 15
 
+# "madeleine" es como Vosk escribe "Madelain" (ma-de-lain).
 PALABRAS_ACTIVACION = {"madeline", "madeleine"}
+# Al cerrar cada frase se revisan las N transcripciones más probables,
+# no solo la primera: con la voz de Keric "Madelain" a veces sale
+# primero como "más de la" o "manuel hay", pero "madeleine" casi
+# siempre está entre las alternativas. Calibrado con sus grabaciones:
+# con 20 detecta 9/9 y 0 falsos en 111 frases parecidas. No cuesta CPU
+# extra (las alternativas salen del mismo cálculo).
+ALTERNATIVAS = 20
 
 
 def avisar(texto: str, urgencia: str = "low", ms: int = 3000):
@@ -116,6 +128,7 @@ def escuchar():
         sys.exit(f"[!] Falta el modelo de Vosk en {MODELO} (ver README).")
     modelo = Model(MODELO)
     reconocedor = KaldiRecognizer(modelo, TASA)
+    reconocedor.SetMaxAlternatives(ALTERNATIVAS)
 
     microfono = subprocess.Popen(
         ["parecord", "--raw", "--format=s16le", f"--rate={TASA}", "--channels=1"],
@@ -150,12 +163,24 @@ def escuchar():
             previo.append(bloque)
 
         fin_de_frase = reconocedor.AcceptWaveform(bloque)
-        texto = json.loads(
-            reconocedor.Result() if fin_de_frase else reconocedor.PartialResult()
-        ).get("text" if fin_de_frase else "partial", "")
+        if fin_de_frase:
+            resultado = json.loads(reconocedor.Result())
+            alternativas = [a["text"] for a in resultado.get("alternatives", [])]
+            alternativas = alternativas or [resultado.get("text", "")]
+        else:
+            alternativas = [json.loads(reconocedor.PartialResult()).get("partial", "")]
+        texto = alternativas[0]
+        con_activacion = next((t for t in alternativas if tiene_palabra_activacion(t)), None)
+
+        if DEBUG and fin_de_frase and texto:
+            print(f"[oído] {texto}  (activa: {con_activacion})", flush=True)
 
         if not grabando:
-            if not tiene_palabra_activacion(texto):
+            if not con_activacion:
+                if fin_de_frase:
+                    # Terminó una frase sin "Madeline": la próxima
+                    # empieza de cero.
+                    previo.clear()
                 continue
             grabando = True
             bytes_desde_activacion = 0
@@ -167,6 +192,8 @@ def escuchar():
 
         # Grabando la orden: termina cuando Vosk detecta el fin de la
         # frase. Si solo dijiste "Madeline", espera a la frase siguiente.
+        if frase_de_activacion and con_activacion:
+            texto = con_activacion
         if hay_orden(texto, frase_de_activacion):
             hubo_orden = True
         if fin_de_frase:

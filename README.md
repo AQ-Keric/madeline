@@ -61,7 +61,8 @@ flowchart LR
 ├── scripts/
 │   ├── madeline_mic.sh      # Atajo de micrófono para Hyprland (Super+J)
 │   ├── madeline_escucha.py  # Palabra de activación "Madeline" (Vosk, offline)
-│   └── madeline_escucha_toggle.sh  # Pausar/reanudar la escucha (Super+Shift+J)
+│   ├── madeline_escucha_toggle.sh  # Pausar/reanudar la escucha (Super+Shift+J)
+│   └── calibrar_activacion.py      # Graba tu voz para calibrar la activación
 ├── tests/
 │   ├── test_madeline.py     # Tests del router y de la seguridad (sin red)
 │   ├── test_memoria.py      # Tests de la memoria
@@ -128,6 +129,10 @@ Hay dos formas de hablarle:
   callas. Si solo dices "Madeline", espera unos segundos a que digas la orden. `Super + Shift + J`
   pausa o reanuda la escucha.
 - Presiona `Super + J` para empezar a grabar y otra vez para enviar.
+
+Reconoce tanto "Madeline" como "Madelain" (ma-de-lain). Si no te detecta bien, graba muestras con
+`scripts/calibrar_activacion.py` (quedan en `data/calibracion/`) y prueba con
+`MADELINE_ESCUCHA_DEBUG=1`, que muestra lo que entiende Vosk en cada frase.
 
 La escucha continua usa ~4 % de un núcleo y ~190 MB de RAM. Lo que dices antes de "Madeline" se
 procesa solo en tu PC y se descarta.
