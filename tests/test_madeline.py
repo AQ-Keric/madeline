@@ -47,6 +47,19 @@ class TestRouterLocal(unittest.TestCase):
             ],
         )
 
+    def test_apodos_de_apps(self):
+        self.assertEqual(
+            j.router_local("abre la calculadora y el excel"),
+            [
+                ("abrir_aplicacion", {"app_name": "calculadora"}),
+                ("abrir_aplicacion", {"app_name": "excel"}),
+            ],
+        )
+
+    def test_palabras_comunes_no_se_corrigen_a_apps_nuevas(self):
+        for palabra in ["sube", "sobre", "haces", "hace", "estudio", "controla"]:
+            self.assertEqual(j.normalizar_terminos(palabra), palabra)
+
     def test_termina_no_se_corrige_a_terminal(self):
         self.assertEqual(
             j.router_local("termina discord"),
@@ -86,6 +99,24 @@ class TestListaBlancaApps(unittest.TestCase):
         j.abrir_aplicacion("discord")
         popen.assert_called_once_with(
             ["hyprctl", "dispatch", "exec", "vesktop"]
+        )
+
+    def test_abrir_juego_de_steam_usa_su_appid(self, popen, run):
+        j.abrir_aplicacion("hades")
+        popen.assert_called_once_with(
+            ["hyprctl", "dispatch", "exec", "steam steam://rungameid/1145360"]
+        )
+
+    def test_alias_en_espanol_abre_la_app_real(self, popen, run):
+        j.abrir_aplicacion("excel")
+        popen.assert_called_once_with(
+            ["hyprctl", "dispatch", "exec", "libreoffice --calc"]
+        )
+
+    def test_cerrar_libreoffice_mata_soffice(self, popen, run):
+        j.cerrar_aplicacion("word")
+        run.assert_called_once_with(
+            ["pkill", "-i", "-f", "soffice"], stderr=j.subprocess.DEVNULL
         )
 
     def test_abrir_app_desconocida_no_ejecuta_nada(self, popen, run):

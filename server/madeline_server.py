@@ -1237,6 +1237,183 @@ DICCIONARIO_APPS = {
     "prism": "prismlauncher",
     "prism launcher": "prismlauncher",
     "bottles": "bottles",
+
+    # --- Navegadores, terminales y archivos ---
+    "firefox": "firefox",
+    "alacritty": "alacritty",
+    "dolphin": "dolphin",
+    "explorador": "dolphin",
+    "explorador de archivos": "dolphin",
+
+    # --- Oficina (LibreOffice) ---
+    "libreoffice": "libreoffice",
+    "word": "libreoffice-writer",
+    "writer": "libreoffice-writer",
+    "excel": "libreoffice-calc",
+    "calc": "libreoffice-calc",
+    "hoja de cálculo": "libreoffice-calc",
+    "hoja de calculo": "libreoffice-calc",
+    "powerpoint": "libreoffice-impress",
+    "power point": "libreoffice-impress",
+    "impress": "libreoffice-impress",
+
+    # --- Utilidades ---
+    "calculadora": "qalculate-gtk",
+    "calendario": "gnome-calendar",
+    "editor de texto": "gnome-text-editor",
+    "bloc de notas": "gnome-text-editor",
+    "control de volumen": "pavucontrol",
+    "mezclador de volumen": "pavucontrol",
+    "mezclador": "pavucontrol",
+    "pavucontrol": "pavucontrol",
+    "gestor de bluetooth": "blueman-manager",
+    "administrador de bluetooth": "blueman-manager",
+    "panel de nvidia": "nvidia-settings",
+    "configuración de nvidia": "nvidia-settings",
+    "configuracion de nvidia": "nvidia-settings",
+    "configuración de pantallas": "nwg-displays",
+    "configuracion de pantallas": "nwg-displays",
+    "monitor del sistema": "btop",
+    "administrador de tareas": "btop",
+    "btop": "btop",
+    "pantalla del celular": "scrcpy",
+    "espejo del celular": "scrcpy",
+    "scrcpy": "scrcpy",
+    "máquinas virtuales": "virt-manager",
+    "maquinas virtuales": "virt-manager",
+    "virt manager": "virt-manager",
+    "test de velocidad": "speedtest",
+    "speedtest": "speedtest",
+    "claude": "claude-desktop",
+
+    # --- Multimedia y descargas ---
+    "vlc": "vlc",
+    "mpv": "mpv",
+    "qbittorrent": "qbittorrent",
+    "torrent": "qbittorrent",
+    "jdownloader": "jdownloader",
+    "motrix": "motrix",
+    "upscayl": "upscayl",
+
+    # --- Programación y diseño ---
+    "android studio": "android-studio",
+    "arduino": "arduino-ide",
+    "arduino ide": "arduino-ide",
+    "rstudio": "rstudio",
+    "r studio": "rstudio",
+    "sublime": "sublime",
+    "sublime text": "sublime",
+    "inkscape": "inkscape",
+    "staruml": "staruml",
+    "star uml": "staruml",
+    "fritzing": "fritzing",
+    "meld": "meld",
+    "filezilla": "filezilla",
+    "haguichi": "haguichi",
+
+    # --- Launchers y emuladores ---
+    "lutris": "lutris",
+    "faugus": "faugus-launcher",
+    "olympus": "olympus",
+    "lime3ds": "lime3ds",
+    "lime": "lime3ds",
+    "emulador de 3ds": "lime3ds",
+    "pokemmo": "pokemmo",
+    "pokemon": "pokemmo",
+    "pokémon": "pokemmo",
+    "sober": "sober",
+    "roblox": "sober",
+
+    # --- Juegos de Steam ---
+    "battlefield": "battlefield",
+    "battlefield 4": "battlefield",
+    "celeste": "celeste",
+    "gravity circuit": "gravity circuit",
+    "guild wars": "guild wars 2",
+    "guild wars 2": "guild wars 2",
+    "guild wars dos": "guild wars 2",
+    "gw2": "guild wars 2",
+    "hacknet": "hacknet",
+    "hades": "hades",
+    "how to fish": "how to fish",
+    "katana zero": "katana zero",
+    "katana": "katana zero",
+    "project zomboid": "projectzomboid",
+    "zomboid": "projectzomboid",
+    "terraria": "terraria",
+    "outlast": "outlast",
+    "outlast trials": "outlast",
+    "the outlast trials": "outlast",
+    "ultimate chicken horse": "ultimate chicken horse",
+    "chicken horse": "ultimate chicken horse",
+
+    # --- Apps propias de Keric ---
+    "notas": "notas_app",
+    "mis notas": "notas_app",
+    "app de notas": "notas_app",
+    "crónica de tyria": "gw2_cronica",
+    "cronica de tyria": "gw2_cronica",
+    "crónica": "gw2_cronica",
+    "cronica": "gw2_cronica",
+    "simulador de liga": "descenso_primera_b",
+    "simulador": "descenso_primera_b",
+    "rocket stats": "rocket_stats",
+    "diana zero": "diana_zero",
+    "diana": "diana_zero",
+}
+
+# El comando real para ABRIR cuando no es el mismo nombre técnico:
+# juegos de Steam (por su appid), flatpaks y apps propias fuera del
+# PATH. Son constantes, nunca texto del usuario, así que pasarlas a
+# hyprctl exec (que corre en una shell) es seguro.
+_STEAM = "steam steam://rungameid/"
+_LOCAL = os.path.expanduser("~")
+COMANDOS_APERTURA = {
+    "telegram-desktop": "Telegram",
+    "bottles": "flatpak run com.usebottles.bottles",
+    "libreoffice-writer": "libreoffice --writer",
+    "libreoffice-calc": "libreoffice --calc",
+    "libreoffice-impress": "libreoffice --impress",
+    "btop": "kitty btop",
+    "speedtest": "flatpak run xyz.ketok.Speedtest",
+    "jdownloader": "JDownloader",
+    "motrix": "/opt/Motrix/motrix",
+    "rstudio": "/usr/lib/rstudio/rstudio",
+    "sublime": "flatpak run com.sublimetext.three",
+    "staruml": "/opt/StarUML/staruml",
+    "fritzing": "flatpak run org.fritzing.Fritzing",
+    "pokemmo": "flatpak run com.pokemmo.PokeMMO",
+    "sober": "flatpak run org.vinegarhq.Sober",
+    "battlefield": _STEAM + "1238860",
+    "celeste": _STEAM + "504230",
+    "gravity circuit": _STEAM + "858710",
+    "guild wars 2": _STEAM + "1284210",
+    "hacknet": _STEAM + "365450",
+    "hades": _STEAM + "1145360",
+    "how to fish": _STEAM + "4001890",
+    "katana zero": _STEAM + "460950",
+    "projectzomboid": _STEAM + "108600",
+    "terraria": _STEAM + "105600",
+    "outlast": _STEAM + "1304930",
+    "ultimate chicken horse": _STEAM + "386940",
+    "notas_app": f"{_LOCAL}/.local/bin/notas_app",
+    "gw2_cronica": f"{_LOCAL}/gw2/cronica/build/linux/x64/release/bundle/gw2_cronica",
+    "descenso_primera_b": f"{_LOCAL}/.local/opt/simulador-liga/descenso_primera_b",
+    "rocket_stats": f"{_LOCAL}/Documentos/app_rocket_stats/run_app.sh",
+    "diana_zero": f"{_LOCAL}/.local/bin/iniciar_diana_zero.sh",
+}
+
+# Alias que son palabras comunes (o casi): el corrector difuso de
+# normalizar_terminos() no debe "corregir" otras palabras hacia ellos
+# ("sobre" -> "sober", "haces" -> "hades", "anota" -> "notas").
+ALIAS_SIN_CORRECCION = {
+    "word", "excel", "calc", "writer", "impress", "calculadora",
+    "calendario", "mezclador", "explorador", "torrent", "lime", "sober",
+    "celeste", "hades", "katana", "outlast", "meld", "notas", "crónica",
+    "cronica", "simulador", "diana", "claude", "olympus", "faugus",
+    "sublime", "firefox", "dolphin", "arduino", "motrix", "pokemon",
+    "pokémon", "roblox", "battlefield", "lutris", "zomboid",
+    "pavucontrol", "rstudio", "r studio", "hacknet", "emulador de 3ds",
 }
 
 # Para CERRAR, el proceso real a matar a veces no es el mismo binario
@@ -1248,6 +1425,16 @@ DICCIONARIO_APPS = {
 PROCESOS_CIERRE = {
     "zen-browser": ["zen", "zen-browser"],
     "prismlauncher": ["prismlauncher", "java"],
+    "telegram-desktop": ["telegram"],
+    "libreoffice-writer": ["soffice"],
+    "libreoffice-calc": ["soffice"],
+    "libreoffice-impress": ["soffice"],
+    "libreoffice": ["soffice"],
+    "gw2_cronica": ["gw2_cronica"],
+    "diana_zero": ["visor_camara", "diana_zero"],
+    # Juegos de Steam: el proceso corre desde steamapps/common/<carpeta>
+    "battlefield": ["battlefield 4", "bf4"],
+    "outlast": ["outlast trials"],
 }
 
 
@@ -1347,13 +1534,15 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
     if not nombre_tecnico:
         return mensaje_app_desconocida("abrir", app_name)
 
+    comando = COMANDOS_APERTURA.get(nombre_tecnico, nombre_tecnico)
+
     try:
         if escritorio:
             escritorio = int(escritorio)
             clase = clase_ventana(nombre_tecnico)
 
             subprocess.Popen(
-                ["hyprctl", "dispatch", "exec", nombre_tecnico]
+                ["hyprctl", "dispatch", "exec", comando]
             )
 
             # Antes era un "exec && sleep 2 && move" con shell=True.
@@ -1374,7 +1563,7 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
             )
 
         subprocess.Popen(
-            ["hyprctl", "dispatch", "exec", nombre_tecnico]
+            ["hyprctl", "dispatch", "exec", comando]
         )
 
         return f"He dado la orden de abrir {app_name}."
@@ -1876,7 +2065,9 @@ def normalizar_terminos(texto: str) -> str:
             flags=re.IGNORECASE,
         )
 
-    vocabulario = list(DICCIONARIO_APPS.keys()) + list(DISPOSITIVOS_BLUETOOTH.keys())
+    vocabulario = [
+        alias for alias in DICCIONARIO_APPS if alias not in ALIAS_SIN_CORRECCION
+    ] + list(DISPOSITIVOS_BLUETOOTH.keys())
 
     if not vocabulario:
         return texto
