@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.parse
 import base64
+import unicodedata
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -224,12 +225,14 @@ def cerrar_aplicacion(app_name: str) -> str:
 
 def control_multimedia(accion: str) -> str:
     """Controla la reproducción de música."""
+    # play/pause explícitos: antes ambos eran "play-pause" (alternar),
+    # y "dale play" con la música sonando la pausaba.
     acciones_validas = {
-        "pausar": "play-pause",
-        "reproducir": "play-pause",
-        "siguiente": "next",
-        "anterior": "previous",
-        "reiniciar": "previous",
+        "pausar": ["pause"],
+        "reproducir": ["play"],
+        "siguiente": ["next"],
+        "anterior": ["previous"],
+        "reiniciar": ["position", "0"],
     }
 
     comando = acciones_validas.get(accion.lower())
@@ -244,11 +247,25 @@ def control_multimedia(accion: str) -> str:
             subprocess.run(["playerctl", "previous"], check=True)
             return "Se saltó a la canción anterior con doble toque."
 
-        subprocess.run(["playerctl", comando], check=True)
+        if accion.lower() == "reproducir" and not hay_reproductor():
+            # "Ponle play" sin nada abierto: mejor arrancar la radio
+            # que no hacer nada.
+            return abrir_radio_musica()
+
+        subprocess.run(["playerctl", *comando], check=True)
         return f"Se ejecutó la acción: {accion}."
 
     except Exception as e:
         return f"Pucha, no pude controlar la música: {e}"
+
+
+def hay_reproductor() -> bool:
+    """Si hay algún reproductor (Spotify, YouTube en el navegador...)
+    que playerctl pueda controlar."""
+    resultado = subprocess.run(
+        ["playerctl", "status"], capture_output=True, text=True
+    )
+    return resultado.returncode == 0
 
 
 def info_cancion() -> str:
@@ -1813,7 +1830,16 @@ def _palabras_de(frase: str) -> set:
     return set(frase.split())
 
 
-PALABRAS_PROTEGIDAS = set()
+# Palabras comunes que el corrector difuso confundía con apps
+# ("esto" y "stop" -> "desktop"), más el vocabulario de música.
+PALABRAS_PROTEGIDAS = {
+    "esto", "esta", "este", "eso", "esa", "ese", "estos", "estas", "para",
+    "pasa", "otra", "otro", "stop", "play", "skip", "next", "sigue", "tema",
+    "pausa", "canta", "suena", "musica", "música", "cancion", "canción",
+    "video", "anterior", "siguiente", "repite", "salta", "cambia", "ponle",
+    "dale", "todo", "todos", "nada", "algo", "ahora", "antes", "después",
+    "despues", "donde", "dónde", "cuando", "cuándo", "quien", "quién",
+}
 
 # Verbos de abrir/cerrar/mover: evita que un verbo real ("termina",
 # "sal", "de") se "corrija" a una app parecida.
@@ -1978,21 +2004,107 @@ def extraer_recordatorio(texto_original: str):
 
 INICIO_ORDEN = (
     r"(?:^|[,;.]\s*|\by\s+|\be\s+)"
-    r"[¿¡]?\s*(?:oye\s+)?(?:madel(?:ine|eine|aine|in)\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
+    r"[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
     r"(?:(?:puedes|podr[ií]as)\s+)?"
 )
 FIN_ORDEN = r"(?=\s*(?:[.,;!?]|\by\b|\be\b|$))"
-OBJETO_MUSICA = (
-    r"(?:\s+(?:la\s+|el\s+|de\s+)?"
-    r"(?:m[uú]sica|canci[oó]n|video|reproducci[oó]n|tema))?"
-)
 
-VERBOS_MULTIMEDIA = {
-    "pausar": r"pausa|pausar|pon pausa|det[eé]n|para",
-    "reproducir": r"reanuda|reanudar|contin[uú]a|dale play|play|reproduce|reproducir",
-    "siguiente": r"siguiente|la siguiente|next|pasa|cambia|otra|siguiente canci[oó]n",
-    "anterior": r"anterior|la anterior|previous|vuelve atr[aá]s|retrocede|canci[oó]n anterior",
+def quitar_tildes(texto: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+# Órdenes de música. Se buscan sobre el texto SIN tildes (Whisper a
+# veces las pone y a veces no) y, como el resto de órdenes cortas,
+# tienen que ocupar la cláusula entera: así "¿qué es una pausa
+# activa?" o "¿cuál es el siguiente feriado?" siguen yendo a Groq.
+# Las frases que tiene que entender están en tests/frases_multimedia.py.
+_OBJ = (
+    r"(?:(?:a\s+)?(?:la|el|esta|este|esa|ese)\s+|al\s+|a\s+)?"
+    r"(?:musica|cancion|video|reproduccion|tema|rola)"
+)
+_OBJ_OPC = rf"(?:\s+{_OBJ})?"
+# Relleno que puede ir al final sin cambiar la orden.
+_RELLENO = (
+    r"(?:\s+(?:de\s+nuevo|otra\s+vez|un\s+(?:momento|rato|segundo|ratito)"
+    r"|por\s+favor|porfa|ahora|ya|please))*"
+)
+_PONER = r"(?:ponle|ponele|pon|ponme|dale|darle|da|hazle)"
+
+PATRONES_MULTIMEDIA = {
+    "reproducir": [
+        rf"{_PONER}(?:\s+(?:al|el))?\s+play{_OBJ_OPC}",
+        rf"play{_OBJ_OPC}",
+        rf"(?:reanuda|reanudar|resume|continua|continuar|despausa|despausar|reproduce|reproducir){_OBJ_OPC}",
+        rf"(?:sigue|seguir)\s+con{_OBJ_OPC.replace('(?:', '(?:', 1)}",
+        rf"(?:quita|quitale|saca|sacale)\s+(?:la\s+|el\s+)?pausa(?:\s+{_OBJ})?",
+        rf"(?:vuelve\s+a\s+poner|pon\s+de\s+nuevo|pon\s+otra\s+vez)\s+{_OBJ}",
+        rf"pon\s+(?:la|el)\s+(?:musica|cancion|video)\s+(?:otra\s+vez|de\s+nuevo)",
+    ],
+    "pausar": [
+        rf"(?:pausa|pausar|pausala|pausalo|parala|paralo|deten|detener|detenla|stop){_OBJ_OPC}",
+        rf"para\s+{_OBJ}|para",
+        rf"(?:apaga|quita|calla)\s+{_OBJ}",
+        rf"{_PONER}\s+(?:una\s+)?(?:pausa|stop)(?:\s+{_OBJ})?",
+    ],
+    "siguiente": [
+        rf"(?:siguiente|la\s+siguiente|next|skip|la\s+que\s+sigue){_OBJ_OPC}",
+        rf"(?:(?:la|el)\s+)?(?:cancion|tema|video)\s+siguiente",
+        rf"otra(?!\s+vez){_OBJ_OPC}|otra\s+(?:cancion|tema|rola)",
+        rf"(?:pasa|pasate|salta|saltate|skipea|cambia|cambiale)"
+        rf"(?:\s+(?:a\s+la\s+siguiente|de\s+(?:cancion|tema)|esta(?:\s+cancion)?|este(?:\s+tema)?|{_OBJ}))?",
+        rf"pon(?:me)?\s+(?:la\s+siguiente|otra(?:\s+cancion)?|la\s+que\s+sigue)",
+    ],
+    "anterior": [
+        r"(?:(?:pon(?:me)?|vuelve\s+a|regresa\s+a|devuelvete\s+a|ve\s+a)\s+)?(?:la\s+|el\s+)?"
+        r"(?:(?:cancion|tema|video)\s+)?(?:anterior|de\s+antes)",
+        r"previous|vuelve\s+atras|retrocede|regresa",
+    ],
+    "reiniciar": [
+        rf"(?:reinicia|reiniciar|repite|repetir|empieza|vuelve\s+a\s+empezar)\s+{_OBJ}"
+        r"(?:\s+(?:de\s+nuevo|desde\s+(?:el\s+)?(?:principio|inicio|comienzo)))?",
+        rf"(?:pon\s+)?(?:{_OBJ}\s+)?desde\s+(?:el\s+)?(?:principio|inicio|comienzo)",
+        rf"otra\s+vez\s+{_OBJ}",
+    ],
 }
+
+PATRONES_INFO_CANCION = [
+    r"que\s+(?:cancion|tema|musica|rola)\s+(?:es(?:\s+(?:esta|este|esa|ese|la\s+que\s+suena))?"
+    r"|esta\s+sonando|suena|estoy\s+escuchando|es\s+la\s+que\s+suena)",
+    r"que\s+(?:esta\s+sonando|suena|estoy\s+escuchando)",
+    r"como\s+se\s+llama\s+(?:esta|este|esa|ese|la|el)\s+(?:cancion|tema|rola)",
+    r"quien\s+canta\s+(?:esto|eso|esta(?:\s+cancion)?|este(?:\s+tema)?)",
+    r"de\s+quien\s+es\s+(?:esta|este|esto|esa)(?:\s+(?:cancion|tema))?",
+    r"cual\s+es\s+(?:esta|esa)\s+cancion",
+    r"(?:cual\s+es\s+)?el\s+nombre\s+de\s+(?:esta|la|esa)\s+cancion",
+    r"que\s+tema\s+es\s+(?:este|ese)",
+    r"quien\s+es\s+el\s+artista",
+]
+_INICIO_INFO = r"(?:(?:dime|sabes|me\s+dices)\s+)?"
+
+
+def extraer_ordenes_multimedia(t: str):
+    """Órdenes de música de la frase, en el orden en que aparecen."""
+    t = quitar_tildes(t.lower())
+    encontradas = []
+    fin = _RELLENO + FIN_ORDEN
+
+    for accion, patrones in PATRONES_MULTIMEDIA.items():
+        for patron in patrones:
+            match = re.search(INICIO_ORDEN + rf"(?:{patron}){fin}", t)
+            if match:
+                encontradas.append((match.start(), ("multimedia", {"accion": accion})))
+                break
+
+    for patron in PATRONES_INFO_CANCION:
+        match = re.search(INICIO_ORDEN + _INICIO_INFO + rf"(?:{patron}){fin}", t)
+        if match:
+            encontradas.append((match.start(), ("info_cancion", {})))
+            break
+
+    return [orden for _, orden in sorted(encontradas, key=lambda o: o[0])]
 
 PATRON_CAPTURA = (
     r"\b(?:screenshot|pantallazo)\b"
@@ -2072,10 +2184,10 @@ def extraer_pedido_clima(t: str):
 # Charla corta que no necesita a Groq: "gracias" o "hola" gastaban
 # una llamada completa (prompt + tools) para contestar una frase.
 PATRON_CHARLA = re.compile(
-    r"^(?:oye\s+)?(?:madel(?:ine|eine|aine|in)\s*,?\s*)?"
+    r"^(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
     r"(?P<tipo>(?:muchas\s+)?gracias|hola|buenas|buenos d[ií]as|buenas tardes|"
     r"buenas noches|ok|okay|vale|listo|perfecto|genial|excelente)"
-    r"(?:\s*,?\s*madel(?:ine|eine|aine|in))?[\s.!¡¿?]*$"
+    r"(?:\s*,?\s*madel\w*)?[\s.!¡¿?]*$"
 )
 
 RESPUESTAS_CHARLA = {
@@ -2089,7 +2201,7 @@ RESPUESTAS_CHARLA = {
 # "recuerda que" no choca con los recordatorios: esos dicen
 # "recuérdame en N minutos".
 _PREFIJO_MEMORIA = (
-    r"^[¿¡]?\s*(?:oye\s+)?(?:madel(?:ine|eine|aine|in)\s*,?\s*)?"
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
     r"(?:por\s+favor\s*,?\s*)?"
 )
 PATRON_MEMORIA_GUARDAR = re.compile(
@@ -2240,19 +2352,9 @@ def router_local(texto: str):
     if re.search(PATRON_CAPTURA, t):
         comandos.append(("captura", {}))
 
-    for accion, verbos in VERBOS_MULTIMEDIA.items():
-        if re.search(INICIO_ORDEN + rf"(?:{verbos}){OBJETO_MUSICA}{FIN_ORDEN}", t):
-            comandos.append(("multimedia", {"accion": accion}))
-
-    if (
-        "qué canción" in t
-        or "que cancion" in t
-        or "qué está sonando" in t
-        or "que esta sonando" in t
-        or "qué música está sonando" in t
-        or "que musica esta sonando" in t
-    ):
-        comandos.append(("info_cancion", {}))
+    # Sobre el texto sin el corrector de apps: no hay apps que corregir
+    # y el corrector ya rompió "stop" y "esto".
+    comandos.extend(extraer_ordenes_multimedia(t_crudo))
 
     orden_volumen = extraer_orden_volumen(t)
     if orden_volumen:
@@ -2328,7 +2430,7 @@ def router_local(texto: str):
     # Reiniciar el PROCESO de Madeline (para aplicar cambios de código)
     # es distinto de reiniciar la PC — no necesita confirmación,
     # porque no interrumpe nada más que a la propia Madeline un momento.
-    if re.search(r"\breinicia(?:te)?\s+(?:el\s+)?(?:servidor|madel(?:ine|eine|aine|in))\b", t):
+    if re.search(r"\breinicia(?:te)?\s+(?:el\s+)?(?:servidor|madel\w*)\b", t):
         return [("reiniciar_servidor", {})]
 
     palabras_pc = r"(?:la\s+|el\s+)?(?:pc|computadora|computador|equipo|sistema)"
@@ -2547,6 +2649,11 @@ RESPUESTAS_COMPLETAS = (
 def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
     """Devuelve solo el 'núcleo' de la respuesta."""
     if resultado.startswith(PREFIJOS_ERROR):
+        return resultado
+
+    # "Ponle play" sin reproductor abre la radio: se dice eso, no
+    # "le doy play de nuevo".
+    if nombre == "multimedia" and resultado.startswith("Abriendo tu radio"):
         return resultado
 
     clave = (
