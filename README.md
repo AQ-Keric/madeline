@@ -120,7 +120,7 @@ bind = SUPER, J, exec, /ruta/a/madeline/scripts/madeline_mic.sh
 bind = SUPER SHIFT, J, exec, /ruta/a/madeline/scripts/madeline_escucha_toggle.sh
 exec-once = bash -c 'cd /ruta/a/madeline && .venv/bin/python server/madeline_server.py'
 exec-once = bash -c 'cd /ruta/a/madeline && .venv/bin/python scripts/madeline_escucha.py'
-exec-once = bash -c 'sleep 8 && curl -s -X POST http://127.0.0.1:8000/bienvenida'
+exec-once = /ruta/a/madeline/scripts/madeline_bienvenida.sh
 ```
 
 Hay dos formas de hablarle:
