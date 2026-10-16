@@ -2271,9 +2271,6 @@ PATRONES_MULTIMEDIA = {
         r"(?:\s+(?:de\s+nuevo|desde\s+(?:el\s+)?(?:principio|inicio|comienzo)))?",
         rf"(?:pon\s+)?(?:{_OBJ}\s+)?desde\s+(?:el\s+)?(?:principio|inicio|comienzo)",
         rf"otra\s+vez\s+{_OBJ}",
-        # "pon ESA canción de nuevo" es repetirla; "pon la música de
-        # nuevo" (sin demostrativo) sigue siendo reanudar.
-        r"pon(?:me)?\s+(?:esa|esta)\s+(?:cancion|tema|rola)\s+(?:de\s+nuevo|otra\s+vez)",
     ],
 }
 
@@ -2483,7 +2480,14 @@ def tipo_charla(t: str):
 
 
 def router_local(texto: str):
-    """Detecta múltiples comandos locales dentro del mismo mensaje."""
+    """Detecta múltiples comandos locales dentro del mismo mensaje.
+
+    El router es solo un atajo gratis para órdenes cortas y obvias
+    ("pausa", "siguiente canción"). Lo que no entienda pasa a Groq con
+    los tools de su tema (ver TEMAS_TOOLS). Si una frase falla, se
+    arregla del lado de Groq (temas, descripciones de tools), NO
+    agregando otra regex acá.
+    """
 
     t_crudo = texto.lower().strip()
 
