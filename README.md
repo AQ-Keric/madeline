@@ -161,6 +161,7 @@ El ícono (la montaña de Celeste con la fresa) se genera con `mobile/tool/gener
 | POST   | `/callar`         | Corta la voz que esté sonando en el PC               |
 | POST   | `/bienvenida`     | Saludo + clima al iniciar sesión                     |
 | GET    | `/captura/{id}`   | Descarga una captura de pantalla (una sola vez)      |
+| GET    | `/bandeja`        | Capturas pedidas desde el PC que esperan al celular  |
 | GET    | `/sensores`       | CPU, RAM y temperaturas para el panel del celular    |
 
 Las peticiones que no vienen del propio PC necesitan el header `X-Madeline-Token`.
@@ -189,7 +190,6 @@ descarga tras `MADELINE_EMBED_KEEP_ALIVE` sin uso) y tarda ~25 ms por búsqueda 
 | `MADELINE_VOZ`           | Voz de edge-tts                                           | `es-MX-DaliaNeural`  |
 | `MADELINE_EFECTO_VOZ`    | `sutil`, `holografico` o `ninguno`                        | `ninguno`            |
 | `MADELINE_PIPER_MODELO`  | Modelo `.onnx` de Piper para la voz offline               | vacío                |
-| `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` | Enviar capturas a Telegram (opcional)        | vacío                |
 | `MADELINE_MODELO_EMBED`  | Modelo de embeddings de Ollama                            | `embeddinggemma`     |
 | `MADELINE_EMBED_KEEP_ALIVE` | Tiempo que el modelo queda en RAM tras usarse          | `10m`                |
 | `MADELINE_MEMORIA_DB`    | Ruta de la base de datos de recuerdos                     | `data/memoria.db`    |

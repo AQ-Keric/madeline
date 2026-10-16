@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
@@ -22,7 +23,7 @@ class PantallaPrincipal extends StatefulWidget {
   State<PantallaPrincipal> createState() => _PantallaPrincipalState();
 }
 
-class _PantallaPrincipalState extends State<PantallaPrincipal> {
+class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindingObserver {
   final _conexion = Conexion();
   final _grabadora = AudioRecorder();
   final _reproductor = AudioPlayer();
@@ -40,9 +41,16 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> {
   // grabación; sin esto quedaba grabando sin fin.
   bool _dedoAbajo = false;
 
+  // Capturas pedidas desde el PC: se revisan al abrir la app, al volver
+  // a ella y cada pocos segundos mientras está abierta.
+  Timer? _timerBandeja;
+  bool _revisandoBandeja = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _timerBandeja = Timer.periodic(const Duration(seconds: 8), (_) => _revisarBandeja());
     _texto.addListener(() {
       final hay = _texto.text.trim().isNotEmpty;
       if (hay != _hayTexto) setState(() => _hayTexto = hay);
@@ -51,7 +59,27 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState estado) {
+    if (estado == AppLifecycleState.resumed) _revisarBandeja();
+  }
+
+  Future<void> _revisarBandeja() async {
+    if (_revisandoBandeja || _conexion.estado != EstadoConexion.conectada) return;
+    _revisandoBandeja = true;
+    try {
+      for (final id in await _conexion.bandeja()) {
+        final mensaje = Mensaje('📸 La captura que pediste desde el PC', deMadeline: true);
+        await _bajarCaptura('/bandeja/$id', mensaje, alLlegar: () => _agregar(mensaje));
+      }
+    } finally {
+      _revisandoBandeja = false;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timerBandeja?.cancel();
     _grabadora.dispose();
     _reproductor.dispose();
     _texto.dispose();
@@ -63,6 +91,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> {
     setState(() => _conexion.estado = EstadoConexion.buscando);
     await _conexion.conectar(forzarBusqueda: forzar);
     if (mounted) setState(() {});
+    _revisarBandeja();
   }
 
   void _agregar(Mensaje m) {
@@ -165,14 +194,16 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> {
     }
   }
 
-  Future<void> _bajarCaptura(String ruta, Mensaje mensaje) async {
+  Future<void> _bajarCaptura(String ruta, Mensaje mensaje, {VoidCallback? alLlegar}) async {
     try {
       final r = await _conexion.descargar(ruta);
       if (r.statusCode != 200) return _avisar('La captura ya no está disponible en el PC.');
       setState(() => mensaje.imagen = r.bodyBytes);
+      alLlegar?.call();
 
       if (!await Gal.hasAccess(toAlbum: true)) await Gal.requestAccess(toAlbum: true);
-      await Gal.putImageBytes(r.bodyBytes, album: 'Madeline');
+      final ahora = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+      await Gal.putImageBytes(r.bodyBytes, album: 'Madeline', name: 'madeline_$ahora');
       _avisar('Captura guardada en la galería (álbum Madeline).');
     } catch (e) {
       _avisar('No pude guardar la captura.');

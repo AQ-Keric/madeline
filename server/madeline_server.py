@@ -37,8 +37,6 @@ load_dotenv(override=True)
 import memoria  # noqa: E402
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not GROQ_API_KEY:
     raise RuntimeError("Falta GROQ_API_KEY en el archivo .env")
@@ -923,23 +921,32 @@ def analizar_pantalla(pregunta: str) -> str:
         return f"No pude analizar la pantalla: {e}"
 
 
-def enviar_captura_telegram(captura_id: str):
-    """Envía la captura con ese ID directamente a tu Telegram."""
+# Capturas pedidas desde el PC (voz o Super+J): quedan en esta bandeja
+# hasta que la app del celular las descarga. Reemplaza a Telegram.
+CARPETA_BANDEJA = "/tmp/madeline_bandeja"
+os.makedirs(CARPETA_BANDEJA, exist_ok=True)
+HORAS_VIDA_BANDEJA = 24
+PATRON_ID_CAPTURA = re.compile(r"^[0-9a-f]{12}$")
+
+
+def enviar_captura_al_telefono(captura_id: str):
+    """Deja la captura en la bandeja para que la app la descargue."""
     ruta = ruta_captura_disponible(captura_id)
     if not ruta:
         return
+    destino = os.path.join(CARPETA_BANDEJA, captura_id + os.path.splitext(ruta)[1])
+    os.replace(ruta, destino)
+    print(f"[*] Captura {captura_id} en la bandeja del celular.")
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Advertencia: Faltan los tokens de Telegram en el archivo .env. No se envió la captura.")
-        return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    try:
-        with open(ruta, "rb") as foto:
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID}, files={"photo": foto}, timeout=15)
-        print("[*] Captura enviada exitosamente a Telegram.")
-    except Exception as e:
-        print(f"[!] Error enviando captura a Telegram: {e}")
+def capturas_en_bandeja() -> list:
+    archivos = []
+    for nombre in os.listdir(CARPETA_BANDEJA):
+        captura_id, _ = os.path.splitext(nombre)
+        if PATRON_ID_CAPTURA.match(captura_id):
+            ruta = os.path.join(CARPETA_BANDEJA, nombre)
+            archivos.append({"id": captura_id, "creada": os.path.getmtime(ruta), "ruta": ruta})
+    return sorted(archivos, key=lambda a: a["creada"])
 
 
 HEADERS_BUSQUEDA = {
@@ -3203,10 +3210,10 @@ async def procesar_mensaje(
 
         if captura_id_local and ruta_captura_disponible(captura_id_local):
             image_path_response = f"/captura/{captura_id_local}"
-            # Desde el celular la app ya la guarda en la galería:
-            # Telegram solo cuando la pides en el PC.
+            # Desde el celular la app ya la recibe en la respuesta; la
+            # pedida desde el PC queda en la bandeja para el celular.
             if origen == "pc":
-                enviar_captura_telegram(captura_id_local)
+                enviar_captura_al_telefono(captura_id_local)
 
         # --------------------------------------------------------
         # ANÁLISIS DE PANTALLA (también devuelve la foto analizada)
@@ -3333,7 +3340,7 @@ async def procesar_mensaje(
                 if ruta_captura_disponible(captura_id_groq):
                     image_path_response = f"/captura/{captura_id_groq}"
                     if origen == "pc":
-                        enviar_captura_telegram(captura_id_groq)
+                        enviar_captura_al_telefono(captura_id_groq)
 
             if fn_name == "buscar_en_web" and not resultado.startswith(PREFIJOS_ERROR):
                 # Antes los snippets se leían en bruto ("Resultados web
@@ -3614,6 +3621,14 @@ def limpiar_archivos_viejos():
         except OSError:
             pass
 
+    limite_bandeja = time.time() - HORAS_VIDA_BANDEJA * 3600
+    for captura in capturas_en_bandeja():
+        if captura["creada"] < limite_bandeja:
+            try:
+                os.remove(captura["ruta"])
+            except OSError:
+                pass
+
 
 async def generar_audio_para_telefono(texto: str) -> str | None:
     """
@@ -3854,6 +3869,23 @@ async def recibir_texto(
     )
 
     return resultado
+
+@app.get("/bandeja")
+def bandeja_endpoint():
+    """Capturas pedidas desde el PC que el celular todavía no bajó."""
+    return {"capturas": [{"id": c["id"], "creada": c["creada"]} for c in capturas_en_bandeja()]}
+
+
+@app.get("/bandeja/{captura_id}")
+def bandeja_captura_endpoint(captura_id: str, background_tasks: BackgroundTasks):
+    """Entrega una captura de la bandeja y la borra (se baja una vez)."""
+    captura = next((c for c in capturas_en_bandeja() if c["id"] == captura_id), None)
+    if not captura:
+        raise HTTPException(status_code=404, detail="Esa captura ya no está en la bandeja.")
+    background_tasks.add_task(os.remove, captura["ruta"])
+    media_type = "image/jpeg" if captura["ruta"].endswith(".jpg") else "image/png"
+    return FileResponse(captura["ruta"], media_type=media_type, background=background_tasks)
+
 
 @app.get("/sensores")
 def sensores_endpoint():

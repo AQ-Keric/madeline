@@ -147,6 +147,19 @@ class Conexion {
   Future<http.Response> descargar(String ruta) =>
       http.get(Uri.parse('$base$ruta'), headers: cabeceras).timeout(const Duration(seconds: 30));
 
+  /// IDs de las capturas pedidas desde el PC que esperan al celular.
+  Future<List<String>> bandeja() async {
+    if (ip == null) return [];
+    try {
+      final r = await http.get(Uri.parse('$base/bandeja'), headers: cabeceras).timeout(const Duration(seconds: 3));
+      if (r.statusCode != 200) return [];
+      final capturas = (jsonDecode(r.body) as Map<String, dynamic>)['capturas'] as List;
+      return capturas.map((c) => c['id'].toString()).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
   Future<Map<String, dynamic>?> sensores() async {
     if (ip == null) return null;
     try {

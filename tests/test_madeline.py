@@ -435,21 +435,21 @@ class TestCapturaSegunOrigen(unittest.IsolatedAsyncioTestCase):
         parches = [
             mock.patch.object(j, "tomar_captura", return_value="CAPTURA_LISTA:abc"),
             mock.patch.object(j, "ruta_captura_disponible", return_value="/tmp/x.jpg"),
-            mock.patch.object(j, "enviar_captura_telegram"),
+            mock.patch.object(j, "enviar_captura_al_telefono"),
             mock.patch.object(j, "procesar_salida_de_voz", mock.AsyncMock(return_value=None)),
         ]
         for parche in parches:
             parche.start()
             self.addCleanup(parche.stop)
 
-    async def test_desde_telefono_no_va_a_telegram(self):
+    async def test_desde_telefono_va_en_la_respuesta(self):
         r = await j.procesar_mensaje(j.ChatRequest(message="toma una captura"), origen="telefono")
         self.assertEqual(r.image_path, "/captura/abc")
-        j.enviar_captura_telegram.assert_not_called()
+        j.enviar_captura_al_telefono.assert_not_called()
 
-    async def test_desde_pc_va_a_telegram(self):
+    async def test_desde_pc_va_a_la_bandeja(self):
         await j.procesar_mensaje(j.ChatRequest(message="toma una captura"), origen="pc")
-        j.enviar_captura_telegram.assert_called_once_with("abc")
+        j.enviar_captura_al_telefono.assert_called_once_with("abc")
 
 
 class TestEfectoVoz(unittest.IsolatedAsyncioTestCase):
@@ -489,3 +489,31 @@ class TestCerrarTodo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBandeja(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from fastapi.testclient import TestClient
+        self.carpeta = tempfile.mkdtemp()
+        for parche in (mock.patch.object(j, "CARPETA_BANDEJA", self.carpeta),
+                       mock.patch.object(j, "MADELINE_TOKEN", "")):
+            parche.start()
+            self.addCleanup(parche.stop)
+        self.cliente = TestClient(j.app)
+
+    def test_captura_del_pc_llega_una_vez_al_celular(self):
+        captura = "/tmp/captura_madeline_0123456789ab.jpg"
+        with open(captura, "wb") as f:
+            f.write(b"jpg")
+        j.enviar_captura_al_telefono("0123456789ab")
+
+        self.assertFalse(os.path.exists(captura))
+        lista = self.cliente.get("/bandeja").json()["capturas"]
+        self.assertEqual([c["id"] for c in lista], ["0123456789ab"])
+        self.assertEqual(self.cliente.get("/bandeja/0123456789ab").content, b"jpg")
+        self.assertEqual(self.cliente.get("/bandeja").json()["capturas"], [])
+        self.assertEqual(self.cliente.get("/bandeja/0123456789ab").status_code, 404)
+
+    def test_no_sirve_archivos_fuera_de_la_bandeja(self):
+        self.assertEqual(self.cliente.get("/bandeja/..%2F..%2Fetc%2Fpasswd").status_code, 404)
