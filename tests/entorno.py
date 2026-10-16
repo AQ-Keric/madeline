@@ -15,6 +15,7 @@ os.environ.setdefault("GROQ_API_KEY", "test")
 _TMP = tempfile.mkdtemp(prefix="madeline_test_")
 os.environ["MADELINE_MEMORIA_DB"] = os.path.join(_TMP, "memoria.db")
 os.environ["MADELINE_LOG_SIN_TEMA"] = os.path.join(_TMP, "frases_sin_tema.log")
+os.environ["MADELINE_LOG_CONVERSACIONES"] = os.path.join(_TMP, "conversaciones.jsonl")
 
 import memoria  # noqa: E402
 

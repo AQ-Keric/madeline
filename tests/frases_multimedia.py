@@ -33,6 +33,7 @@ ESPERADO = {
     ("multimedia", "reiniciar"): [
         "reinicia la canción", "pon la canción desde el principio", "desde el principio",
         "empieza la canción de nuevo", "repite la canción", "otra vez la canción",
+        "pon esa canción de nuevo", "pon esta canción otra vez", "ponme esa canción de nuevo",
     ],
     ("info_cancion", None): [
         "qué canción es esta", "qué canción es", "qué canción está sonando",

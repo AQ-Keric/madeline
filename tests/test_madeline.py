@@ -6,6 +6,7 @@ Correr desde la raíz del proyecto:
 No llaman a Groq ni ejecutan nada en el sistema: subprocess y el
 cliente de Groq se reemplazan por mocks.
 """
+import json
 import os
 import shlex
 import sys
@@ -409,6 +410,41 @@ class TestGroq(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cuota", respuesta.response)
         # La pregunta sin responder no queda colgada en el historial.
         self.assertEqual(j.historial_chat, [])
+
+    async def test_tool_de_groq_responde_natural(self):
+        multimedia = mock.Mock(return_value="Se ejecutó la acción: reiniciar.")
+        with mock.patch.dict(j.TOOLS_FUNCIONES, {"control_multimedia": multimedia}), \
+             mock.patch.object(j.client.chat.completions, "create",
+                               return_value=respuesta_groq_con_tool(
+                                   "control_multimedia", '{"accion": "reiniciar"}')):
+            respuesta = await j.procesar_mensaje(
+                j.ChatRequest(message="vuelve a tocar lo que sonaba"), origen="pc"
+            )
+
+        self.assertNotIn("Se ejecutó", respuesta.response)
+        self.assertTrue(any(
+            n in respuesta.response for n in j.NUCLEOS[("multimedia", "reiniciar")]
+        ), respuesta.response)
+
+    async def test_conversaciones_quedan_registradas(self):
+        if os.path.exists(j.LOG_CONVERSACIONES):
+            os.remove(j.LOG_CONVERSACIONES)
+        with mock.patch.object(j.client.chat.completions, "create",
+                               return_value=respuesta_groq_texto("Es una estrella.")):
+            await j.procesar_mensaje(j.ChatRequest(message="¿qué es el sol?"), origen="telefono")
+        with mock.patch.object(j, "control_multimedia", return_value="ok"):
+            await j.procesar_mensaje(j.ChatRequest(message="pausa la música"), origen="pc")
+
+        with open(j.LOG_CONVERSACIONES, encoding="utf-8") as f:
+            groq, router = [json.loads(linea) for linea in f]
+
+        self.assertEqual(groq["ruta"], "groq")
+        self.assertEqual(groq["origen"], "telefono")
+        self.assertEqual(groq["mensaje"], "¿qué es el sol?")
+        self.assertEqual(groq["respuesta"], "Es una estrella.")
+        self.assertIn("buscar_en_web", groq["tools_enviadas"])
+        self.assertEqual(router["ruta"], "router")
+        self.assertEqual(router["acciones"], [["multimedia", {"accion": "pausar"}]])
 
     async def test_charla_no_llama_a_groq(self):
         with mock.patch.object(j.client.chat.completions, "create") as create:

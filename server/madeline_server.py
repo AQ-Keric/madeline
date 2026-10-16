@@ -1657,7 +1657,10 @@ tools = [
         "type": "function",
         "function": {
             "name": "control_multimedia",
-            "description": "Controla la reproducción multimedia.",
+            "description": (
+                "Controla la reproducción multimedia. 'reiniciar' vuelve "
+                "a empezar la canción actual (repetirla)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2268,6 +2271,9 @@ PATRONES_MULTIMEDIA = {
         r"(?:\s+(?:de\s+nuevo|desde\s+(?:el\s+)?(?:principio|inicio|comienzo)))?",
         rf"(?:pon\s+)?(?:{_OBJ}\s+)?desde\s+(?:el\s+)?(?:principio|inicio|comienzo)",
         rf"otra\s+vez\s+{_OBJ}",
+        # "pon ESA canción de nuevo" es repetirla; "pon la música de
+        # nuevo" (sin demostrativo) sigue siendo reanudar.
+        r"pon(?:me)?\s+(?:esa|esta)\s+(?:cancion|tema|rola)\s+(?:de\s+nuevo|otra\s+vez)",
     ],
 }
 
@@ -2869,8 +2875,20 @@ def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
     return random.choice(variantes).format(**args)
 
 
+# Los tools de Groq se llaman distinto que las órdenes del router; las
+# frases de NUCLEOS están con el nombre del router. Sin esto, una orden
+# que resolvía Groq se leía cruda: "Se ejecutó la acción: reproducir".
+NOMBRE_LOCAL_DE_TOOL = {
+    "control_multimedia": "multimedia",
+    "ajustar_volumen": "volumen",
+    "controlar_bluetooth": "bluetooth",
+    "tomar_captura": "captura",
+}
+
+
 def respuesta_local(nombre: str, args: dict, resultado: str) -> str:
     """Genera una respuesta carismática sin gastar tokens de Groq."""
+    nombre = NOMBRE_LOCAL_DE_TOOL.get(nombre, nombre)
     if resultado.startswith(PREFIJOS_ERROR) or nombre in RESPUESTAS_COMPLETAS:
         return resultado
 
@@ -3340,9 +3358,45 @@ async def responder_sin_cuota(origen: str) -> ChatResponse:
     return ChatResponse(response=MENSAJE_SIN_CUOTA, audio_path=audio)
 
 
+# Todas las conversaciones, una por línea (JSON), para revisar después
+# qué entendió Madeline y en qué falló. Solo queda en este PC.
+LOG_CONVERSACIONES = os.getenv(
+    "MADELINE_LOG_CONVERSACIONES",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "conversaciones.jsonl"),
+)
+
+
+def registrar_conversacion(mensaje: str, origen: str, registro: dict, respuesta: ChatResponse):
+    linea = {
+        "fecha": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+        "origen": origen,
+        "mensaje": mensaje,
+        **registro,
+        "respuesta": respuesta.response,
+    }
+    try:
+        os.makedirs(os.path.dirname(LOG_CONVERSACIONES), exist_ok=True)
+        with open(LOG_CONVERSACIONES, "a", encoding="utf-8") as f:
+            f.write(json.dumps(linea, ensure_ascii=False, default=str) + "\n")
+    except OSError as e:
+        print(f"[!] No pude registrar la conversación: {e}")
+
+
 async def procesar_mensaje(
     request: ChatRequest,
     origen: str = "pc"
+):
+    # ruta: "router" (orden local), "groq" o "sin_cuota".
+    registro = {"ruta": None, "acciones": []}
+    respuesta = await _procesar_mensaje(request, origen, registro)
+    registrar_conversacion(request.message.strip(), origen.lower().strip(), registro, respuesta)
+    return respuesta
+
+
+async def _procesar_mensaje(
+    request: ChatRequest,
+    origen: str,
+    registro: dict,
 ):
     origen = origen.lower().strip()
 
@@ -3374,6 +3428,8 @@ async def procesar_mensaje(
 
     if comandos:
         print(f"[*] Router local: {comandos}")
+        registro["ruta"] = "router"
+        registro["acciones"] = [[nombre, args] for nombre, args in comandos]
 
         resultados = ejecutar_comandos_locales(comandos)
 
@@ -3453,6 +3509,8 @@ async def procesar_mensaje(
 
     mensajes.extend(historial_chat)
     tools_mensaje = tools_necesarias(mensaje_usuario)
+    registro["ruta"] = "groq"
+    registro["tools_enviadas"] = [t["function"]["name"] for t in tools_mensaje]
 
     parametros = {
         "model": MODEL,
@@ -3473,6 +3531,7 @@ async def procesar_mensaje(
     try:
         response = await llamar_groq(parametros)
     except SinCuotaGroq:
+        registro["ruta"] = "sin_cuota"
         return await responder_sin_cuota(origen)
 
     response_message = response.choices[0].message
@@ -3494,6 +3553,7 @@ async def procesar_mensaje(
                 fn_args = {}
 
             print(f"[*] Tool call: {fn_name} {fn_args}")
+            registro["acciones"].append([fn_name, fn_args])
 
             if fn_name == "control_energia":
                 # Igual que en router_local: apagar/reiniciar NUNCA se
