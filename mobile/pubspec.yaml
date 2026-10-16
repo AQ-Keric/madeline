@@ -1,5 +1,5 @@
 name: madeline_mobile
-description: "J.A.R.V.I.S. Uplink Interface"
+description: "Madeline: app compañera para hablarle desde el celular."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -18,14 +18,12 @@ dependencies:
   audioplayers: ^6.8.1
   # Guardar capturas en la galería del teléfono
   gal: ^2.3.0
+  shared_preferences: ^2.5.6
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
-  flutter_launcher_icons: any
 flutter:
   uses-material-design: true
-flutter_launcher_icons:
-  android: true
-  ios: false
-  image_path: "assets/logo.png"
+  assets:
+    - assets/logo.png

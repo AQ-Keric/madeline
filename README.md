@@ -142,10 +142,14 @@ procesa solo en tu PC y se descarta.
 ```bash
 cd mobile
 flutter pub get
-flutter build apk --dart-define=MADELINE_TOKEN=<tu_token> --dart-define=MADELINE_IP=<ip_del_pc>
+flutter build apk --dart-define=MADELINE_TOKEN=<tu_token>
 ```
 
-El celular debe estar en la misma red que el PC.
+No hace falta configurar la IP: la app busca sola al PC en la red del celular (prueba el puerto 8000
+en las direcciones de esa red) y recuerda la última que funcionó. Si cambia, la vuelve a buscar. En
+Ajustes se puede escribir a mano. El celular debe estar en la misma red que el PC.
+
+El ícono (la montaña de Celeste con la fresa) se genera con `mobile/tool/generar_icono.py`.
 
 ### Endpoints principales
 

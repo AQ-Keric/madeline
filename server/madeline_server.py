@@ -121,6 +121,9 @@ class ChatResponse(BaseModel):
     response: str
     image_path: Optional[str] = None
     audio_path: Optional[str] = None
+    # Lo que entendió Whisper (solo en /comando_audio): la app lo
+    # muestra en la burbuja del usuario.
+    transcripcion: Optional[str] = None
 
 class ComandoTexto(BaseModel):
     texto: str
@@ -2642,7 +2645,7 @@ PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
 # saludo): envolverlas con "Claro, Keric. ¿Quieres...?" suena raro.
 RESPUESTAS_COMPLETAS = (
     "confirmar_accion", "confirmacion_cancelada", "charla", "respuesta_busqueda",
-    "memoria_guardar", "memoria_olvidar", "memoria_consultar",
+    "memoria_guardar", "memoria_olvidar", "memoria_consultar", "info_cancion",
 )
 
 
@@ -3809,6 +3812,7 @@ async def comando_audio_endpoint(
     # debe salir la voz.
     #
 
+    resultado.transcripcion = mensaje_usuario
     return resultado
 
 
