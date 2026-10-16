@@ -2960,12 +2960,13 @@ TEMAS_TOOLS = {
         ("musica", "cancion", "sonando", "suena", "escuch", "play", "pausa",
          "reproduc", "reanud", "despaus", "siguiente", "skip", "stop",
          "deten", "spotify", "youtube music", "yt music", "radio",
-         "playlist", "artista", "cantante", "album", r"rolas?\b"),
+         "playlist", "artista", "canta", "album", r"rolas?\b"),
         ("control_multimedia", "info_cancion", "abrir_radio_musica"),
     ),
     "volumen": (
-        ("volumen", "silenci", "mute", "mutea", "mas fuerte", "mas bajito",
-         "mas alto", "mas bajo", "no se escucha", "no escucho"),
+        ("volumen", "silenci", "mute", "mutea", r"fuerte\b", "bajito",
+         "mas alto", "mas bajo", "no se escucha", "no escucho", "bajale",
+         "subele"),
         ("ajustar_volumen",),
     ),
     "apps": (

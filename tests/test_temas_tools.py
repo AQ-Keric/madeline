@@ -21,7 +21,7 @@ class TestTemasTools(unittest.TestCase):
             "pon esa canción de nuevo", "no me gusta esta canción",
             "qué opinas de la música electrónica", "me encanta cuando pausan la música",
             "quiero escuchar algo tranquilo", "detén eso", "dale play a lo de antes",
-            "qué está sonando ahora", "abre spotify y ponle algo",
+            "qué está sonando ahora", "abre spotify y ponle algo", "¿quién canta esto?",
         ):
             with self.subTest(frase=frase):
                 self.assertTrue(MUSICA <= nombres(frase), nombres(frase))
@@ -29,6 +29,7 @@ class TestTemasTools(unittest.TestCase):
     def test_otros_temas(self):
         casos = {
             "silencio por favor": {"ajustar_volumen"},
+            "está muy fuerte, bájale un poco": {"ajustar_volumen"},
             "cierra eso": {"abrir_aplicacion", "cerrar_aplicacion"},
             "¿va a llover mañana?": {"reporte_clima"},
             "cuánta RAM estoy usando": {"estado_sistema"},
