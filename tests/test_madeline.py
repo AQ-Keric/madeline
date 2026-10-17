@@ -639,3 +639,38 @@ class TestDeck(unittest.TestCase):
             ids = [a["id"] for a in self.cliente.get("/deck/apps").json()["apps"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(set(ids), j.APPS_PERMITIDAS)
+
+
+class TestRecordatoriosYPestanas(unittest.TestCase):
+    """Frases como las escribe Whisper: con tildes y números en palabras."""
+
+    def test_recordatorio_con_numero(self):
+        self.assertEqual(
+            j.extraer_recordatorio("recuérdame en 10 minutos que saque la ropa"),
+            (10, "minutos", "saque la ropa"),
+        )
+
+    def test_recordatorio_con_numero_en_palabras(self):
+        self.assertEqual(
+            j.extraer_recordatorio("recuérdame en cinco minutos que saque la ropa"),
+            (5, "minutos", "saque la ropa"),
+        )
+        self.assertEqual(j.extraer_recordatorio("avísame en una hora")[:2], (1, "hora"))
+        self.assertEqual(
+            j.extraer_recordatorio("recuérdame en cuarenta y cinco minutos")[:2],
+            (45, "minutos"),
+        )
+
+    def test_avisame_con_y_sin_tilde(self):
+        self.assertEqual(j.extraer_recordatorio("avísame en 2 horas")[:2], (2, "horas"))
+        self.assertEqual(j.extraer_recordatorio("avisame en 2 horas")[:2], (2, "horas"))
+
+    def test_buscame_con_tilde(self):
+        self.assertEqual(
+            j.extraer_pedido_pestanas("búscame papers sobre redes neuronales"),
+            ("redes neuronales", "papers"),
+        )
+        self.assertEqual(
+            j.extraer_pedido_pestanas("ábreme imágenes de gatos"),
+            ("gatos", "imagenes"),
+        )

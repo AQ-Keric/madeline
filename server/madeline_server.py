@@ -2183,7 +2183,7 @@ def extraer_pedido_pestanas(texto_original: str):
     herramienta de Groq, no esto."""
 
     match = re.search(
-        r"\b(?:busca(?:me)?|abre|ábreme)\s+papers?\s+"
+        r"\b(?:b[uú]sca(?:me)?|abre|[aá]breme)\s+papers?\s+"
         r"(?:sobre|de|acerca de)\s+(.+)",
         texto_original,
         re.IGNORECASE,
@@ -2192,7 +2192,7 @@ def extraer_pedido_pestanas(texto_original: str):
         return match.group(1).strip(" .,¡!¿?"), "papers"
 
     match = re.search(
-        r"\b(?:busca(?:me)?|abre|ábreme)\s+im[aá]genes\s+"
+        r"\b(?:b[uú]sca(?:me)?|abre|[aá]breme)\s+im[aá]genes\s+"
         r"(?:de|sobre)\s+(.+)",
         texto_original,
         re.IGNORECASE,
@@ -2217,10 +2217,24 @@ def es_pedido_de_musica(texto_original: str) -> bool:
     ))
 
 
+# Whisper a veces escribe "cinco minutos" en vez de "5 minutos".
+NUMEROS_EN_PALABRAS = {
+    "un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4,
+    "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+    "once": 11, "doce": 12, "trece": 13, "catorce": 14, "quince": 15,
+    "veinte": 20, "veinticinco": 25, "treinta": 30, "cuarenta": 40,
+    "cuarenta y cinco": 45, "cincuenta": 50, "sesenta": 60, "noventa": 90,
+}
+_NUMERO_RECORDATORIO = "|".join(
+    sorted(NUMEROS_EN_PALABRAS, key=len, reverse=True)
+)
+
+
 def extraer_recordatorio(texto_original: str):
-    """Detecta 'recordame/avisame en N minutos/horas (que) <mensaje>'."""
+    """Detecta 'recordame/avísame en N minutos/horas (que) <mensaje>'."""
     match = re.search(
-        r"\b(?:record[aá]me|recu[eé]rdame|avis[aá]me)\s+en\s+(\d+)\s*"
+        r"\b(?:record[aá]me|recu[eé]rdame|av[ií]s[aá]me)\s+en\s+"
+        rf"(\d+|{_NUMERO_RECORDATORIO})\s*"
         r"(minutos?|horas?|segundos?)\b(?:\s+que\s+)?(.*)",
         texto_original,
         re.IGNORECASE,
@@ -2229,7 +2243,8 @@ def extraer_recordatorio(texto_original: str):
     if not match:
         return None
 
-    cantidad = int(match.group(1))
+    numero = match.group(1).lower()
+    cantidad = int(numero) if numero.isdigit() else NUMEROS_EN_PALABRAS[numero]
     unidad = match.group(2).lower()
     mensaje = match.group(3).strip(" .,¡!¿?")
 
