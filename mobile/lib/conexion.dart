@@ -160,6 +160,37 @@ class Conexion {
     }
   }
 
+  // ------------------------------------------------------------
+  // Deck: botones que ejecutan una acción directa en el PC
+  // ------------------------------------------------------------
+
+  String iconoApp(String id) => '$base/deck/icono/${Uri.encodeComponent(id)}';
+
+  Future<Map<String, dynamic>?> _getJson(String ruta) async {
+    try {
+      final r = await _conReintento(
+          () => http.get(Uri.parse('$base$ruta'), headers: cabeceras).timeout(const Duration(seconds: 8)));
+      return r.statusCode == 200 ? jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic> : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>?> deckApps() async {
+    final datos = await _getJson('/deck/apps');
+    return (datos?['apps'] as List?)?.cast<Map<String, dynamic>>();
+  }
+
+  Future<Map<String, dynamic>?> deckEstado() => _getJson('/deck/estado');
+
+  Future<http.Response> deckAccion(String tool, [Map<String, dynamic> args = const {}]) => _conReintento(() => http
+      .post(
+        Uri.parse('$base/deck/accion'),
+        headers: {'Content-Type': 'application/json', ...cabeceras},
+        body: jsonEncode({'tool': tool, 'args': args}),
+      )
+      .timeout(const Duration(seconds: 30)));
+
   Future<Map<String, dynamic>?> sensores() async {
     if (ip == null) return null;
     try {

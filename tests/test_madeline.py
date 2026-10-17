@@ -154,6 +154,19 @@ class TestListaBlancaApps(unittest.TestCase):
         run.assert_not_called()
         self.assertTrue(resultado.startswith("No pude"))
 
+    def test_cambiar_escritorio_usa_hyprctl_workspace(self, popen, run):
+        run.return_value = mock.Mock(returncode=0, stdout="ok")
+        resultado = j.cambiar_escritorio(3)
+        self.assertEqual(
+            run.call_args.args[0], ["hyprctl", "dispatch", "workspace", "3"]
+        )
+        self.assertEqual(resultado, "Cambiado al escritorio 3.")
+
+    def test_cambiar_escritorio_invalido_no_ejecuta_nada(self, popen, run):
+        resultado = j.cambiar_escritorio("1; rm -rf ~")
+        run.assert_not_called()
+        self.assertTrue(resultado.startswith("No entendí"))
+
 
 @mock.patch.object(j.subprocess, "Popen")
 class TestUrlsNavegador(unittest.TestCase):
@@ -584,3 +597,45 @@ class TestBandeja(unittest.TestCase):
 
     def test_no_sirve_archivos_fuera_de_la_bandeja(self):
         self.assertEqual(self.cliente.get("/bandeja/..%2F..%2Fetc%2Fpasswd").status_code, 404)
+
+
+class TestDeck(unittest.TestCase):
+    """Los botones del celular llaman tools directo, sin Groq."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        parche = mock.patch.object(j, "MADELINE_TOKEN", "")
+        parche.start()
+        self.addCleanup(parche.stop)
+        self.cliente = TestClient(j.app)
+
+    def accion(self, tool, **args):
+        return self.cliente.post("/deck/accion", json={"tool": tool, "args": args})
+
+    def test_boton_ejecuta_la_tool_sin_groq(self):
+        tool = mock.Mock(return_value="ok")
+        with mock.patch.dict(j.TOOLS_FUNCIONES, {"control_multimedia": tool}), \
+                mock.patch.object(j, "llamar_groq") as groq:
+            r = self.accion("control_multimedia", accion="siguiente")
+        self.assertEqual(r.json()["response"], "ok")
+        tool.assert_called_once_with(accion="siguiente")
+        groq.assert_not_called()
+
+    def test_tool_fuera_de_la_lista_se_rechaza(self):
+        self.assertEqual(self.accion("buscar_en_web", consulta="x").status_code, 400)
+        self.assertEqual(self.accion("__import__").status_code, 400)
+
+    def test_argumentos_extra_o_raros_se_rechazan(self):
+        self.assertEqual(self.accion("abrir_aplicacion", app_name="kitty", shell="rm").status_code, 400)
+        r = self.cliente.post("/deck/accion", json={"tool": "cerrar_aplicacion", "args": {"app_name": ["kitty"]}})
+        self.assertEqual(r.status_code, 400)
+
+    def test_icono_solo_de_apps_conocidas(self):
+        self.assertEqual(self.cliente.get("/deck/icono/..%2F..%2Fetc%2Fpasswd").status_code, 404)
+        self.assertEqual(self.cliente.get("/deck/icono/no-existe").status_code, 404)
+
+    def test_catalogo_una_entrada_por_app(self):
+        with mock.patch.object(j.deck, "nombre_visible", lambda t, c, a: a.title()):
+            ids = [a["id"] for a in self.cliente.get("/deck/apps").json()["apps"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(set(ids), j.APPS_PERMITIDAS)

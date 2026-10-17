@@ -35,6 +35,7 @@ load_dotenv(override=True)
 
 # Después de load_dotenv: memoria lee su configuración del .env.
 import memoria  # noqa: E402
+import deck  # noqa: E402
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -125,6 +126,10 @@ class ChatResponse(BaseModel):
 
 class ComandoTexto(BaseModel):
     texto: str
+
+class AccionDeck(BaseModel):
+    tool: str
+    args: dict = {}
 
 # ============================================================
 # HERRAMIENTAS / MÚSCULOS
@@ -448,7 +453,7 @@ def segundos_desde_unidad(cantidad: int, unidad: str) -> int:
 async def recordatorio_en_segundo_plano(segundos: int, mensaje: str):
     """Espera y después habla el recordatorio por los parlantes locales."""
     await asyncio.sleep(segundos)
-    texto = f"Keric, te recuerdo: {mensaje}."
+    texto = f"Oye, Keric, me pediste que te recordara: {mensaje}."
     print(f"[RECORDATORIO] {texto}")
     await hablar_por_parlantes(texto)
 
@@ -483,7 +488,7 @@ def cerrar_todo() -> str:
     if not cerradas:
         return "No había nada que cerrar."
 
-    return f"Protocolo de limpieza ejecutado. Cerré: {', '.join(cerradas)}."
+    return f"Limpieza hecha, cerré: {', '.join(cerradas)}."
 
 
 URL_CLIMA = "https://wttr.in/Villa+Alegre,Chile?format=j1&lang=es"
@@ -1602,6 +1607,27 @@ def mover_ventana(app_name: str, escritorio: int) -> str:
         return f"Error al mover la ventana de {app_name}: {e}"
 
 
+def cambiar_escritorio(escritorio: int) -> str:
+    """Cambia la vista al escritorio indicado (sin mover ventanas)."""
+    try:
+        escritorio = int(escritorio)
+        if escritorio < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return f"No entendí a qué escritorio cambiar: {escritorio}."
+
+    try:
+        resultado = subprocess.run(
+            ["hyprctl", "dispatch", "workspace", str(escritorio)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if resultado.returncode != 0 or "ok" not in resultado.stdout.lower():
+            return f"Hyprland no pudo cambiar al escritorio {escritorio}."
+        return f"Cambiado al escritorio {escritorio}."
+    except Exception as e:
+        return f"Error al cambiar al escritorio {escritorio}: {e}"
+
+
 # ============================================================
 # HERRAMIENTAS PARA GROQ
 # ============================================================
@@ -1820,6 +1846,23 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "cambiar_escritorio",
+            "description": "Cambia la vista a otro escritorio (ir a / mostrar el escritorio N).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "escritorio": {
+                        "type": "integer",
+                        "description": "Número del escritorio.",
+                    },
+                },
+                "required": ["escritorio"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "controlar_bluetooth",
             "description": "Enciende o apaga el adaptador Bluetooth del PC.",
             "parameters": {
@@ -1989,6 +2032,7 @@ TOOLS_FUNCIONES = {
     "buscar_en_web": buscar_en_web,
     "abrir_aplicacion": abrir_aplicacion,
     "mover_ventana": mover_ventana,
+    "cambiar_escritorio": cambiar_escritorio,
     "controlar_bluetooth": controlar_bluetooth,
     "conectar_bluetooth": conectar_bluetooth,
     "desconectar_bluetooth": desconectar_bluetooth,
@@ -2395,9 +2439,9 @@ PATRON_CHARLA = re.compile(
 )
 
 RESPUESTAS_CHARLA = {
-    "gracias": ["De nada, Keric.", "Para eso estoy.", "¡Cuando quieras!"],
-    "saludo": ["Hola, Keric. ¿En qué te ayudo?", "¡Hola! Aquí estoy.", "Dime, Keric."],
-    "ok": ["Perfecto.", "Aquí estaré si me necesitas.", "Muy bien."],
+    "gracias": ["De nada, Keric.", "Ay, no es nada.", "¡Cuando quieras!", "Lo sé, soy increíble."],
+    "saludo": ["¡Hola, Keric! ¿Qué se te ofrece?", "¡Holi! Aquí ando.", "Dime, Keric, soy toda oídos.", "¿Ahora qué inventaste? Cuéntame."],
+    "ok": ["Va.", "Aquí ando si me necesitas.", "Sale.", "Perfecto, como siempre."],
 }
 
 
@@ -2443,9 +2487,16 @@ def pedido_de_memoria(texto: str):
     return None
 
 
+FRASES_ANOTADO = [
+    "Anotado, Keric.", "Va, me lo guardo.", "Guardadito.",
+    "Ya quedó, yo sí me acuerdo de las cosas.", "Apuntado en mi cabecita.",
+    "No se me olvida, tranqui.",
+]
+
+
 def memoria_guardar(dato: str) -> str:
     memoria.guardar(dato)
-    return random.choice(["Anotado, Keric.", "Lo tendré presente.", "Guardado en mi memoria.", "No se me olvida."])
+    return elegir_variada(FRASES_ANOTADO)
 
 
 def memoria_olvidar(tema: str) -> str:
@@ -2746,32 +2797,46 @@ def router_local(texto: str):
 # ============================================================
 
 MULETILLAS = [
-    "Claro, Keric.",
-    "Vamos allá, Keric.",
-    "Enseguida, Keric.",
-    "Entendido, Keric.",
-    "Con gusto, Keric.",
-    "Dalo por hecho, Keric.",
-    "Sin problema, Keric.",
-    "Marchando.",
-    "Entendido.",
-    "Ahora mismo.",
-    "Con gusto.",
-    "Dalo por hecho.",
-    "Sin problema.",
-    "En eso estoy.",
-    "Hecho está.",
-    "¡Vamos!",
-    # Variantes SIN el nombre — para que no aparezca en el 100% de las
-    # respuestas, como pide una personalidad natural y no robótica.
-    "Desde luego.",
-    "Por supuesto.",
-    "Enseguida.",
+    "Va, Keric.",
+    "Listo, Keric.",
+    "Ya voy, Keric.",
+    "Tus deseos son órdenes, Keric. Bueno, casi.",
+    "Lo que tú digas, Keric.",
+    "Ay, Keric, ¿qué harías sin mí?",
+    "Sale, Keric.",
+    "Ahí te va, Keric.",
+    "Para ti lo que sea, Keric.",
+    "Uy, qué exigente, Keric.",
+    "Va.",
+    "Listo.",
+    "Ya está.",
     "Hecho.",
     "Ahí va.",
-    "Claro que sí.",
-    "Cómo no.",
-    "Ya mismo.",
+    "Fácil.",
+    "Pan comido.",
+    "Ok, ok.",
+    "Con todo el amor del mundo.",
+    "Sí, jefe. Es broma.",
+    # Variantes SIN el nombre — para que no aparezca en el 100% de las
+    # respuestas, como pide una personalidad natural y no robótica.
+    "Ya mero.",
+    "Dame un segundo… listo.",
+    "Como si me costara.",
+    "Para eso estoy.",
+    "Va, va.",
+    "Ándale.",
+    "Sale.",
+    "Obvio.",
+    "Facilito.",
+    "Tus caprichos son mi especialidad.",
+    "Ya sabía que me lo ibas a pedir.",
+    "Porque me caes bien.",
+    "Mira qué rápida soy.",
+    "Uf, qué trabajo tan duro. Es broma.",
+    "Sin quejarme. Esta vez.",
+    "Todo bajo control.",
+    "Lista.",
+    "Dicho y hecho.",
 ]
 
 NUCLEOS = {
@@ -2782,69 +2847,155 @@ NUCLEOS = {
         "Captura hecha y en camino",
         "Ahí quedó la imagen",
         "Pantalla capturada",
+        "Foto a tu pantalla, ya salió bonita",
+        "Click, quedó guardada",
+        "Ya la tengo, sin filtros",
+        "Capturé todo, hasta tus pestañas abiertas",
     ],
     ("multimedia", "pausar"): [
         "Reproducción pausada",
         "Música pausada",
         "Dejé la reproducción en pausa",
         "Silencio momentáneo, ya está",
+        "Pausa, a respirar un poquito",
+        "La música espera por ti",
+        "Le puse pausa",
+        "Shh, ya paró",
     ],
     ("multimedia", "reproducir"): [
         "Reanudando la reproducción",
         "Sigue sonando",
         "Le doy play de nuevo",
         "De vuelta a la música",
+        "Que siga la fiesta",
+        "Play, ya está sonando",
+        "Música de regreso",
+        "Volvió el ruido bonito",
     ],
     ("multimedia", "siguiente"): [
         "Pasando a la siguiente canción",
         "Vamos a la próxima",
         "Cambié de canción",
         "Saltando a la que sigue",
+        "Esa no te gustaba, ¿verdad? Siguiente",
+        "Next, a ver si esta sí",
+        "Otra canción, va",
+        "Adiós a esa, hola a la que sigue",
     ],
     ("multimedia", "anterior"): [
         "Volviendo a la canción anterior",
         "Retrocedí una canción",
         "De vuelta al tema anterior",
+        "La extrañabas, ¿eh? Ya regresó",
+        "Una para atrás",
+        "Regresé a la de antes",
     ],
     ("multimedia", "reiniciar"): [
         "Reiniciando la reproducción",
         "Volví a empezar la canción",
         "Desde el principio otra vez",
+        "Otra vez desde cero, te gustó, ¿eh?",
+        "La pongo desde el inicio",
+        "De nuevo desde el primer segundo",
     ],
     ("volumen", "setear"): [
         "Volumen fijado al {porcentaje}%",
         "Dejé el volumen en {porcentaje}%",
         "Ajustado al {porcentaje}% de volumen",
         "Volumen en {porcentaje}% en punto",
+        "Volumen al {porcentaje}%, como pediste",
+        "Ahí quedó en {porcentaje}%",
     ],
     ("volumen", "subir"): [
         "Subí el volumen un {porcentaje}%",
         "Aumenté el volumen en {porcentaje}%",
         "Un {porcentaje}% más de volumen, listo",
         "Le metí {porcentaje}% más de volumen",
+        "Más fuerte, un {porcentaje}% más",
+        "Subí {porcentaje}%, cuida esos oídos",
+        "{porcentaje}% más de ruido, a tus órdenes",
     ],
     ("volumen", "bajar"): [
         "Bajé el volumen un {porcentaje}%",
         "Reduje el volumen en {porcentaje}%",
         "Un {porcentaje}% menos de volumen",
         "Le quité {porcentaje}% de volumen",
+        "Más bajito, {porcentaje}% menos",
+        "Bajé {porcentaje}%, tus vecinos te lo agradecen",
+        "{porcentaje}% menos, más tranquilo",
     ],
     ("volumen", "mutear"): [
         "Cambié el estado del silencio",
         "Alterné el mute",
         "Listo con el silencio",
+        "Mute cambiado",
+        "Le piqué al silencio",
     ],
     ("bluetooth", "encender"): [
         "Bluetooth encendido",
         "Adaptador Bluetooth activado",
         "Ya está prendido el Bluetooth",
+        "Bluetooth arriba y buscando amigos",
+        "Prendí el Bluetooth",
     ],
     ("bluetooth", "apagar"): [
         "Bluetooth apagado",
         "Adaptador Bluetooth desactivado",
         "Ya está apagado el Bluetooth",
+        "Bluetooth a dormir",
+        "Apagué el Bluetooth",
+    ],
+    ("abrir_aplicacion", None): [
+        "Abriendo {app_name}",
+        "Ya va {app_name}",
+        "{app_name} en camino",
+        "Te abro {app_name}",
+        "{app_name} ya está arrancando",
+        "Ahí viene {app_name}",
+        "Abrí {app_name}, no te distraigas, ¿eh?",
+        "{app_name}, saliendo del horno",
+    ],
+    ("abrir_aplicacion", "escritorio"): [
+        "Abro {app_name} y la mando al escritorio {escritorio}",
+        "{app_name} se va al escritorio {escritorio}",
+        "{app_name} en camino al escritorio {escritorio}",
+        "Te dejo {app_name} en el escritorio {escritorio}",
+    ],
+    ("cerrar_aplicacion", None): [
+        "Cerré {app_name}",
+        "{app_name} cerrada",
+        "Adiós, {app_name}",
+        "Ya no está {app_name}",
+        "{app_name} se fue a descansar",
+        "Chao, {app_name}",
+        "Cerré {app_name}, ya era hora",
+    ],
+    ("mover_ventana", None): [
+        "Mandé {app_name} al escritorio {escritorio}",
+        "{app_name} ya está en el escritorio {escritorio}",
+        "Moví {app_name} al escritorio {escritorio}",
+        "{app_name} se mudó al escritorio {escritorio}",
+    ],
+    ("recordatorio", None): [
+        "Te aviso en {cantidad} {unidad}: {mensaje}",
+        "En {cantidad} {unidad} te recuerdo: {mensaje}",
+        "Anotado, en {cantidad} {unidad} te digo: {mensaje}",
+        "Dentro de {cantidad} {unidad} te lo recuerdo, no te preocupes: {mensaje}",
     ],
 }
+
+# Últimas frases dichas por lista: elegir_variada no repite ninguna de
+# las más recientes, así la misma orden seguida no suena igual.
+_RECIENTES = {}
+
+
+def elegir_variada(opciones: list) -> str:
+    recientes = _RECIENTES.setdefault(id(opciones), [])
+    libres = [o for o in opciones if o not in recientes] or opciones
+    elegida = random.choice(libres)
+    recientes.append(elegida)
+    del recientes[:-(len(opciones) // 2)]
+    return elegida
 
 
 PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
@@ -2867,16 +3018,18 @@ def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
     if nombre == "multimedia" and resultado.startswith("Abriendo tu radio"):
         return resultado
 
-    clave = (
-        nombre,
-        args.get("accion") if nombre in ("multimedia", "volumen", "bluetooth") else None,
-    )
-    variantes = NUCLEOS.get(clave)
+    if nombre in ("multimedia", "volumen", "bluetooth"):
+        detalle = args.get("accion")
+    elif nombre == "abrir_aplicacion" and args.get("escritorio"):
+        detalle = "escritorio"
+    else:
+        detalle = None
+    variantes = NUCLEOS.get((nombre, detalle))
 
     if not variantes:
         return resultado
 
-    return random.choice(variantes).format(**args)
+    return elegir_variada(variantes).format(**args)
 
 
 # Los tools de Groq se llaman distinto que las órdenes del router; las
@@ -2900,7 +3053,7 @@ def respuesta_local(nombre: str, args: dict, resultado: str) -> str:
         return f"Estos son los parámetros actuales. {resultado}"
 
     nucleo = nucleo_local(nombre, args, resultado).rstrip(". ")
-    return f"{random.choice(MULETILLAS)} {nucleo}."
+    return f"{elegir_variada(MULETILLAS)} {nucleo}."
 
 
 def ejecutar_comandos_locales(comandos):
@@ -2938,7 +3091,7 @@ def resumir_resultados_locales(resultados):
     if not frases:
         return "Entendido."
 
-    muletilla = random.choice(MULETILLAS)
+    muletilla = elegir_variada(MULETILLAS)
 
     if len(frases) == 1:
         return f"{muletilla} {frases[0]}."
@@ -2976,7 +3129,7 @@ TEMAS_TOOLS = {
     ),
     "ventanas": (
         ("mueve", "mover", "escritorio", "workspace", "ventana"),
-        ("mover_ventana",),
+        ("mover_ventana", "cambiar_escritorio"),
     ),
     "clima": (
         ("clima", "temperatura", "lluvia", "llueve", "llov", "pronostico",
@@ -3116,7 +3269,7 @@ def ejecutar_comando_local(nombre: str, args: dict):
         return "Cancelado. No se hizo ningún cambio."
 
     if nombre == "charla":
-        return random.choice(RESPUESTAS_CHARLA[args["tipo"]])
+        return elegir_variada(RESPUESTAS_CHARLA[args["tipo"]])
 
     if nombre == "memoria_guardar":
         return memoria_guardar(**args)
@@ -3197,10 +3350,10 @@ def read_root():
 
 
 FRASES_BIENVENIDA = [
-    "Bienvenido a casa, Keric.",
+    "¡Volviste, Keric! Ya te extrañaba. Poquito.",
     "¡Hola de nuevo, Keric!",
-    "Sistemas en línea. Bienvenido de vuelta.",
-    "Todo listo, Keric. Bienvenido.",
+    "Aquí estoy, despierta y lista para lo que sea.",
+    "Todo listo, Keric. ¿Qué vamos a hacer hoy?",
 ]
 
 
@@ -3208,7 +3361,7 @@ async def dar_bienvenida() -> str:
     """Arma y dice el saludo de bienvenida + un reporte del clima.
     Pensada para llamarse UNA sola vez al arrancar la sesión gráfica,
     no algo que el usuario pida por voz."""
-    saludo = random.choice(FRASES_BIENVENIDA)
+    saludo = elegir_variada(FRASES_BIENVENIDA)
     clima = reporte_clima()
     texto = f"{saludo} {clima}"
     await hablar_por_parlantes(texto)
@@ -3253,8 +3406,9 @@ async def obtener_captura(captura_id: str, background_tasks: BackgroundTasks):
 # local (órdenes, clima, charla corta) no gasta nada.
 
 SYSTEM_PROMPT = """Eres Madeline, la asistente de escritorio de Keric, con el \
-carácter de la protagonista de Celeste: cálida, decidida y con ingenio. \
-Responde en español, tuteando; llámalo por su nombre a veces, no en cada frase.
+carácter de la protagonista de Celeste. Hablas como una amiga relajada: \
+tierna, cálida y con un toque de sarcasmo juguetón, nunca formal ni servil. \
+Responde en español, tuteando; llámalo Keric a veces, no en cada frase.
 Sé breve: máximo 3 frases salvo que pida más detalle. Mejor corto y \
 completo que largo y cortado.
 Tu respuesta se lee en voz alta: nunca uses markdown, listas ni \
@@ -3347,8 +3501,8 @@ async def resumir_busqueda(pregunta: str, resultados_web: str) -> str:
 
 
 MENSAJE_SIN_CUOTA = (
-    "Keric, se agotó la cuota gratuita de Groq por ahora. Las órdenes "
-    "directas siguen funcionando; las preguntas tendrán que esperar un poco."
+    "Keric, me quedé sin cuota de Groq por ahora. Las órdenes directas "
+    "siguen funcionando; las preguntas tendrán que esperar un ratito."
 )
 
 
@@ -4162,6 +4316,100 @@ def sensores_endpoint():
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# ============================================================
+# DECK: botones del celular (como un Stream Deck)
+# ============================================================
+# Cada botón llama a una tool directo, sin router ni Groq: 0 tokens.
+# Solo estas tools y estos argumentos; las tools mismas validan los
+# valores (lista blanca de apps, acciones conocidas, números).
+DECK_ACCIONES = {
+    "abrir_aplicacion": {"app_name", "escritorio"},
+    "cerrar_aplicacion": {"app_name"},
+    "control_multimedia": {"accion"},
+    "abrir_radio_musica": set(),
+    "info_cancion": set(),
+    "ajustar_volumen": {"accion", "porcentaje"},
+    "cambiar_escritorio": {"escritorio"},
+    "tomar_captura": set(),
+    "estado_sistema": set(),
+    "reporte_clima": {"dia"},
+    "controlar_bluetooth": {"accion"},
+    "conectar_bluetooth": {"dispositivo"},
+    "desconectar_bluetooth": {"dispositivo"},
+    "verificar_actualizaciones": set(),
+    "cerrar_todo": set(),
+    "control_energia": {"accion"},
+}
+
+
+@app.get("/deck/apps")
+def deck_apps_endpoint():
+    """Las apps de DICCIONARIO_APPS con su nombre para mostrar."""
+    return {"apps": deck.catalogo(DICCIONARIO_APPS, COMANDOS_APERTURA)}
+
+
+@app.get("/deck/icono/{app_id}")
+def deck_icono_endpoint(app_id: str):
+    if app_id not in APPS_PERMITIDAS:
+        raise HTTPException(status_code=404, detail="Esa app no está en la lista.")
+    ruta = deck.icono_png(app_id, COMANDOS_APERTURA.get(app_id, app_id))
+    if not ruta:
+        raise HTTPException(status_code=404, detail="Esa app no tiene ícono.")
+    # Los íconos casi nunca cambian: que el celular los guarde un día.
+    return FileResponse(ruta, media_type="image/png",
+                        headers={"Cache-Control": "max-age=86400"})
+
+
+@app.get("/deck/estado")
+def deck_estado_endpoint():
+    """Escritorios en uso, el activo y los dispositivos Bluetooth."""
+    escritorios, activo = [], None
+    try:
+        lista = subprocess.run(["hyprctl", "workspaces", "-j"],
+                               capture_output=True, text=True, timeout=3)
+        escritorios = sorted(w["id"] for w in json.loads(lista.stdout) if w["id"] > 0)
+        actual = subprocess.run(["hyprctl", "activeworkspace", "-j"],
+                                capture_output=True, text=True, timeout=3)
+        activo = json.loads(actual.stdout)["id"]
+    except Exception as e:
+        print(f"[!] No pude leer los escritorios de Hyprland: {e}")
+
+    # Un nombre por dispositivo (hay alias con y sin tilde).
+    bluetooth = list({mac: nombre for nombre, mac in reversed(DISPOSITIVOS_BLUETOOTH.items())}.values())[::-1]
+    return {"escritorios": escritorios, "activo": activo, "bluetooth": bluetooth}
+
+
+@app.post("/deck/accion")
+def deck_accion_endpoint(accion: AccionDeck):
+    """Ejecuta el botón. Es "def" para que FastAPI lo corra en un hilo
+    aparte: las tools usan subprocess y no deben frenar al servidor."""
+    permitidos = DECK_ACCIONES.get(accion.tool)
+    if permitidos is None:
+        raise HTTPException(status_code=400, detail="Ese botón no existe.")
+    if not set(accion.args) <= permitidos or not all(
+        isinstance(v, (str, int)) for v in accion.args.values()
+    ):
+        raise HTTPException(status_code=400, detail="Argumentos inválidos para ese botón.")
+
+    print(f"[🎛️ Deck] {accion.tool} {accion.args}")
+    try:
+        # control_energia no está en TOOLS_FUNCIONES (por voz pide
+        # confirmación); en el deck la confirmación la pide la app.
+        funcion = control_energia if accion.tool == "control_energia" else TOOLS_FUNCIONES[accion.tool]
+        resultado = funcion(**accion.args)
+    except TypeError:
+        raise HTTPException(status_code=400, detail="Faltan argumentos para ese botón.")
+
+    image_path = None
+    if resultado.startswith("CAPTURA_LISTA"):
+        captura_id = resultado.split(":", 1)[1]
+        if ruta_captura_disponible(captura_id):
+            image_path = f"/captura/{captura_id}"
+        resultado = "Captura lista."
+    return {"response": resultado, "image_path": image_path}
+
 
 if __name__ == "__main__":
     import uvicorn

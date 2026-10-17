@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import 'conexion.dart';
+import 'pantalla_deck.dart';
 import 'tema.dart';
 import 'widgets/burbuja.dart';
 import 'widgets/fondo_montana.dart';
@@ -32,6 +33,9 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
   final List<Mensaje> _mensajes = [
     Mensaje('Hola, Keric. Mantén presionado el micrófono para hablarme, o escríbeme.', deMadeline: true),
   ];
+
+  // 0: chat, 1: deck de botones.
+  int _pestana = 0;
 
   bool _grabando = false;
   bool _pensando = false;
@@ -208,6 +212,13 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     } catch (e) {
       _avisar('No pude guardar la captura.');
     }
+  }
+
+  /// Una captura pedida desde el deck: se muestra en el chat.
+  void _capturaDesdeDeck(String ruta) {
+    final mensaje = Mensaje('📸 Captura desde el deck', deMadeline: true);
+    setState(() => _pestana = 0);
+    _bajarCaptura(ruta, mensaje, alLlegar: () => _agregar(mensaje));
   }
 
   void _avisar(String texto) {
@@ -480,25 +491,60 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
             children: [
               _cabecera(),
               Expanded(
-                child: GestureDetector(
-                  onTap: () => FocusScope.of(context).unfocus(),
-                  child: ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                    itemCount: _mensajes.length + (_pensando ? 1 : 0),
-                    itemBuilder: (_, i) {
-                      if (i == _mensajes.length) return const Escribiendo();
-                      final m = _mensajes[i];
-                      return Burbuja(mensaje: m, alTocarImagen: m.imagen == null ? null : () => _verImagen(m));
-                    },
-                  ),
+                child: IndexedStack(
+                  index: _pestana,
+                  children: [
+                    _chat(),
+                    PantallaDeck(conexion: _conexion, alLlegarCaptura: _capturaDesdeDeck),
+                  ],
                 ),
               ),
-              _barraInferior(),
             ],
           ),
         ),
       ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _pestana,
+        height: 62,
+        backgroundColor: Colores.montanaFrente,
+        indicatorColor: Colores.pelo.withValues(alpha: 0.25),
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+        onDestinationSelected: (i) {
+          FocusScope.of(context).unfocus();
+          setState(() => _pestana = i);
+        },
+        destinations: const [
+          NavigationDestination(
+              icon: Icon(Icons.chat_bubble_outline_rounded),
+              selectedIcon: Icon(Icons.chat_bubble_rounded),
+              label: 'Chat'),
+          NavigationDestination(
+              icon: Icon(Icons.grid_view_outlined), selectedIcon: Icon(Icons.grid_view_rounded), label: 'Deck'),
+        ],
+      ),
+    );
+  }
+
+  Widget _chat() {
+    return Column(
+      children: [
+        Expanded(
+          child: GestureDetector(
+            onTap: () => FocusScope.of(context).unfocus(),
+            child: ListView.builder(
+              controller: _scroll,
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              itemCount: _mensajes.length + (_pensando ? 1 : 0),
+              itemBuilder: (_, i) {
+                if (i == _mensajes.length) return const Escribiendo();
+                final m = _mensajes[i];
+                return Burbuja(mensaje: m, alTocarImagen: m.imagen == null ? null : () => _verImagen(m));
+              },
+            ),
+          ),
+        ),
+        _barraInferior(),
+      ],
     );
   }
 }

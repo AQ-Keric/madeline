@@ -31,6 +31,7 @@ class TestTemasTools(unittest.TestCase):
             "silencio por favor": {"ajustar_volumen"},
             "está muy fuerte, bájale un poco": {"ajustar_volumen"},
             "cierra eso": {"abrir_aplicacion", "cerrar_aplicacion"},
+            "muéstrame el escritorio 1": {"cambiar_escritorio"},
             "¿va a llover mañana?": {"reporte_clima"},
             "cuánta RAM estoy usando": {"estado_sistema"},
             "conecta los audífonos": {"conectar_bluetooth"},

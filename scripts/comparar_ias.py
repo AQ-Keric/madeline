@@ -45,6 +45,8 @@ CASOS = [
     # ventanas
     ("mueve firefox al escritorio 3", "mover_ventana", {"escritorio": 3}),
     ("manda la terminal al workspace 2", "mover_ventana", {"escritorio": 2}),
+    ("muéstrame el escritorio 1", "cambiar_escritorio", {"escritorio": 1}),
+    ("llévame al workspace 4", "cambiar_escritorio", {"escritorio": 4}),
     ("mi escritorio de madera está rayado", None, {}),
     # volumen
     ("no se escucha nada, súbele", "ajustar_volumen", {"accion": "subir"}),
