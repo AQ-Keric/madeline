@@ -32,8 +32,9 @@ sin gastar tokens.
 - **Recados y agenda**: "recuérdame que debo pagar la luz" queda en tus recados, que se ven en
   la barra (Noctalia). "¿Qué tengo mañana?" y "agéndame dentista el jueves a las 4" usan tu
   Google Calendar.
-- **App móvil (Flutter)**: hablarle desde el celular, recibir la respuesta en audio, ver capturas
-  y un panel de sensores del PC en tiempo real.
+- **App móvil (Flutter)**: hablarle desde el celular, recibir la respuesta en audio, ver capturas,
+  un panel de sensores del PC en tiempo real, un deck de botones, los recados y la agenda (también
+  fuera de casa: se sincronizan al volver) y una ayuda con frases de ejemplo.
 - **Seguridad**: token obligatorio para peticiones desde la red (`X-Madeline-Token`), confirmación
   antes de apagar/reiniciar, validación de URLs y de nombres de apps.
 
@@ -170,6 +171,10 @@ El ícono (la montaña de Celeste con la fresa) se genera con `mobile/tool/gener
 | GET    | `/captura/{id}`   | Descarga una captura de pantalla (una sola vez)      |
 | GET    | `/bandeja`        | Capturas pedidas desde el PC que esperan al celular  |
 | GET    | `/sensores`       | CPU, RAM y temperaturas para el panel del celular    |
+| GET    | `/recados`        | Recados pendientes                                   |
+| POST   | `/recados`        | Agrega un recado (`{"texto": …}`)                    |
+| DELETE | `/recados/{id}`   | Tacha un recado                                      |
+| GET    | `/agenda?dias=7`  | Eventos de Google Calendar desde hoy                 |
 
 Las peticiones que no vienen del propio PC necesitan el header `X-Madeline-Token`.
 
@@ -236,6 +241,7 @@ los pasos al inicio de `scripts/autorizar_google.py` y córrelo una vez. El perm
 ```
 
 No llaman a Groq ni ejecutan nada en el sistema: `subprocess` y el cliente de Groq se reemplazan por mocks.
+La app tiene los suyos (sincronización de recados): `cd mobile && flutter test`.
 
 ## Autor
 
