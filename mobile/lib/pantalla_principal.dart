@@ -14,6 +14,7 @@ import 'conexion.dart';
 import 'pantalla_ayuda.dart';
 import 'pantalla_deck.dart';
 import 'pantalla_recados.dart';
+import 'recados_locales.dart';
 import 'tema.dart';
 import 'widgets/burbuja.dart';
 import 'widgets/fondo_montana.dart';
@@ -28,6 +29,7 @@ class PantallaPrincipal extends StatefulWidget {
 
 class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindingObserver {
   final _conexion = Conexion();
+  late final _recados = RecadosLocales(_conexion);
   final _grabadora = AudioRecorder();
   final _reproductor = AudioPlayer();
   final _texto = TextEditingController();
@@ -66,7 +68,14 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState estado) {
-    if (estado == AppLifecycleState.resumed) _revisarBandeja();
+    if (estado != AppLifecycleState.resumed) return;
+    // De vuelta en casa: busca al PC y le manda los recados anotados afuera.
+    if (_conexion.estado == EstadoConexion.sinConexion) {
+      _conectar();
+    } else {
+      _revisarBandeja();
+      _recados.sincronizar();
+    }
   }
 
   Future<void> _revisarBandeja() async {
@@ -98,6 +107,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     await _conexion.conectar(forzarBusqueda: forzar);
     if (mounted) setState(() {});
     _revisarBandeja();
+    _recados.sincronizar();
   }
 
   void _agregar(Mensaje m) {
@@ -520,7 +530,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
                   children: [
                     _chat(),
                     PantallaDeck(conexion: _conexion, alLlegarCaptura: _capturaDesdeDeck),
-                    PantallaRecados(conexion: _conexion, activa: _pestana == 2),
+                    PantallaRecados(conexion: _conexion, recados: _recados, activa: _pestana == 2),
                   ],
                 ),
               ),

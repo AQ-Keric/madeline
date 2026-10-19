@@ -1,15 +1,21 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'conexion.dart';
+import 'recados_locales.dart';
 import 'tema.dart';
 
 /// Los recados (los mismos del panel de la barra del PC) y lo que viene en
-/// la agenda los próximos 7 días. Todo directo, sin pasar por Groq.
+/// la agenda los próximos 7 días. Todo directo, sin pasar por Groq. Fuera
+/// de casa se anota y tacha igual: queda en el celular hasta encontrar al PC.
 class PantallaRecados extends StatefulWidget {
-  const PantallaRecados({super.key, required this.conexion, required this.activa});
+  const PantallaRecados({super.key, required this.conexion, required this.recados, required this.activa});
 
   final Conexion conexion;
+  final RecadosLocales recados;
 
   /// Si la pestaña está a la vista: al volver a ella se recarga.
   final bool activa;
@@ -27,10 +33,16 @@ const _meses = [
 class _PantallaRecadosState extends State<PantallaRecados> {
   final _nuevo = TextEditingController();
 
-  List<Map<String, dynamic>>? _recados;
+  static const _claveAgenda = 'agenda_copia';
+
+  List<Recado>? _recados;
   List<Map<String, dynamic>>? _eventos;
-  String? _errorAgenda;
   bool _cargando = false;
+  bool _enLinea = true;
+  int _porSincronizar = 0;
+
+  /// La agenda viene de la copia guardada (sin conexión con el PC).
+  bool _agendaGuardada = false;
 
   Conexion get _conexion => widget.conexion;
 
@@ -52,17 +64,44 @@ class _PantallaRecadosState extends State<PantallaRecados> {
     super.dispose();
   }
 
+  /// Muestra al tiro lo guardado en el celular y después intenta sincronizar.
+  Future<void> _mostrarLocal() async {
+    final lista = await widget.recados.lista();
+    final porSincronizar = await widget.recados.pendientes();
+    if (mounted) {
+      setState(() {
+        _recados = lista;
+        _porSincronizar = porSincronizar;
+      });
+    }
+  }
+
   Future<void> _cargar() async {
     if (_cargando) return;
     setState(() => _cargando = true);
-    final resultados = await Future.wait([_conexion.recados(), _conexion.agenda()]);
+    await _mostrarLocal();
+    final enLinea = await widget.recados.sincronizar();
+    await _mostrarLocal();
+
+    final agenda = enLinea ? await _conexion.agenda() : null;
+    final prefs = await SharedPreferences.getInstance();
+    if (agenda != null && agenda['error'] == null) await prefs.setString(_claveAgenda, jsonEncode(agenda['eventos']));
+    final copia = prefs.getString(_claveAgenda);
+    final hoy = DateTime.now().toIso8601String().substring(0, 10);
     if (!mounted) return;
-    final agenda = resultados[1] as Map<String, dynamic>?;
     setState(() {
       _cargando = false;
-      _recados = resultados[0] as List<Map<String, dynamic>>?;
-      _eventos = (agenda?['eventos'] as List?)?.cast<Map<String, dynamic>>();
-      _errorAgenda = agenda == null ? 'No encuentro tu PC en esta red.' : agenda['error'] as String?;
+      _enLinea = enLinea;
+      _agendaGuardada = agenda?['error'] != null || agenda == null;
+      _eventos = agenda != null && agenda['error'] == null
+          ? (agenda['eventos'] as List).cast<Map<String, dynamic>>()
+          : copia == null
+              ? null
+              // Lo ya pasado de la copia no se muestra.
+              : (jsonDecode(copia) as List)
+                  .cast<Map<String, dynamic>>()
+                  .where((e) => (e['fecha'] as String).compareTo(hoy) >= 0)
+                  .toList();
     });
   }
 
@@ -70,29 +109,16 @@ class _PantallaRecadosState extends State<PantallaRecados> {
     final texto = _nuevo.text.trim();
     if (texto.isEmpty) return;
     _nuevo.clear();
-    if (await _conexion.agregarRecado(texto)) {
-      HapticFeedback.lightImpact();
-      _cargar();
-    } else {
-      _nuevo.text = texto;
-      _avisar('No pude guardar el recado. ¿Está prendido el PC?');
-    }
+    HapticFeedback.lightImpact();
+    await widget.recados.agregar(texto);
+    _cargar();
   }
 
-  Future<void> _tachar(Map<String, dynamic> recado) async {
+  Future<void> _tachar(Recado recado) async {
     HapticFeedback.selectionClick();
     setState(() => _recados?.remove(recado));
-    if (!await _conexion.borrarRecado(recado['id'] as int)) {
-      _avisar('No pude tachar el recado.');
-      _cargar();
-    }
-  }
-
-  void _avisar(String texto) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(texto)));
+    await widget.recados.tachar(recado);
+    _cargar();
   }
 
   // ------------------------------------------------------------
@@ -150,11 +176,30 @@ class _PantallaRecadosState extends State<PantallaRecados> {
     );
   }
 
+  /// "Sin conexión con el PC: 2 cambios se mandan al volver a casa".
+  Widget _aviso() {
+    if (_enLinea && _porSincronizar == 0) return const SizedBox.shrink();
+    final cambios = _porSincronizar == 1 ? '1 cambio' : '$_porSincronizar cambios';
+    final texto = _enLinea
+        ? 'Sincronizando $cambios…'
+        : _porSincronizar == 0
+            ? 'Sin conexión con el PC. Lo que anotes se manda al volver a casa.'
+            : 'Sin conexión con el PC: $cambios se mandan al volver a casa.';
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Row(
+        children: [
+          const Icon(Icons.cloud_off_rounded, size: 18, color: Colores.aviso),
+          const SizedBox(width: 8),
+          Expanded(child: Text(texto, style: const TextStyle(color: Colores.aviso, fontSize: 13))),
+        ],
+      ),
+    );
+  }
+
   Widget _listaRecados() {
     final lista = _recados;
-    if (lista == null) {
-      return _tarjeta(_vacio(_cargando ? 'Cargando…' : 'No encuentro tu PC en esta red.'));
-    }
+    if (lista == null) return _tarjeta(_vacio('Cargando…'));
     if (lista.isEmpty) return _tarjeta(_vacio('Sin recados. Qué orden.'));
     return _tarjeta(Column(
       children: [
@@ -166,7 +211,13 @@ class _PantallaRecadosState extends State<PantallaRecados> {
               icon: const Icon(Icons.check_box_outline_blank_rounded, color: Colores.fresa),
               onPressed: () => _tachar(r),
             ),
-            title: Text(r['texto']?.toString() ?? ''),
+            title: Text(r.texto),
+            trailing: r.pendiente
+                ? const Tooltip(
+                    message: 'Se manda al PC al volver a casa',
+                    child: Icon(Icons.cloud_upload_outlined, size: 20, color: Colores.textoSuave),
+                  )
+                : null,
           ),
         ],
       ],
@@ -184,7 +235,7 @@ class _PantallaRecadosState extends State<PantallaRecados> {
 
   Widget _agenda() {
     final eventos = _eventos;
-    if (eventos == null || _errorAgenda != null && eventos.isEmpty) {
+    if (eventos == null) {
       return _tarjeta(_vacio(_cargando ? 'Cargando…' : 'No pude revisar tu calendario.'));
     }
     if (eventos.isEmpty) return _tarjeta(_vacio('Nada agendado esta semana.'));
@@ -243,9 +294,10 @@ class _PantallaRecadosState extends State<PantallaRecados> {
           children: [
             _titulo('Recados'),
             _entrada(),
+            _aviso(),
             const SizedBox(height: 10),
             _listaRecados(),
-            _titulo('Próximos 7 días'),
+            _titulo(_agendaGuardada && _eventos != null ? 'Próximos días · lo último que vi' : 'Próximos 7 días'),
             _agenda(),
           ],
         ),
