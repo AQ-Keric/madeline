@@ -260,6 +260,7 @@ class TestOrdenesCortas(unittest.TestCase):
         "¿va a llover hoy?": [("clima", {"dia": "hoy"})],
         "pronóstico para pasado mañana": [("clima", {"dia": "pasado mañana"})],
         "gracias madeline": [("charla", {"tipo": "gracias"})],
+        "Madeline. Gracias.": [("charla", {"tipo": "gracias"})],
         "Hola.": [("charla", {"tipo": "saludo"})],
         "abre discord y pausa la música": [
             ("multimedia", {"accion": "pausar"}),

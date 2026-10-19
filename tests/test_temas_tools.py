@@ -37,6 +37,14 @@ class TestTemasTools(unittest.TestCase):
             "conecta los audífonos": {"conectar_bluetooth"},
             "¿qué ves en la pantalla?": {"analizar_pantalla"},
             "busca quién ganó el partido": {"buscar_en_web"},
+            # Frases reales del log: Whisper conjuga mal el verbo.
+            "MADELINE, abro Steam.": {"abrir_aplicacion"},
+            "MADELINE, reinicie el servidor.": {"reiniciar_servidor"},
+            "Reinicio el servidor.": {"reiniciar_servidor"},
+            "MADELINE cambia al escritorio 6.": {"cambiar_escritorio"},
+            "Muevete al escritorio 6.": {"cambiar_escritorio"},
+            "Busco una página de Champions de Valorant": {"abrir_pestanas_busqueda"},
+            "A verme páginas de valorantes.": {"abrir_pestanas_busqueda"},
         }
         for frase, esperadas in casos.items():
             with self.subTest(frase=frase):
@@ -54,7 +62,10 @@ class TestTemasTools(unittest.TestCase):
     def test_sin_tema_manda_solo_busqueda_y_queda_registrada(self):
         if os.path.exists(j.LOG_SIN_TEMA):
             os.remove(j.LOG_SIN_TEMA)
-        self.assertEqual(nombres("cuéntame un chiste"), {"buscar_en_web"})
+        self.assertEqual(
+            nombres("cuéntame un chiste"),
+            {"buscar_en_web", "abrir_aplicacion", "abrir_pestanas_busqueda"},
+        )
         with open(j.LOG_SIN_TEMA, encoding="utf-8") as f:
             self.assertTrue(f.read().rstrip().endswith("\tcuéntame un chiste"))
 
@@ -68,6 +79,12 @@ class TestTemasTools(unittest.TestCase):
         reales = {t["function"]["name"] for t in j.tools}
         for tema, (_, tools) in j.TEMAS_TOOLS.items():
             self.assertTrue(set(tools) <= reales, tema)
+
+    def test_alucinaciones_de_whisper(self):
+        import re
+        for frase in ("Subtitulado por Jnkoil", "Subtítulos realizados por la comunidad de Amara.org"):
+            with self.subTest(frase=frase):
+                self.assertTrue(re.search(j.ALUCINACIONES_WHISPER, frase, re.IGNORECASE))
 
 
 if __name__ == "__main__":

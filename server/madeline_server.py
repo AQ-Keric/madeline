@@ -1709,7 +1709,10 @@ tools = [
         "type": "function",
         "function": {
             "name": "info_cancion",
-            "description": "Dice qué canción y artista están sonando.",
+            "description": (
+                "Dice qué canción y artista están sonando ahora en el PC: "
+                "'¿qué suena?', '¿quién canta esto?', '¿cómo se llama esta canción?'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -1720,7 +1723,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "control_energia",
-            "description": "Apaga o reinicia la computadora.",
+            "description": "Apaga o reinicia la computadora (no el servidor de Madeline).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1731,6 +1734,14 @@ tools = [
                 },
                 "required": ["accion"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reiniciar_servidor",
+            "description": "Reinicia el servidor de Madeline (no la PC), para aplicar cambios.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -1826,7 +1837,10 @@ tools = [
         "type": "function",
         "function": {
             "name": "mover_ventana",
-            "description": "Mueve una aplicación a un escritorio específico.",
+            "description": (
+                "Mueve la ventana de una app nombrada a otro escritorio. "
+                "Si no nombra una app, usa cambiar_escritorio."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1847,7 +1861,10 @@ tools = [
         "type": "function",
         "function": {
             "name": "cambiar_escritorio",
-            "description": "Cambia la vista a otro escritorio (ir a / mostrar el escritorio N).",
+            "description": (
+                "Cambia la vista a otro escritorio: ve, cambia, muévete "
+                "o muéstrame el escritorio N."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1892,6 +1909,8 @@ tools = [
                     "dispositivo": {
                         "type": "string",
                         "description": "Nombre del dispositivo a conectar.",
+                        # Con la lista, Groq no pregunta "¿cuáles audífonos?".
+                        "enum": list(DISPOSITIVOS_BLUETOOTH),
                     }
                 },
                 "required": ["dispositivo"],
@@ -1909,6 +1928,7 @@ tools = [
                     "dispositivo": {
                         "type": "string",
                         "description": "Nombre del dispositivo a desconectar.",
+                        "enum": list(DISPOSITIVOS_BLUETOOTH),
                     }
                 },
                 "required": ["dispositivo"],
@@ -1965,7 +1985,8 @@ tools = [
                 "investigar, comparar varias fuentes, o ver resultados "
                 "por su cuenta — por ejemplo pedidos de estudio o "
                 "universidad ('buscame papers sobre X', 'ábreme fuentes "
-                "sobre Y', 'quiero ver imágenes de Z'). NO usar para "
+                "sobre Y', 'quiero ver imágenes de Z') o cuando pide "
+                "una página o sitio ('búscame la página de X'). NO usar para "
                 "preguntas que se responden bien con una frase corta "
                 "(para eso está buscar_en_web, que no abre nada)."
             ),
@@ -2041,6 +2062,7 @@ TOOLS_FUNCIONES = {
     "abrir_radio_musica": abrir_radio_musica,
     "abrir_pestanas_busqueda": abrir_pestanas_busqueda,
     "analizar_pantalla": analizar_pantalla,
+    "reiniciar_servidor": reiniciar_servidor_madeline,
 }
 
 assert set(TOOLS_FUNCIONES) | {"control_energia"} == {
@@ -2267,7 +2289,7 @@ def extraer_recordatorio(texto_original: str):
 
 INICIO_ORDEN = (
     r"(?:^|[,;.]\s*|\by\s+|\be\s+)"
-    r"[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
+    r"[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*[,.]?\s*)?(?:por\s+favor\s*,?\s*)?"
     r"(?:(?:puedes|podr[ií]as)\s+)?"
 )
 FIN_ORDEN = r"(?=\s*(?:[.,;!?]|\by\b|\be\b|$))"
@@ -2447,7 +2469,7 @@ def extraer_pedido_clima(t: str):
 # Charla corta que no necesita a Groq: "gracias" o "hola" gastaban
 # una llamada completa (prompt + tools) para contestar una frase.
 PATRON_CHARLA = re.compile(
-    r"^(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
+    r"^(?:oye\s+)?(?:madel\w*\s*[,.]?\s*)?"
     r"(?P<tipo>(?:muchas\s+)?gracias|hola|buenas|buenos d[ií]as|buenas tardes|"
     r"buenas noches|ok|okay|vale|listo|perfecto|genial|excelente)"
     r"(?:\s*,?\s*madel\w*)?[\s.!¡¿?]*$"
@@ -3138,7 +3160,7 @@ TEMAS_TOOLS = {
         ("ajustar_volumen",),
     ),
     "apps": (
-        ("abre", "abrir", "ejecuta", "lanza", "cierra", "cerra", r"mata\b",
+        ("abre", "abrir", r"abr[oa]\b", "ejecuta", "lanza", "cierra", "cerra", r"mata\b",
          "matar", "termina", "quita"),
         ("abrir_aplicacion", "cerrar_aplicacion"),
     ),
@@ -3158,9 +3180,9 @@ TEMAS_TOOLS = {
         ("estado_sistema",),
     ),
     "energia": (
-        ("apaga", "reinicia", "suspende", "cierra todo", "cerrar todo",
-         "modo panico"),
-        ("control_energia", "cerrar_todo"),
+        ("apaga", "reinici", "suspende", "cierra todo", "cerrar todo",
+         "modo panico", "servidor"),
+        ("control_energia", "cerrar_todo", "reiniciar_servidor"),
     ),
     "actualizaciones": (
         ("actualiza", "paquetes", "update"),
@@ -3176,12 +3198,13 @@ TEMAS_TOOLS = {
         ("tomar_captura", "analizar_pantalla"),
     ),
     "busqueda": (
-        ("busca", "investiga", "internet", "en la web", "noticia",
+        ("busc", "investiga", "internet", "en la web", "noticia",
          "informacion reciente"),
         ("buscar_en_web",),
     ),
     "pestanas": (
-        ("paper", "articulos", "fuentes", "imagenes", "pestana"),
+        ("paper", "articulos", "fuentes", "imagenes", "pestana", "pagina",
+         "sitio"),
         ("abrir_pestanas_busqueda", "buscar_en_web"),
     ),
 }
@@ -3230,8 +3253,10 @@ def tools_necesarias(texto: str):
         # lo rechaza con 400 (bug conocido de los modelos gpt-oss
         # cuando se quedan sin herramientas). Dándole siempre al menos
         # buscar_en_web como opción real, tiene algo concreto para
-        # usar en vez de inventar algo que no existe.
-        nombres.add("buscar_en_web")
+        # usar en vez de inventar algo que no existe. Abrir apps y
+        # páginas también van: Whisper a veces deforma el verbo y,
+        # sin esas tools, Groq decía "listo" sin hacer nada.
+        nombres.update(("buscar_en_web", "abrir_aplicacion", "abrir_pestanas_busqueda"))
 
     return [
         tool for tool in tools
@@ -3429,7 +3454,11 @@ completo que largo y cortado.
 Tu respuesta se lee en voz alta: nunca uses markdown, listas ni \
 tablas; habla en prosa corrida.
 Usa herramientas solo si te piden una acción o un dato que no sabes \
-(buscar_en_web solo para información reciente). Nunca inventes resultados."""
+(buscar_en_web solo para información reciente). Nunca inventes resultados.
+Te hablan por voz y la transcripción a veces viene mal conjugada \
+("abro Steam" es "abre Steam", "reinicio" es "reinicia"). Nunca digas \
+que hiciste una acción sin haber llamado a su herramienta; si no la \
+tienes, dilo."""
 
 SYSTEM_PROMPT_BUSQUEDA = """Eres Madeline. Responde la pregunta en \
 español, en 1 a 3 frases de prosa sin markdown (se lee en voz alta), \
@@ -4134,7 +4163,7 @@ PISTA_VOCABULARIO = (
 )
 
 ALUCINACIONES_WHISPER = (
-    r"^\W*(?:subt[ií]tulos (?:realizados|por)|amara\.org|"
+    r"^\W*(?:subt[ií]tul\w* (?:realizad\w* )?por|amara\.org|"
     r"suscr[ií]bete|gracias por ver|¡?gracias por ver el video)"
 )
 

@@ -95,6 +95,15 @@ CASOS = [
     ("ponme algo de música", "abrir_radio_musica", {}),
     ("la música de ahora es mala", None, {}),
     ("me encanta cuando pausan la música en las fiestas", None, {}),
+    # Del log real (Whisper conjuga mal el verbo)
+    ("MADELINE, abro Steam.", "abrir_aplicacion", {}),
+    ("MADELINE, abro Discord.", "abrir_aplicacion", {}),
+    ("MADELINE, reinicie el servidor.", "reiniciar_servidor", {}),
+    ("Reinicio el servidor.", "reiniciar_servidor", {}),
+    ("MADELINE cambia al escritorio 6.", "cambiar_escritorio", {"escritorio": 6}),
+    ("Muevete al escritorio 6.", "cambiar_escritorio", {"escritorio": 6}),
+    ("Busco una página de Champions de Valorant", "abrir_pestanas_busqueda", {}),
+    ("A verme páginas de valorantes.", "abrir_pestanas_busqueda", {}),
 ]
 
 
