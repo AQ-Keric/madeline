@@ -15,7 +15,7 @@ import urllib.parse
 import base64
 import unicodedata
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 import edge_tts
 import requests
@@ -36,6 +36,8 @@ load_dotenv(override=True)
 # Después de load_dotenv: memoria lee su configuración del .env.
 import memoria  # noqa: E402
 import deck  # noqa: E402
+import agenda  # noqa: E402
+import recados  # noqa: E402
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -1629,6 +1631,116 @@ def cambiar_escritorio(escritorio: int) -> str:
 
 
 # ============================================================
+# RECADOS Y AGENDA
+# ============================================================
+
+def _enumerar(cosas: list) -> str:
+    if len(cosas) == 1:
+        return cosas[0]
+    return ", ".join(cosas[:-1]) + " y " + cosas[-1]
+
+
+def agregar_recado(texto: str) -> str:
+    recado = recados.agregar(texto)
+    return elegir_variada([
+        "Anotado en tus recados: {}.", "Va, te lo dejo en los recados: {}.",
+        "Listo, ya está en tus recados: {}.",
+    ]).format(recado["texto"])
+
+
+def ver_recados() -> str:
+    lista = [r["texto"] for r in recados.listar()]
+    if not lista:
+        return "No tienes recados pendientes. Qué orden, Keric."
+    if len(lista) == 1:
+        return f"Tienes un recado: {lista[0]}."
+    return f"Tienes {len(lista)} recados: {_enumerar(lista[:8])}."
+
+
+def borrar_recado(cual: str) -> str:
+    if quitar_tildes(cual.lower()).strip(" .") in ("todos", "todo", "todos los recados"):
+        cantidad = recados.borrar_todos()
+        return f"Listo, borré tus {cantidad} recados." if cantidad else "No tenías recados."
+    recado = recados.buscar(cual)
+    if not recado:
+        return f"No encontré un recado sobre {cual}."
+    recados.borrar(recado["id"])
+    return f"Listo, taché el recado: {recado['texto']}."
+
+
+def ver_agenda(fecha: str, dias: int = 1) -> str:
+    try:
+        desde = datetime.strptime(fecha, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return "No entendí qué día revisar."
+    dias = max(1, min(int(dias or 1), 14))
+    try:
+        eventos = agenda.eventos_entre(desde, desde + timedelta(days=dias))
+    except agenda.SinAgenda as e:
+        print(f"[!] Agenda: {e}")
+        return "No pude revisar tu calendario ahora."
+
+    hoy = datetime.now().date()
+    cuando = agenda.dia_relativo(desde, hoy) if dias == 1 else (
+        "esta semana" if dias == 7 and desde == hoy else f"en esos {dias} días"
+    )
+    if not eventos:
+        return f"No tienes nada agendado {cuando}."
+
+    def describir(evento):
+        if not evento["hora"]:
+            return evento["titulo"]
+        momento = datetime.combine(evento["fecha"], datetime.strptime(evento["hora"], "%H:%M").time())
+        return f"{evento['titulo']} {agenda.a_la_hora(momento)}"
+
+    if dias == 1:
+        return f"{cuando.capitalize()} tienes {_enumerar([describir(e) for e in eventos[:8]])}."
+    partes = []
+    for dia in sorted({e["fecha"] for e in eventos})[:7]:
+        del_dia = [describir(e) for e in eventos if e["fecha"] == dia]
+        partes.append(f"{agenda.dia_relativo(dia, hoy)}, {_enumerar(del_dia[:4])}")
+    return "Tienes " + "; ".join(partes) + "."
+
+
+def crear_evento(titulo: str, fecha: str, hora: str = None, duracion_minutos: int = 60,
+                 mensaje: str = "") -> str:
+    """mensaje es lo que dijo Keric: de ahí sale el día y si es de mañana o de tarde."""
+    ahora = datetime.now()
+    try:
+        dia = datetime.strptime(fecha, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return "No entendí bien la fecha, ¿me la repites?"
+    if mensaje and not agenda.menciona_dia(mensaje):
+        dia = ahora.date()
+
+    if hora:
+        inicio = agenda.interpretar_hora_dicha(dia, hora, agenda.parte_del_dia(mensaje), ahora)
+        if inicio is None:
+            return "No entendí bien la hora, ¿me la repites?"
+        cuando = f"{agenda.dia_relativo(inicio.date(), ahora.date())} {agenda.a_la_hora(inicio)}"
+    else:
+        inicio = dia
+        cuando = agenda.dia_relativo(dia, ahora.date())
+
+    titulo = titulo.strip(" .")
+    try:
+        agenda.crear(titulo, inicio, int(duracion_minutos or 60))
+    except agenda.PermisoVencido as e:
+        print(f"[!] Agenda: {e}")
+        agenda.reautorizar()
+        return (
+            "No pude agendarlo: se venció el permiso de Google. Te abrí el navegador "
+            "para renovarlo; cuando termines, pídemelo de nuevo."
+        )
+    except agenda.SinAgenda as e:
+        print(f"[!] Agenda: {e}")
+        if not agenda.autorizado():
+            return "No pude agendarlo: todavía falta conectar tu cuenta de Google."
+        return "No pude agendarlo en tu calendario ahora."
+    return f"Listo, agendé {titulo} {cuando}."
+
+
+# ============================================================
 # HERRAMIENTAS PARA GROQ
 # ============================================================
 
@@ -2034,6 +2146,80 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "agregar_recado",
+            "description": (
+                "Anota un recado sin hora: algo que Keric no quiere olvidar "
+                "(recuérdame que debo X, tengo que X)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "texto": {"type": "string", "description": "El recado, corto (ej: Pagar la luz)."},
+                },
+                "required": ["texto"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ver_recados",
+            "description": "Lee los recados pendientes.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "borrar_recado",
+            "description": "Borra un recado ya hecho (ya pagué la luz, borra el recado del pan).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cual": {"type": "string", "description": "De qué trata, o 'todos'."},
+                },
+                "required": ["cual"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ver_agenda",
+            "description": "Lee los eventos del calendario de Google desde una fecha.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fecha": {"type": "string", "description": "AAAA-MM-DD"},
+                    "dias": {"type": "integer", "description": "Cuántos días mirar (1 un día, 7 una semana)."},
+                },
+                "required": ["fecha"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "crear_evento",
+            "description": "Agrega un evento con fecha al calendario de Google (agéndame, tengo dentista el jueves).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "titulo": {"type": "string", "description": "Qué es, corto y sin la fecha."},
+                    "fecha": {"type": "string", "description": "AAAA-MM-DD"},
+                    "hora": {
+                        "type": "string",
+                        "description": "H:MM tal como la dijo, sin convertir («a las 4» -> 4:00). Omitir si no dijo hora.",
+                    },
+                    "duracion_minutos": {"type": "integer"},
+                },
+                "required": ["titulo", "fecha"],
+            },
+        },
+    },
 ]
 
 
@@ -2063,7 +2249,16 @@ TOOLS_FUNCIONES = {
     "abrir_pestanas_busqueda": abrir_pestanas_busqueda,
     "analizar_pantalla": analizar_pantalla,
     "reiniciar_servidor": reiniciar_servidor_madeline,
+    "agregar_recado": agregar_recado,
+    "ver_recados": ver_recados,
+    "borrar_recado": borrar_recado,
+    "ver_agenda": ver_agenda,
+    "crear_evento": crear_evento,
 }
+
+# Reciben además lo que dijo Keric (mensaje=...), no solo lo que
+# entendió Groq: el día y si "a las 4" es de tarde salen de ahí.
+TOOLS_CON_MENSAJE = {"crear_evento"}
 
 assert set(TOOLS_FUNCIONES) | {"control_energia"} == {
     t["function"]["name"] for t in tools
@@ -2489,8 +2684,10 @@ _PREFIJO_MEMORIA = (
     r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
     r"(?:por\s+favor\s*,?\s*)?"
 )
+# "Anota un recado: …" no es memoria: va a Groq, que lo deja en recados.
 PATRON_MEMORIA_GUARDAR = re.compile(
     _PREFIJO_MEMORIA
+    + r"(?!.*\b(?:recados?|pendientes?)\b)"
     + r"(?:recuerda|acu[eé]rdate(?:\s+de)?|no\s+olvides|anota|guarda\s+en\s+(?:tu\s+)?memoria)"
     r"\s*(?:que|esto|lo\s+siguiente)?\s*:?\s+(?P<dato>.{3,})",
     re.IGNORECASE,
@@ -3042,6 +3239,7 @@ PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
 RESPUESTAS_COMPLETAS = (
     "confirmar_accion", "confirmacion_cancelada", "charla", "respuesta_busqueda",
     "memoria_guardar", "memoria_olvidar", "memoria_consultar", "info_cancion",
+    "agregar_recado", "ver_recados", "borrar_recado", "ver_agenda", "crear_evento",
 )
 
 
@@ -3206,6 +3404,18 @@ TEMAS_TOOLS = {
         ("paper", "articulos", "fuentes", "imagenes", "pestana", "pagina",
          "sitio"),
         ("abrir_pestanas_busqueda", "buscar_en_web"),
+    ),
+    "recados": (
+        ("recado", "recuerdame", "acuerdame", "pendiente", "tengo que",
+         "debo ", "no me dejes olvidar", "ya hice", "ya pague", "ya compre",
+         "tacha"),
+        ("agregar_recado", "ver_recados", "borrar_recado"),
+    ),
+    "agenda": (
+        ("agenda", "calendario", "evento", "cita", "reunion", "que tengo",
+         "tengo algo", "hora al", "dentista", "doctor", "medico", "cumple",
+         "planes", "esta semana", "ocupado"),
+        ("ver_agenda", "crear_evento"),
     ),
 }
 
@@ -3774,8 +3984,9 @@ async def _procesar_mensaje(
                 else:
                     resultado = "No pude entender la acción de energía."
             elif fn_name in TOOLS_FUNCIONES:
+                extra = {"mensaje": mensaje_usuario} if fn_name in TOOLS_CON_MENSAJE else {}
                 try:
-                    resultado = TOOLS_FUNCIONES[fn_name](**fn_args)
+                    resultado = TOOLS_FUNCIONES[fn_name](**fn_args, **extra)
                 except TypeError as e:
                     # Groq a veces inventa un argumento que la función
                     # no acepta: mejor un error hablado que un 500.
@@ -4453,6 +4664,52 @@ def deck_accion_endpoint(accion: AccionDeck):
             image_path = f"/captura/{captura_id}"
         resultado = "Captura lista."
     return {"response": resultado, "image_path": image_path}
+
+
+# ============================================================
+# RECADOS Y AGENDA PARA EL CELULAR
+# ============================================================
+# Lo mismo que el panel de la barra: leer, agregar y tachar sin Groq.
+
+class RecadoNuevo(BaseModel):
+    texto: str
+
+
+@app.get("/recados")
+def recados_endpoint():
+    return {"recados": recados.listar()}
+
+
+@app.post("/recados")
+def recados_agregar_endpoint(nuevo: RecadoNuevo):
+    texto = nuevo.texto.strip()
+    if not texto or len(texto) > 300:
+        raise HTTPException(status_code=400, detail="El recado está vacío o es muy largo.")
+    return recados.agregar(texto)
+
+
+@app.delete("/recados/{id_recado}")
+def recados_borrar_endpoint(id_recado: int):
+    if recados.borrar(id_recado) is None:
+        raise HTTPException(status_code=404, detail="Ese recado ya no está.")
+    return {"ok": True}
+
+
+@app.get("/agenda")
+def agenda_endpoint(dias: int = 7):
+    """Eventos desde hoy. Es "def": la API de Google tarda ~0.5 s."""
+    hoy = datetime.now().date()
+    try:
+        eventos = agenda.eventos_entre(hoy, hoy + timedelta(days=max(1, min(dias, 31))))
+    except agenda.SinAgenda as e:
+        return {"eventos": [], "error": str(e)}
+    return {
+        "eventos": [
+            {"fecha": e["fecha"].isoformat(), "hora": e["hora"], "titulo": e["titulo"]}
+            for e in eventos
+        ],
+        "error": None,
+    }
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ _TMP = tempfile.mkdtemp(prefix="madeline_test_")
 os.environ["MADELINE_MEMORIA_DB"] = os.path.join(_TMP, "memoria.db")
 os.environ["MADELINE_LOG_SIN_TEMA"] = os.path.join(_TMP, "frases_sin_tema.log")
 os.environ["MADELINE_LOG_CONVERSACIONES"] = os.path.join(_TMP, "conversaciones.jsonl")
+os.environ["MADELINE_RECADOS"] = os.path.join(_TMP, "recados.json")
+os.environ["MADELINE_GOOGLE_DIR"] = os.path.join(_TMP, "google")
 
 import memoria  # noqa: E402
 

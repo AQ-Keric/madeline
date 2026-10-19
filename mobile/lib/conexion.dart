@@ -191,6 +191,43 @@ class Conexion {
       )
       .timeout(const Duration(seconds: 30)));
 
+  // ------------------------------------------------------------
+  // Recados y agenda (lo mismo que el panel de la barra del PC)
+  // ------------------------------------------------------------
+
+  Future<List<Map<String, dynamic>>?> recados() async {
+    final datos = await _getJson('/recados');
+    return (datos?['recados'] as List?)?.cast<Map<String, dynamic>>();
+  }
+
+  Future<bool> agregarRecado(String texto) async {
+    try {
+      final r = await _conReintento(() => http
+          .post(
+            Uri.parse('$base/recados'),
+            headers: {'Content-Type': 'application/json', ...cabeceras},
+            body: jsonEncode({'texto': texto}),
+          )
+          .timeout(const Duration(seconds: 8)));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> borrarRecado(int id) async {
+    try {
+      final r = await _conReintento(
+          () => http.delete(Uri.parse('$base/recados/$id'), headers: cabeceras).timeout(const Duration(seconds: 8)));
+      // 404: ya lo había tachado alguien más (la barra o Madeline).
+      return r.statusCode == 200 || r.statusCode == 404;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<Map<String, dynamic>?> agenda({int dias = 7}) => _getJson('/agenda?dias=$dias');
+
   Future<Map<String, dynamic>?> sensores() async {
     if (ip == null) return null;
     try {

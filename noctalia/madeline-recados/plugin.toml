@@ -1,0 +1,37 @@
+# Recados de Madeline en la barra: el ícono muestra cuántos hay y el tooltip
+# los lista. Clic: panel para agregar y tachar.
+# Lee el mismo archivo que Madeline (~/asistente_local/data/recados.json).
+
+id = "keric/madeline-recados"
+name = "Recados de Madeline"
+version = "1.0.0"
+# 23 para noctalia.readFileAsync: se relee el archivo cada 2 segundos.
+plugin_api = 28
+author = "keric"
+license = "MIT"
+dependencies = []
+tags = ["bar", "productivity"]
+icon = "checklist"
+description = "Recados de Madeline en la barra."
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 400
+height = 440
+placement = "attached"
+open_near_click = true
+
+[[widget]]
+id = "widget"
+entry = "widget.luau"
+
+  [widget.actions]
+  left = "panel-toggle keric/madeline-recados:panel"
+
+  [[widget.setting]]
+  key = "glyph"
+  type = "glyph"
+  label_key = "settings.glyph.label"
+  description_key = "settings.glyph.description"
+  default = "checklist"

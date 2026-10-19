@@ -11,7 +11,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import 'conexion.dart';
+import 'pantalla_ayuda.dart';
 import 'pantalla_deck.dart';
+import 'pantalla_recados.dart';
 import 'tema.dart';
 import 'widgets/burbuja.dart';
 import 'widgets/fondo_montana.dart';
@@ -34,7 +36,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     Mensaje('Hola, Keric. Mantén presionado el micrófono para hablarme, o escríbeme.', deMadeline: true),
   ];
 
-  // 0: chat, 1: deck de botones.
+  // 0: chat, 1: deck de botones, 2: recados y agenda.
   int _pestana = 0;
 
   bool _grabando = false;
@@ -319,6 +321,23 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     );
   }
 
+  void _abrirAyuda() {
+    FocusScope.of(context).unfocus();
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PantallaAyuda(
+          alElegirFrase: (frase) {
+            // La frase queda escrita en el chat, lista para enviar o cambiar.
+            _texto.text = frase;
+            _texto.selection = TextSelection.collapsed(offset: frase.length);
+            setState(() => _pestana = 0);
+          },
+        ),
+      ),
+    );
+  }
+
   // ------------------------------------------------------------
   // Interfaz
   // ------------------------------------------------------------
@@ -364,6 +383,11 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
                 _estado(),
               ],
             ),
+          ),
+          IconButton(
+            tooltip: 'Cómo hablarle',
+            icon: const Icon(Icons.help_outline_rounded, color: Colores.textoSuave),
+            onPressed: _abrirAyuda,
           ),
           IconButton(
             tooltip: 'Estado del PC',
@@ -496,6 +520,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
                   children: [
                     _chat(),
                     PantallaDeck(conexion: _conexion, alLlegarCaptura: _capturaDesdeDeck),
+                    PantallaRecados(conexion: _conexion, activa: _pestana == 2),
                   ],
                 ),
               ),
@@ -520,6 +545,8 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
               label: 'Chat'),
           NavigationDestination(
               icon: Icon(Icons.grid_view_outlined), selectedIcon: Icon(Icons.grid_view_rounded), label: 'Deck'),
+          NavigationDestination(
+              icon: Icon(Icons.checklist_rounded), selectedIcon: Icon(Icons.checklist_rtl_rounded), label: 'Recados'),
         ],
       ),
     );

@@ -29,6 +29,9 @@ sin gastar tokens.
 - **Memoria a largo plazo local**: recuerda lo que le pides ("recuerda que…"), los datos que
   cuentas al pasar ("estoy aprendiendo Flutter") y las conversaciones. Todo se guarda en SQLite
   con embeddings de Ollama en tu PC; a Groq solo llegan los 2–3 recuerdos relevantes, o ninguno.
+- **Recados y agenda**: "recuérdame que debo pagar la luz" queda en tus recados, que se ven en
+  la barra (Noctalia). "¿Qué tengo mañana?" y "agéndame dentista el jueves a las 4" usan tu
+  Google Calendar.
 - **App móvil (Flutter)**: hablarle desde el celular, recibir la respuesta en audio, ver capturas
   y un panel de sensores del PC en tiempo real.
 - **Seguridad**: token obligatorio para peticiones desde la red (`X-Madeline-Token`), confirmación
@@ -56,13 +59,17 @@ flowchart LR
 .
 ├── server/
 │   ├── madeline_server.py   # API FastAPI: router local, herramientas, Groq y voz
-│   └── memoria.py           # Memoria a largo plazo (SQLite + embeddings locales)
+│   ├── memoria.py           # Memoria a largo plazo (SQLite + embeddings locales)
+│   ├── recados.py           # Recados sin hora (data/recados.json)
+│   └── agenda.py            # Google Calendar y horas dichas ("a las 4" -> 16:00)
+├── noctalia/madeline-recados/  # Widget de los recados para la barra de Noctalia
 ├── mobile/                  # App Flutter compañera (Android)
 ├── scripts/
 │   ├── madeline_mic.sh      # Atajo de micrófono para Hyprland (Super+J)
 │   ├── madeline_escucha.py  # Palabra de activación "Madeline" (Vosk, offline)
 │   ├── madeline_escucha_toggle.sh  # Pausar/reanudar la escucha (Super+Shift+J)
-│   └── calibrar_activacion.py      # Graba tu voz para calibrar la activación
+│   ├── calibrar_activacion.py      # Graba tu voz para calibrar la activación
+│   └── autorizar_google.py  # Conecta la agenda con tu cuenta de Google (una vez)
 ├── tests/
 │   ├── test_madeline.py     # Tests del router y de la seguridad (sin red)
 │   ├── test_memoria.py      # Tests de la memoria
@@ -180,6 +187,34 @@ Las peticiones que no vienen del propio PC necesitan el header `X-Madeline-Token
 Las órdenes ("sube el volumen") no se guardan. Los recuerdos viven en `data/memoria.db`, que no se
 sube al repositorio. El modelo de embeddings usa ~700 MB de RAM solo mientras está cargado (Ollama lo
 descarga tras `MADELINE_EMBED_KEEP_ALIVE` sin uso) y tarda ~25 ms por búsqueda en CPU.
+
+## Recados y agenda
+
+| Le dices                                     | Qué hace                                        |
+|----------------------------------------------|-------------------------------------------------|
+| "Recuérdame que debo pagar la luz"           | Agrega un recado (sin hora)                     |
+| "¿Qué recados tengo?"                        | Los lee                                         |
+| "Ya pagué la luz" / "borra todos los recados" | Tacha el que más se parece, o todos            |
+| "¿Qué tengo mañana?" / "¿y esta semana?"     | Lee tu Google Calendar                          |
+| "Agéndame dentista el jueves a las 4"        | Crea el evento (de 1 a 6 sin aclarar es de tarde) |
+| "Recuérdame en 10 minutos que…"              | Sigue siendo el recordatorio hablado (0 tokens) |
+
+Van por Groq con las tools de su tema, igual que el resto. "Recuerda que…" (sin *-me*) sigue
+guardando en la memoria.
+
+**Barra**: el widget `noctalia/madeline-recados` muestra cuántos recados hay y los lista en el
+tooltip. El clic abre un panel para escribir recados nuevos y tacharlos. Se instala una vez:
+
+```bash
+noctalia msg plugins source add madeline path ~/asistente_local/noctalia
+noctalia msg plugins enable keric/madeline-recados
+# y en ~/.config/noctalia/config.toml: "recados" en la barra + [widget.recados] type = "keric/madeline-recados:widget"
+```
+
+**Google Calendar**: sin autorizar, Madeline lee la agenda con la URL iCal del calendario de
+quickshell (`~/.config/ml4w/settings/gcal-urls`) pero no puede crear eventos. Para crearlos, sigue
+los pasos al inicio de `scripts/autorizar_google.py` y córrelo una vez. El permiso queda en
+`data/google/token.json`.
 
 ## Configuración
 
