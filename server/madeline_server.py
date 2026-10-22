@@ -1634,6 +1634,77 @@ def cambiar_escritorio(escritorio: int) -> str:
 # RECADOS Y AGENDA
 # ============================================================
 
+# ============================================================
+# AVATAR EN PANTALLA
+# ============================================================
+# La monita pixel art que pasea por el borde de abajo (avatar/shell.qml,
+# con Quickshell). El estado se escribe siempre, esté o no prendido el
+# avatar: es un archivo en RAM (XDG_RUNTIME_DIR) y no cuesta nada.
+
+CARPETA_AVATAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "avatar")
+ARCHIVO_ESTADO_AVATAR = os.path.join(os.getenv("XDG_RUNTIME_DIR") or "/tmp", "madeline_estado")
+# Si existe, el avatar se prende solo al arrancar el servidor.
+MARCA_AVATAR_ACTIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "avatar_activo")
+ESTADO_AVATAR = None
+
+
+def poner_estado_avatar(estado: str):
+    """quieta | escuchando | pensando | hablando."""
+    global ESTADO_AVATAR
+    if estado == ESTADO_AVATAR:
+        return
+    ESTADO_AVATAR = estado
+    try:
+        with open(ARCHIVO_ESTADO_AVATAR, "w", encoding="utf-8") as f:
+            f.write(estado)
+    except OSError:
+        pass
+
+
+def _lanzar_avatar() -> bool:
+    if not shutil.which("qs"):
+        return False
+    # -n: si ya está corriendo (por ejemplo tras reiniciar el servidor),
+    # no abre otra.
+    subprocess.Popen(
+        ["qs", "-n", "-p", CARPETA_AVATAR],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return True
+
+
+def mostrar_avatar(accion: str) -> str:
+    if accion == "esconder":
+        subprocess.run(["qs", "kill", "-p", CARPETA_AVATAR],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.remove(MARCA_AVATAR_ACTIVO)
+        except OSError:
+            pass
+        return elegir_variada([
+            "Listo, me escondo. Llámame si me extrañas.",
+            "Va, me voy a mi rincón.",
+            "Me escondo. Igual sigo escuchando, eh.",
+        ])
+
+    if not _lanzar_avatar():
+        return "No pude: falta Quickshell (qs) para dibujarme en la pantalla."
+    os.makedirs(os.path.dirname(MARCA_AVATAR_ACTIVO), exist_ok=True)
+    open(MARCA_AVATAR_ACTIVO, "w").close()
+    return elegir_variada([
+        "Aquí estoy, voy a dar una vuelta por tu pantalla.",
+        "Salgo a pasear. No me pises.",
+        "Listo, ando por abajo de tu pantalla.",
+    ])
+
+
+poner_estado_avatar("quieta")
+if os.path.exists(MARCA_AVATAR_ACTIVO):
+    _lanzar_avatar()
+
+
 def _enumerar(cosas: list) -> str:
     if len(cosas) == 1:
         return cosas[0]
@@ -2220,6 +2291,18 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "mostrar_avatar",
+            "description": "Muestra o esconde a Madeline (tú) paseando como monita por la pantalla.",
+            "parameters": {
+                "type": "object",
+                "properties": {"accion": {"type": "string", "enum": ["mostrar", "esconder"]}},
+                "required": ["accion"],
+            },
+        },
+    },
 ]
 
 
@@ -2254,6 +2337,7 @@ TOOLS_FUNCIONES = {
     "borrar_recado": borrar_recado,
     "ver_agenda": ver_agenda,
     "crear_evento": crear_evento,
+    "mostrar_avatar": mostrar_avatar,
 }
 
 # Reciben además lo que dijo Keric (mensaje=...), no solo lo que
@@ -3240,6 +3324,7 @@ RESPUESTAS_COMPLETAS = (
     "confirmar_accion", "confirmacion_cancelada", "charla", "respuesta_busqueda",
     "memoria_guardar", "memoria_olvidar", "memoria_consultar", "info_cancion",
     "agregar_recado", "ver_recados", "borrar_recado", "ver_agenda", "crear_evento",
+    "mostrar_avatar",
 )
 
 
@@ -3416,6 +3501,11 @@ TEMAS_TOOLS = {
          "tengo algo", "hora al", "dentista", "doctor", "medico", "cumple",
          "planes", "esta semana", "ocupado"),
         ("ver_agenda", "crear_evento"),
+    ),
+    "avatar": (
+        ("avatar", "pase", "escond", "aparec", "mascota", "monit", "munec",
+         "sprite", "camina", "sal a"),
+        ("mostrar_avatar",),
     ),
 }
 
@@ -3801,7 +3891,13 @@ async def procesar_mensaje(
 ):
     # ruta: "router" (orden local), "groq" o "sin_cuota".
     registro = {"ruta": None, "acciones": []}
-    respuesta = await _procesar_mensaje(request, origen, registro)
+    poner_estado_avatar("pensando")
+    try:
+        respuesta = await _procesar_mensaje(request, origen, registro)
+    finally:
+        # Si ya está hablando, la voz la devuelve a "quieta" al terminar.
+        if ESTADO_AVATAR == "pensando":
+            poner_estado_avatar("quieta")
     registrar_conversacion(request.message.strip(), origen.lower().strip(), registro, respuesta)
     return respuesta
 
@@ -4246,6 +4342,7 @@ async def hablar_por_parlantes(texto: str):
             stderr=subprocess.DEVNULL,
         )
         PROCESO_VOZ_PC = proceso
+        poner_estado_avatar("hablando")
 
         while proceso.poll() is None:
             await asyncio.sleep(0.1)
@@ -4256,6 +4353,7 @@ async def hablar_por_parlantes(texto: str):
     finally:
         if proceso is not None and PROCESO_VOZ_PC is proceso:
             PROCESO_VOZ_PC = None
+            poner_estado_avatar("quieta")
         if os.path.exists(ruta_respuesta):
             try:
                 os.remove(ruta_respuesta)
@@ -4386,6 +4484,7 @@ async def callar_endpoint():
     cortaba cuando TERMINABAS de grabar (al llegar el audio), así que
     el micrófono grababa a Madeline hablando encima de tu orden."""
     interrumpir_voz_pc()
+    poner_estado_avatar("escuchando")
     return {"ok": True}
 
 

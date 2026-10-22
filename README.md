@@ -32,6 +32,11 @@ sin gastar tokens.
 - **Recados y agenda**: "recuérdame que debo pagar la luz" queda en tus recados, que se ven en
   la barra (Noctalia). "¿Qué tengo mañana?" y "agéndame dentista el jueves a las 4" usan tu
   Google Calendar.
+- **Avatar en pantalla**: "Madeline, sal a pasear" y aparece una monita pixel art (pelo morado,
+  sudadera lila, audífonos) que usa tus ventanas como niveles de Celeste: pasea, se sube encima
+  con un dash (con estela y el pelo azul) y se tira para abajo. Reacciona cuando escucha, piensa o habla (la luz
+  de los audífonos pasa por el arcoíris), parpadea con la música y a veces se sienta a dormir.
+  "Escóndete" la guarda. No recibe clics, se esconde con apps en pantalla completa y gasta ~1,5 % de CPU.
 - **App móvil (Flutter)**: hablarle desde el celular, recibir la respuesta en audio, ver capturas,
   un panel de sensores del PC en tiempo real, un deck de botones, los recados y la agenda (también
   fuera de casa: se sincronizan al volver) y una ayuda con frases de ejemplo.
@@ -63,6 +68,7 @@ flowchart LR
 │   ├── memoria.py           # Memoria a largo plazo (SQLite + embeddings locales)
 │   ├── recados.py           # Recados sin hora (data/recados.json)
 │   └── agenda.py            # Google Calendar y horas dichas ("a las 4" -> 16:00)
+├── avatar/                  # Monita que pasea por la pantalla (Quickshell + sprites)
 ├── noctalia/madeline-recados/  # Widget de los recados para la barra de Noctalia
 ├── mobile/                  # App Flutter compañera (Android)
 ├── scripts/
