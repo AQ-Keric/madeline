@@ -66,7 +66,7 @@ class _PantallaDeckState extends State<PantallaDeck> {
       _filtro = '';
     });
     if (carpeta == Carpeta.apps && _apps == null) _cargarApps();
-    if (carpeta == Carpeta.escritorios || carpeta == Carpeta.bluetooth) _cargarEstado();
+    if (carpeta != Carpeta.apps && carpeta != Carpeta.multimedia) _cargarEstado();
   }
 
   Future<void> _cargarApps() async {
@@ -97,7 +97,7 @@ class _PantallaDeckState extends State<PantallaDeck> {
       final texto = datos['response']?.toString() ?? '';
       if (datos['image_path'] != null) widget.alLlegarCaptura(datos['image_path'].toString());
       if (texto.isNotEmpty) _avisar(texto);
-      if (t.tool == 'cambiar_escritorio') _cargarEstado();
+      if (t.tool == 'cambiar_escritorio' || t.tool == 'mostrar_avatar') _cargarEstado();
       return !RegExp(r'^(error|no pude|pucha|falló)', caseSensitive: false).hasMatch(texto);
     } catch (_) {
       _avisar('No encuentro tu PC en esta red.');
@@ -166,7 +166,7 @@ class _PantallaDeckState extends State<PantallaDeck> {
                 label: Text('Cerrar $nombre'),
                 onPressed: () {
                   Navigator.pop(contexto);
-                  _ejecutar(Tecla(nombre, Icons.close, Colores.pelo, 'cerrar_aplicacion',
+                  _ejecutar(Tecla(nombre, Icons.close, Colores.peligro, 'cerrar_aplicacion',
                       args: {'app_name': id}, confirmar: '¿Cierro $nombre?'));
                 },
               ),
@@ -218,17 +218,21 @@ class _PantallaDeckState extends State<PantallaDeck> {
 
   List<Tecla> _teclasSistema() {
     const c = Colores.aviso;
-    return const [
-      Tecla('Captura', Icons.screenshot_monitor_rounded, c, 'tomar_captura'),
-      Tecla('Estado del PC', Icons.monitor_heart_rounded, c, 'estado_sistema'),
-      Tecla('Clima', Icons.wb_cloudy_rounded, c, 'reporte_clima', args: {'dia': 'ahora'}),
-      Tecla('Clima mañana', Icons.umbrella_rounded, c, 'reporte_clima', args: {'dia': 'mañana'}),
-      Tecla('Actualizaciones', Icons.system_update_alt_rounded, c, 'verificar_actualizaciones'),
-      Tecla('Cerrar todo', Icons.cleaning_services_rounded, Colores.fresa, 'cerrar_todo',
+    // La monita que pasea por la pantalla del PC: prendida se ve resaltada.
+    final avatar = _estado?['avatar'] == true;
+    return [
+      Tecla(avatar ? 'Esconder avatar' : 'Mostrar avatar', Icons.directions_walk_rounded, Colores.pelo,
+          'mostrar_avatar', args: {'accion': avatar ? 'esconder' : 'mostrar'}, activa: avatar),
+      const Tecla('Captura', Icons.screenshot_monitor_rounded, c, 'tomar_captura'),
+      const Tecla('Estado del PC', Icons.monitor_heart_rounded, c, 'estado_sistema'),
+      const Tecla('Clima', Icons.wb_cloudy_rounded, c, 'reporte_clima', args: {'dia': 'ahora'}),
+      const Tecla('Clima mañana', Icons.umbrella_rounded, c, 'reporte_clima', args: {'dia': 'mañana'}),
+      const Tecla('Actualizaciones', Icons.system_update_alt_rounded, c, 'verificar_actualizaciones'),
+      const Tecla('Cerrar todo', Icons.cleaning_services_rounded, Colores.fresa, 'cerrar_todo',
           confirmar: '¿Cierro el navegador y los juegos?'),
-      Tecla('Reiniciar PC', Icons.restart_alt_rounded, Colores.pelo, 'control_energia',
+      const Tecla('Reiniciar PC', Icons.restart_alt_rounded, Colores.peligro, 'control_energia',
           args: {'accion': 'reiniciar'}, confirmar: '¿Reinicio el PC?'),
-      Tecla('Apagar PC', Icons.power_settings_new_rounded, Colores.pelo, 'control_energia',
+      const Tecla('Apagar PC', Icons.power_settings_new_rounded, Colores.peligro, 'control_energia',
           args: {'accion': 'apagar'}, confirmar: '¿Apago el PC?'),
     ];
   }
@@ -459,7 +463,7 @@ class _TeclaDeckState extends State<TeclaDeck> {
     if (!mounted) return;
     setState(() {
       _trabajando = false;
-      _destello = ok ? Colores.ok : Colores.pelo;
+      _destello = ok ? Colores.ok : Colores.peligro;
     });
     await Future.delayed(const Duration(milliseconds: 450));
     if (mounted) setState(() => _destello = null);

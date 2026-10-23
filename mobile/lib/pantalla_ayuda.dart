@@ -135,6 +135,21 @@ const _secciones = [
     ],
   ),
   _Seccion(
+    'Avatar',
+    Icons.directions_walk_rounded,
+    'Madeline en pixel art paseando por la pantalla del PC, como la de arriba en esta app.',
+    [
+      _Grupo('Mostrar', ['Sal a pasear', 'Muestra el avatar']),
+      _Grupo('Esconder', ['Escóndete', 'Quita el avatar']),
+    ],
+    [
+      'Usa tus ventanas como niveles de Celeste: hace dash para subirse encima y se tira para abajo.',
+      'Cuando te escucha, piensa o habla, la luz de sus audífonos pasa por el arcoíris; con música, parpadea.',
+      'No estorba: los clics pasan a través de ella y se esconde sola si algo está en pantalla completa.',
+      'En el Deck, carpeta Sistema, tienes un botón para mostrarla o esconderla.',
+    ],
+  ),
+  _Seccion(
     'Clima',
     Icons.wb_sunny_outlined,
     'El clima de Villa Alegre, hasta pasado mañana.',

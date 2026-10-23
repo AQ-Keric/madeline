@@ -1,17 +1,20 @@
-"""Genera el ícono de Madeline: la montaña de Celeste de noche con la
-fresa como luna. Saca el ícono adaptativo de Android (fondo, frente y
-monocromo), los PNG clásicos y el logo que usa la app.
+"""Genera el ícono de Madeline: ella en pixel art (la misma del avatar
+del PC, con pelo morado y audífonos) delante de la montaña de Celeste
+de noche, con la fresa como luna. Saca el ícono adaptativo de Android
+(fondo, frente y monocromo), los PNG clásicos y el logo que usa la app.
 
 Uso (desde mobile/):  ../.venv/bin/python tool/generar_icono.py
 """
 import os
 import random
+import sys
 
 from PIL import Image, ImageDraw, ImageFilter
 
 S = 1024          # lienzo maestro
 AA = 4            # supermuestreo para bordes suaves
 RES = os.path.join(os.path.dirname(__file__), "..", "android", "app", "src", "main", "res")
+AVATAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "avatar")
 
 CIELO_ARRIBA = (20, 12, 46)
 CIELO_ABAJO = (74, 36, 104)
@@ -50,12 +53,31 @@ def fondo() -> Image.Image:
     return img
 
 
-def frente(color_unico=None) -> Image.Image:
-    """Montañas + fresa, centradas en la zona segura del ícono
-    adaptativo (el 66% central)."""
+def madeline(color_unico=None) -> Image.Image:
+    """Busto de Madeline en pixel art, sacado del sprite del avatar
+    (cabeza y sudadera), grande y centrado, cortado por abajo."""
+    sys.path.insert(0, AVATAR)
+    import generar_sprites as g
+    sprite, _ = g.dibujar(g.ESTILOS[g.ESTILO_POR_DEFECTO], con_luz=True)
+    busto = sprite.crop((6, 1, 27, 24))           # columnas 6-26, filas 1-23
+    if color_unico:
+        alfa = busto.getchannel("A")
+        busto = Image.new("RGBA", busto.size, color_unico + (255,))
+        busto.putalpha(alfa)
+    alto = int(S * AA * 0.70)
+    ancho = busto.width * alto // busto.height
+    busto = busto.resize((ancho, alto), Image.NEAREST)
+    img = lienzo()
+    img.paste(busto, ((S * AA - ancho) // 2, S * AA - alto), busto)
+    return img
+
+
+def montanas() -> Image.Image:
+    """La cordillera de noche: va en la capa de fondo, detrás de ella."""
     img = lienzo()
     d = ImageDraw.Draw(img)
-    c = lambda col: (color_unico or col) + (255,)
+    c = lambda col: col + (255,)
+    color_unico = None
 
     # Montaña de atrás y la cumbre de Celeste, hasta el borde de abajo.
     d.polygon([p(0.06, 1.0), p(0.36, 0.47), p(0.50, 0.62), p(0.66, 1.0)], fill=c(MONTE_ATRAS))
@@ -75,10 +97,16 @@ def frente(color_unico=None) -> Image.Image:
             colina.append(p(x, 0.84 + 0.035 * ((x * 7.3) % 1.0 - 0.5) - 0.04 * (1 - abs(x - 0.5) * 2)))
         colina += [p(1.0, 1.0), p(0.0, 1.0)]
         d.polygon(colina, fill=(44, 26, 74, 255))
+    return img
 
+
+def fresa(color_unico=None) -> Image.Image:
+    img = lienzo()
+    d = ImageDraw.Draw(img)
+    c = lambda col: (color_unico or col) + (255,)
     # Fresa (la "luna"): redonda arriba y en punta suave abajo.
     import math
-    fx, fy, ax, ay = 0.70, 0.37, 0.072, 0.070
+    fx, fy, ax, ay = 0.785, 0.33, 0.046, 0.044
     contorno = []
     for i in range(120):
         t = 2 * math.pi * i / 120
@@ -116,8 +144,14 @@ def guardar(img, ruta):
     img.save(ruta)
 
 
+def frente(color_unico=None) -> Image.Image:
+    """Lo que va en la zona segura del ícono adaptativo: ella y la fresa."""
+    return Image.alpha_composite(fresa(color_unico), madeline(color_unico))
+
+
 def main():
-    f, fr = fondo(), frente()
+    f = Image.alpha_composite(fondo(), montanas())
+    fr = frente()
     completo = Image.alpha_composite(f, fr)
 
     # Ícono adaptativo: 108dp por capa.

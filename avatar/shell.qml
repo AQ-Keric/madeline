@@ -12,7 +12,12 @@
 //
 // El estado de Madeline lo escribe el servidor en
 // $XDG_RUNTIME_DIR/madeline_estado (quieta | escuchando | pensando |
-// hablando). La ventana del avatar no recibe clics (mask vacía) y se
+// hablando | despedida).
+//
+// Al aparecer, unos destellos se juntan en un punto del piso, estalla un
+// anillo de luz y ella cae con un saltito y saluda. Con "despedida" (al
+// pedirle que se esconda) salta, se va con un dash hacia arriba dejando
+// un estallido de destellos y cierra el programa. La ventana del avatar no recibe clics (mask vacía) y se
 // esconde si hay algo en pantalla completa (juegos, videos).
 //
 // La luz de los audífonos es un hoyo en el sprite (sprites/luz.json
@@ -42,6 +47,11 @@ ShellRoot {
         // saltar, caer o dash.
         property string modo: "quieta"
         property bool azul: false        // pelo azul: después del dash
+        property bool entrando: true     // invisible hasta la animación de entrada
+        property bool entradaIniciada: false
+        property bool saliendo: false
+        property bool festejando: false  // arcoíris al llegar y al irse
+        property string saludo: ""
         property bool haciaLaDerecha: true
         property int cuadro: 0
         property bool luzApagada: false
@@ -74,7 +84,7 @@ ShellRoot {
 
         readonly property color colorLuz: {
             if (luzApagada) return luz.apagada;
-            if (atendiendo || hayMusica) return Qt.hsla(tono, 0.95, 0.62, 1);
+            if (atendiendo || hayMusica || festejando) return Qt.hsla(tono, 0.95, 0.62, 1);
             if (modo === "dormir") return Qt.darker(luz.reposo, 1.8);
             return luz.reposo;
         }
@@ -116,6 +126,10 @@ ShellRoot {
         }
 
         onEstadoChanged: {
+            if (estado === "despedida")
+                salir();
+            if (saliendo)
+                return;
             olvidar.restart();
             if (estado === "quieta") {
                 programar(2500);
@@ -134,7 +148,7 @@ ShellRoot {
         // Arcoíris mientras escucha, piensa o habla.
         Timer {
             interval: 90
-            running: ventana.atendiendo
+            running: ventana.atendiendo || ventana.festejando
             repeat: true
             onTriggered: ventana.tono = (ventana.tono + 0.04) % 1
         }
@@ -186,6 +200,85 @@ ShellRoot {
 
         Component.onCompleted: refrescar.restart()
 
+        // Si hyprctl no responde, entra igual sobre el piso.
+        Timer {
+            interval: 3000
+            running: !ventana.entradaIniciada
+            onTriggered: ventana.entrar()
+        }
+
+        // ------------------------------------------------------------
+        // Entrada y despedida
+        // ------------------------------------------------------------
+
+        function entrar() {
+            entradaIniciada = true;
+            const piso = superficies[0];
+            monita.x = Math.round(xEn(piso) / escala) * escala;
+            monita.y = piso.y - lado;
+            const cx = monita.x + lado / 2, cy = monita.y + lado * 0.55;
+            for (let i = 0; i < chispas.count; i++)
+                chispas.itemAt(i).juntar(cx, cy, i * 28);
+            aparecer.restart();
+        }
+
+        Timer {
+            id: aparecer
+            interval: 1050
+            onTriggered: {
+                if (ventana.saliendo)
+                    return;
+                anillo.estallar(monita.x + ventana.lado / 2, monita.y + ventana.lado * 0.55);
+                ventana.entrando = false;
+                ventana.festejando = true;
+                ventana.saludo = "¡Hola!";
+                ventana.modo = "saltar";
+                ventana.mover(monita.x, monita.y - 33, 200, "", "sale", ventana.caer, 30);
+                finFestejo.restart();
+            }
+        }
+
+        Timer {
+            id: finFestejo
+            interval: 2200
+            onTriggered: {
+                ventana.festejando = false;
+                ventana.saludo = "";
+            }
+        }
+
+        function salir() {
+            if (saliendo)
+                return;
+            saliendo = true;
+            decidir.stop();
+            mov.stop();
+            aparecer.stop();
+            if (entrando) {
+                Qt.quit();
+                return;
+            }
+            const dir = haciaLaDerecha ? 1 : -1;
+            festejando = true;
+            saludo = "¡Chao!";
+            modo = "saltar";
+            mover(monita.x, monita.y - 15, 450, "", "sale", () => {
+                saludo = "";
+                for (let i = 0; i < chispas.count; i++)
+                    chispas.itemAt(i).explotar(monita.x + lado / 2, monita.y + lado * 0.5);
+                modo = "dash";
+                azul = true;
+                mover(monita.x + dir * 300, -lado * 2, 380, "sale", "sale", () => cerrar.start(), 30);
+            }, 30);
+        }
+
+        // Espera a que se apaguen los últimos destellos.
+        Timer {
+            id: cerrar
+            interval: 500
+            onTriggered: Qt.quit()
+        }
+
         function armarEscena(texto) {
             const partes = texto.split("@@");
             let monitores, clientes;
@@ -210,8 +303,10 @@ ShellRoot {
                     sups.push({ x0: c.at[0] - mon.x, x1: c.at[0] - mon.x + c.size[0], y: y, suelo: false });
             }
             superficies = sups;
+            if (!entradaIniciada)
+                entrar();
             // Si la ventana en la que estaba parada se fue, se cae.
-            if (!ocupada() && !superficieEn(piesX(), piesY()))
+            else if (!entrando && !saliendo && !ocupada() && !superficieEn(piesX(), piesY()))
                 caer();
         }
 
@@ -383,7 +478,6 @@ ShellRoot {
         Timer {
             id: decidir
             interval: 1500
-            running: true
             onTriggered: {
                 if (ventana.estado !== "quieta" || ventana.ocupada())
                     return;
@@ -502,12 +596,98 @@ ShellRoot {
             onTriggered: estela.itemAt(siguiente++ % estela.count).soltar(monita.x, monita.y, ventana.haciaLaDerecha)
         }
 
+        // Destellos pixelados de la entrada y la despedida.
+        Repeater {
+            id: chispas
+            model: 18
+            delegate: Rectangle {
+                id: chispa
+                readonly property var colores: ["#8e52e0", "#b0a0d6", "#78dcff", "#f4eeff"]
+                width: ventana.escala * (index % 3 === 0 ? 3 : 2)
+                height: width
+                color: colores[index % colores.length]
+                opacity: 0
+                visible: opacity > 0
+
+                // Entran en curva desde un semicírculo por encima del punto
+                // (por debajo está el borde de la pantalla).
+                function juntar(cx, cy, retraso) {
+                    const angulo = Math.PI + index / (chispas.count - 1) * Math.PI;
+                    const radio = 150 + Math.random() * 90;
+                    chispa.x = cx + Math.cos(angulo) * radio;
+                    chispa.y = cy + Math.sin(angulo) * radio * 0.8;
+                    juntarX.to = cx;
+                    juntarY.to = cy;
+                    pausa.duration = retraso;
+                    llegada.restart();
+                }
+
+                function explotar(cx, cy) {
+                    const angulo = Math.PI + Math.random() * Math.PI;
+                    const radio = 70 + Math.random() * 110;
+                    chispa.x = cx;
+                    chispa.y = cy;
+                    salidaX.to = cx + Math.cos(angulo) * radio;
+                    salidaY.to = cy + Math.sin(angulo) * radio;
+                    salida.restart();
+                }
+
+                SequentialAnimation {
+                    id: llegada
+                    PauseAnimation { id: pausa }
+                    ParallelAnimation {
+                        NumberAnimation { id: juntarX; target: chispa; property: "x"; duration: 560; easing.type: Easing.InQuad }
+                        NumberAnimation { id: juntarY; target: chispa; property: "y"; duration: 560; easing.type: Easing.InOutSine }
+                        NumberAnimation { target: chispa; property: "opacity"; from: 0; to: 1; duration: 200 }
+                    }
+                    NumberAnimation { target: chispa; property: "opacity"; to: 0; duration: 90 }
+                }
+
+                ParallelAnimation {
+                    id: salida
+                    NumberAnimation { id: salidaX; target: chispa; property: "x"; duration: 520; easing.type: Easing.OutQuad }
+                    NumberAnimation { id: salidaY; target: chispa; property: "y"; duration: 520; easing.type: Easing.OutQuad }
+                    NumberAnimation { target: chispa; property: "opacity"; from: 1; to: 0; duration: 520; easing.type: Easing.InQuad }
+                }
+            }
+        }
+
+        // Anillo de luz cuando aparece.
+        Rectangle {
+            id: anillo
+            property real cx: 0
+            property real cy: 0
+            x: cx - width / 2
+            y: cy - height / 2
+            width: 0
+            height: width
+            radius: width / 2
+            color: "transparent"
+            border.width: ventana.escala
+            border.color: "#d6c4ff"
+            opacity: 0
+            visible: opacity > 0
+
+            function estallar(x, y) {
+                cx = x;
+                cy = y;
+                estallido.restart();
+            }
+
+            ParallelAnimation {
+                id: estallido
+                NumberAnimation { target: anillo; property: "width"; from: 12; to: ventana.lado * 1.8; duration: 420; easing.type: Easing.OutQuad }
+                NumberAnimation { target: anillo; property: "opacity"; from: 1; to: 0; duration: 420; easing.type: Easing.InQuad }
+            }
+        }
+
         Item {
             id: monita
             width: ventana.lado
             height: ventana.lado
             x: ventana.width / 3
             y: ventana.height - height
+            visible: !ventana.entrando
 
             Item {
                 anchors.fill: parent
@@ -536,8 +716,8 @@ ShellRoot {
                 }
             }
 
-            // Globito sobre la cabeza: ! escuchando, ... pensando,
-            // ♪ hablando y zZ durmiendo.
+            // Globito sobre la cabeza: el saludo al llegar o irse, !
+            // escuchando, ... pensando, ♪ hablando y zZ durmiendo.
             Text {
                 anchors.bottom: parent.top
                 anchors.bottomMargin: -10
@@ -549,6 +729,8 @@ ShellRoot {
                 style: Text.Outline
                 styleColor: "#1a1423"
                 text: {
+                    if (ventana.saludo)
+                        return ventana.saludo;
                     switch (ventana.animacion) {
                     case "escuchar": return "!";
                     case "pensar": return ".".repeat(ventana.cuadro + 2);

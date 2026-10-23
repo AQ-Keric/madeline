@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 
 import '../tema.dart';
+import 'avatar_madeline.dart';
 
 class Mensaje {
   String texto;
@@ -38,7 +39,7 @@ class Burbuja extends StatelessWidget {
           bottomLeft: Radius.circular(deElla ? 4 : 18),
           bottomRight: Radius.circular(deElla ? 18 : 4),
         ),
-        border: deElla ? Border.all(color: mensaje.esError ? Colores.pelo : Colores.borde, width: 1) : null,
+        border: deElla ? Border.all(color: mensaje.esError ? Colores.peligro : Colores.borde, width: 1) : null,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -101,7 +102,8 @@ class _EscribiendoState extends State<Escribiendo> with SingleTickerProviderStat
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
-          const CircleAvatar(radius: 14, backgroundImage: AssetImage('assets/logo.png')),
+          // Ella pensando, mientras llega la respuesta.
+          AvatarMadeline.busto(estado: EstadoAvatar.pensando, diametro: 28, fondo: Colores.superficieAlta),
           const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),

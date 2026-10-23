@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 
-/// Paleta inspirada en Celeste: noche en la montaña, el pelo rojo de
-/// Madeline (y azul cuando gasta el dash), fresas y nieve.
+/// Paleta de Madeline: noche en la montaña de Celeste, su pelo morado
+/// y su sudadera lila (como el avatar del PC), el azul del pelo después
+/// del dash, fresas y nieve.
 class Colores {
   static const cieloArriba = Color(0xFF140C2E);
   static const cieloAbajo = Color(0xFF2E1A4A);
@@ -11,8 +12,10 @@ class Colores {
   static const superficieAlta = Color(0xFF32205A);
   static const borde = Color(0xFF4A3478);
 
-  static const pelo = Color(0xFFE5484D); // rojo de Madeline
+  static const pelo = Color(0xFF8E52E0); // morado de Madeline
+  static const sudadera = Color(0xFFB0A0D6);
   static const dash = Color(0xFF5BB4F0); // azul tras el dash: grabando
+  static const peligro = Color(0xFFE5484D); // errores, apagar, sin conexión
   static const fresa = Color(0xFFFF6B81);
   static const nieve = Color(0xFFF4EEFF);
   static const texto = Color(0xFFEDE6FF);

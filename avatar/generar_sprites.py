@@ -24,6 +24,8 @@ from PIL import Image
 
 TAM = 32
 CARPETA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sprites")
+# La app del celular usa los mismos cuadros (la Madeline de la cabecera).
+CARPETA_APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mobile", "assets", "avatar")
 
 COMUNES = {
     "K": (26, 20, 35),       # contorno
@@ -308,13 +310,14 @@ def cuadros():
     return lista
 
 
-def generar(nombre_estilo):
+def generar(nombre_estilo, carpeta=None):
     estilo = ESTILOS[nombre_estilo]
-    os.makedirs(CARPETA, exist_ok=True)
+    carpeta = carpeta or CARPETA
+    os.makedirs(carpeta, exist_ok=True)
     cajas = {}
     for nombre, args in cuadros():
         img, cajas[nombre] = dibujar(estilo, **args)
-        img.save(os.path.join(CARPETA, nombre + ".png"))
+        img.save(os.path.join(carpeta, nombre + ".png"))
         if nombre == "dash_0":
             # Silueta celeste sólida para la estela del dash.
             silueta = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -322,9 +325,9 @@ def generar(nombre_estilo):
                 for x in range(TAM):
                     if img.getpixel((x, y))[3]:
                         silueta.putpixel((x, y), (120, 220, 255, 255))
-            silueta.save(os.path.join(CARPETA, "dash_silueta.png"))
+            silueta.save(os.path.join(carpeta, "dash_silueta.png"))
     hexa = "#{:02x}{:02x}{:02x}".format
-    with open(os.path.join(CARPETA, "luz.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(carpeta, "luz.json"), "w", encoding="utf-8") as f:
         json.dump({"reposo": hexa(*estilo["G"]), "apagada": hexa(*estilo["A"]),
                    "cuadros": cajas}, f, indent=1)
 
@@ -346,4 +349,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--muestra":
         muestra(sys.argv[2])
     else:
-        generar(sys.argv[1] if len(sys.argv) > 1 else ESTILO_POR_DEFECTO)
+        estilo = sys.argv[1] if len(sys.argv) > 1 else ESTILO_POR_DEFECTO
+        generar(estilo)
+        if os.path.isdir(os.path.dirname(CARPETA_APP)):
+            generar(estilo, CARPETA_APP)

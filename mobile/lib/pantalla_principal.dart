@@ -16,6 +16,7 @@ import 'pantalla_deck.dart';
 import 'pantalla_recados.dart';
 import 'recados_locales.dart';
 import 'tema.dart';
+import 'widgets/avatar_madeline.dart';
 import 'widgets/burbuja.dart';
 import 'widgets/fondo_montana.dart';
 import 'widgets/panel_sensores.dart';
@@ -43,6 +44,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
 
   bool _grabando = false;
   bool _pensando = false;
+  bool _hablando = false;
   bool _hayTexto = false;
   // Si el dedo sigue sobre el botón. La primera vez, el diálogo de
   // permiso del micrófono hace que se suelte ANTES de que arranque la
@@ -59,6 +61,10 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _timerBandeja = Timer.periodic(const Duration(seconds: 8), (_) => _revisarBandeja());
+    // La Madeline de la cabecera mueve la boca mientras suena su voz.
+    _reproductor.onPlayerStateChanged.listen((estado) {
+      if (mounted) setState(() => _hablando = estado == PlayerState.playing);
+    });
     _texto.addListener(() {
       final hay = _texto.text.trim().isNotEmpty;
       if (hay != _hayTexto) setState(() => _hayTexto = hay);
@@ -356,7 +362,7 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     final (color, texto) = switch (_conexion.estado) {
       EstadoConexion.conectada => (Colores.ok, 'Conectada · ${_conexion.ip}'),
       EstadoConexion.buscando => (Colores.aviso, 'Buscando tu PC…'),
-      EstadoConexion.sinConexion => (Colores.pelo, 'Sin conexión · toca para reintentar'),
+      EstadoConexion.sinConexion => (Colores.peligro, 'Sin conexión · toca para reintentar'),
     };
     return GestureDetector(
       onTap: _conexion.estado == EstadoConexion.sinConexion ? () => _conectar(forzar: true) : null,
@@ -371,17 +377,34 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
     );
   }
 
+  EstadoAvatar get _estadoAvatar => _grabando
+      ? EstadoAvatar.escuchando
+      : _pensando
+          ? EstadoAvatar.pensando
+          : _hablando
+              ? EstadoAvatar.hablando
+              : EstadoAvatar.quieta;
+
   Widget _cabecera() {
+    final atenta = _estadoAvatar != EstadoAvatar.quieta;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
       child: Row(
         children: [
-          Container(
+          // Ella misma, en pixel art, con un halo que se enciende cuando
+          // te escucha, piensa o habla.
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 300),
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              boxShadow: [BoxShadow(color: Colores.fresa.withValues(alpha: 0.35), blurRadius: 16)],
+              boxShadow: [
+                BoxShadow(
+                  color: (atenta ? Colores.dash : Colores.pelo).withValues(alpha: atenta ? 0.45 : 0.25),
+                  blurRadius: atenta ? 22 : 14,
+                ),
+              ],
             ),
-            child: const CircleAvatar(radius: 22, backgroundImage: AssetImage('assets/logo.png')),
+            child: AvatarMadeline.busto(estado: _estadoAvatar, diametro: 50, fondo: Colores.superficieAlta),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -415,8 +438,8 @@ class _PantallaPrincipalState extends State<PantallaPrincipal> with WidgetsBindi
   }
 
   Widget _botonMicrofono() {
-    // Rojo como el pelo de Madeline; azul mientras graba, como cuando
-    // gasta el dash en Celeste.
+    // Morado como el pelo de Madeline; azul mientras graba, como cuando
+    // hace dash en Celeste.
     final color = _grabando ? Colores.dash : Colores.pelo;
     return GestureDetector(
       onTapDown: (_) {

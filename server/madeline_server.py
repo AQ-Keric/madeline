@@ -1677,12 +1677,23 @@ def _lanzar_avatar() -> bool:
 
 def mostrar_avatar(accion: str) -> str:
     if accion == "esconder":
-        subprocess.run(["qs", "kill", "-p", CARPETA_AVATAR],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             os.remove(MARCA_AVATAR_ACTIVO)
         except OSError:
             pass
+        # Se despide sola (salta y se va con un dash) y cierra el programa;
+        # el qs kill es por si no alcanzó. Si mientras tanto la volviste a
+        # mostrar (vuelve la marca), no se toca.
+        poner_estado_avatar("despedida")
+
+        def cerrar():
+            if not os.path.exists(MARCA_AVATAR_ACTIVO):
+                subprocess.run(["qs", "kill", "-p", CARPETA_AVATAR],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if ESTADO_AVATAR == "despedida":
+                poner_estado_avatar("quieta")
+
+        threading.Timer(2.5, cerrar).start()
         return elegir_variada([
             "Listo, me escondo. Llámame si me extrañas.",
             "Va, me voy a mi rincón.",
@@ -4695,6 +4706,7 @@ DECK_ACCIONES = {
     "verificar_actualizaciones": set(),
     "cerrar_todo": set(),
     "control_energia": {"accion"},
+    "mostrar_avatar": {"accion"},
 }
 
 
@@ -4718,7 +4730,8 @@ def deck_icono_endpoint(app_id: str):
 
 @app.get("/deck/estado")
 def deck_estado_endpoint():
-    """Escritorios en uso, el activo y los dispositivos Bluetooth."""
+    """Escritorios en uso, el activo, los dispositivos Bluetooth y si el
+    avatar está paseando por la pantalla."""
     escritorios, activo = [], None
     try:
         lista = subprocess.run(["hyprctl", "workspaces", "-j"],
@@ -4732,7 +4745,8 @@ def deck_estado_endpoint():
 
     # Un nombre por dispositivo (hay alias con y sin tilde).
     bluetooth = list({mac: nombre for nombre, mac in reversed(DISPOSITIVOS_BLUETOOTH.items())}.values())[::-1]
-    return {"escritorios": escritorios, "activo": activo, "bluetooth": bluetooth}
+    return {"escritorios": escritorios, "activo": activo, "bluetooth": bluetooth,
+            "avatar": os.path.exists(MARCA_AVATAR_ACTIVO)}
 
 
 @app.post("/deck/accion")
