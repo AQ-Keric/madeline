@@ -44,7 +44,7 @@ ShellRoot {
         // Lo que está haciendo Madeline (lo manda el servidor).
         property string estado: "quieta"
         // Lo que hace el avatar por su cuenta: quieta, caminar, dormir,
-        // saltar, caer o dash.
+        // saludar, bailar, estirar, celular, saltar, caer o dash.
         property string modo: "quieta"
         property bool azul: false        // pelo azul: después del dash
         property bool entrando: true     // invisible hasta la animación de entrada
@@ -68,7 +68,9 @@ ShellRoot {
         // Mpris avisa solo cuando cambia algo: no hay que consultar.
         readonly property bool hayMusica: Mpris.players.values.some(p => p.isPlaying)
         readonly property bool atendiendo: estado !== "quieta"
-        readonly property bool apoyada: modo === "quieta" || modo === "caminar" || modo === "dormir"
+        // Lo que hace parada en una superficie (lo demás va en el aire).
+        readonly property var modosApoyada: ["quieta", "caminar", "dormir", "saludar", "bailar", "estirar", "celular"]
+        readonly property bool apoyada: modosApoyada.includes(modo)
 
         readonly property string animacion: {
             if (apoyada) {
@@ -81,7 +83,8 @@ ShellRoot {
             return modo;
         }
         readonly property var cuadrosPorAnimacion: ({
-            caminar: 4, hablar: 2, pensar: 2, escuchar: 2, dormir: 2
+            caminar: 4, hablar: 2, pensar: 2, escuchar: 2, dormir: 2,
+            saludar: 2, bailar: 4, estirar: 2, celular: 2
         })
 
         readonly property color colorLuz: {
@@ -139,13 +142,16 @@ ShellRoot {
             }
             // Se detiene a atender (si va en el aire, termina de caer).
             decidir.stop();
-            if (modo === "caminar" || modo === "dormir") {
+            if (apoyada) {
                 mov.stop();
                 modo = "quieta";
             }
         }
 
         onAnimacionChanged: cuadro = 0
+
+        // Si se acaba la música deja de bailar.
+        onHayMusicaChanged: if (!hayMusica && modo === "bailar") descansar(1500)
 
         // Arcoíris mientras escucha, piensa o habla.
         Timer {
@@ -182,6 +188,10 @@ ShellRoot {
             function onRawEvent(evento) {
                 if (ventana.eventosEscena.includes(evento.name))
                     refrescar.restart();
+                // A veces saluda a la ventana nueva.
+                if (evento.name === "openwindow" && ventana.estado === "quieta" && !ventana.entrando
+                        && !ventana.saliendo && !ventana.ocupada() && Math.random() < 0.4)
+                    ventana.hacer("saludar", 2200);
             }
         }
 
@@ -354,6 +364,26 @@ ShellRoot {
             programar(ms);
         }
 
+        // Una actividad en el lugar por un rato; después decide otra cosa.
+        function hacer(m, ms) {
+            mov.stop();
+            modo = m;
+            programar(ms);
+        }
+
+        // Mira para un lado y para el otro, y vuelve a lo suyo.
+        function mirarAlrededor(vueltas) {
+            modo = "quieta";
+            if (vueltas <= 0) {
+                programar(azar(800, 2000));
+                return;
+            }
+            esperar(azar(700, 1400), () => {
+                haciaLaDerecha = !haciaLaDerecha;
+                mirarAlrededor(vueltas - 1);
+            });
+        }
+
         // Movimiento a saltos de un píxel del sprite (escala px), como un
         // juego pixel art, y a pocos cuadros por segundo: la ventana
         // cubre toda la pantalla y cada cuadro se redibuja entera (a 60
@@ -488,7 +518,11 @@ ShellRoot {
                     ventana.caer();
                     return;
                 }
-                const opciones = [["caminar", 40], ["quieta", 18], ["dormir", 6], ["dash", 16]];
+                const opciones = [["caminar", 40], ["quieta", 14], ["dormir", 6], ["dash", 14],
+                                  ["mirar", 8], ["celular", 6], ["saludar", 3], ["saltito", 5]];
+                // Con música baila harto.
+                if (ventana.hayMusica)
+                    opciones.push(["bailar", 45]);
                 if (!s.suelo)
                     opciones.push(["bajar", 16]);
                 let total = opciones.reduce((a, o) => a + o[1], 0);
@@ -503,8 +537,28 @@ ShellRoot {
                     ventana.descansar(ventana.azar(3000, 8000));
                     break;
                 case "dormir":
-                    ventana.modo = "dormir";
-                    ventana.programar(ventana.azar(30000, 120000));
+                    // Primero se estira y bosteza.
+                    ventana.modo = "estirar";
+                    ventana.esperar(1800, () => {
+                        ventana.modo = "dormir";
+                        ventana.programar(ventana.azar(30000, 120000));
+                    });
+                    break;
+                case "bailar":
+                    ventana.hacer("bailar", ventana.azar(6000, 14000));
+                    break;
+                case "celular":
+                    ventana.hacer("celular", ventana.azar(5000, 12000));
+                    break;
+                case "saludar":
+                    ventana.hacer("saludar", 2200);
+                    break;
+                case "mirar":
+                    ventana.mirarAlrededor(2 + Math.floor(Math.random() * 3));
+                    break;
+                case "saltito":
+                    ventana.modo = "saltar";
+                    ventana.mover(monita.x, monita.y - 24, 200, "", "sale", ventana.caer, 30);
                     break;
                 case "bajar":
                     ventana.bajar(s);
@@ -530,6 +584,10 @@ ShellRoot {
                 case "caminar": return 140;
                 case "hablar": return 170;
                 case "dormir": return 900;
+                case "bailar": return 230;
+                case "saludar": return 260;
+                case "estirar": return 700;
+                case "celular": return 1400;
                 default: return 450;
                 }
             }
@@ -539,9 +597,15 @@ ShellRoot {
                 if (ventana.animacion === "quieta") {
                     const secuencia = [0, 1, 0, 1, 0, 1, 0, 2];
                     ventana.cuadro = secuencia[(secuencia.indexOf(ventana.cuadro) + 1 + Math.floor(Math.random() * 2)) % secuencia.length];
+                } else if (ventana.animacion === "celular") {
+                    // Casi siempre mira serio; de vez en cuando se ríe.
+                    ventana.cuadro = Math.random() < 0.25 ? 1 : 0;
                 } else {
                     const total = ventana.cuadrosPorAnimacion[ventana.animacion] || 1;
                     ventana.cuadro = (ventana.cuadro + 1) % total;
+                    // Bailando gira de lado a lado.
+                    if (ventana.animacion === "bailar" && ventana.cuadro % 2 === 0)
+                        ventana.haciaLaDerecha = !ventana.haciaLaDerecha;
                 }
             }
         }
@@ -719,7 +783,8 @@ ShellRoot {
             }
 
             // Globito sobre la cabeza: el saludo al llegar o irse, !
-            // escuchando, ... pensando, ♪ hablando y zZ durmiendo.
+            // escuchando, ... pensando, ♪ hablando o bailando, jaja con el
+            // celular y zZ durmiendo.
             Text {
                 anchors.bottom: parent.top
                 anchors.bottomMargin: -10
@@ -738,6 +803,8 @@ ShellRoot {
                     case "pensar": return ".".repeat(ventana.cuadro + 2);
                     case "hablar": return "♪";
                     case "dormir": return ventana.cuadro ? "zZ" : "z";
+                    case "bailar": return ventana.cuadro < 2 ? "♪" : "♫";
+                    case "celular": return ventana.cuadro ? "jaja" : "";
                     default: return "";
                     }
                 }

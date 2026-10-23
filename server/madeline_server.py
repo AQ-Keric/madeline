@@ -1700,6 +1700,19 @@ def mostrar_avatar(accion: str) -> str:
             "Me escondo. Igual sigo escuchando, eh.",
         ])
 
+    if ESTADO_AVATAR == "despedida" and shutil.which("qs"):
+        # La escondiste recién y todavía va saliendo: "qs -n" no abriría
+        # otra porque esa sigue viva, y al terminar de irse se cerraría.
+        # Se cierra ya y se lanza una nueva.
+        subprocess.run(["qs", "kill", "-p", CARPETA_AVATAR],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(20):
+            vivas = subprocess.run(["qs", "list", "-p", CARPETA_AVATAR],
+                                   capture_output=True, text=True)
+            if "No running instances" in vivas.stdout + vivas.stderr:
+                break
+            time.sleep(0.1)
+    poner_estado_avatar("quieta")
     if not _lanzar_avatar():
         return "No pude: falta Quickshell (qs) para dibujarme en la pantalla."
     os.makedirs(os.path.dirname(MARCA_AVATAR_ACTIVO), exist_ok=True)

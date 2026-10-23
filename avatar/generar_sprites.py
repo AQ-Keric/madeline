@@ -33,6 +33,8 @@ COMUNES = {
     "s": (236, 160, 140),    # mejillas
     "E": (40, 26, 60),       # ojos
     "M": (190, 70, 100),     # boca
+    "F": (44, 40, 60),       # celular
+    "f": (150, 220, 255),    # brillo de la pantalla
 }
 
 # Pelo morado oscuro, igual en todos los estilos.
@@ -128,6 +130,14 @@ def pelo_largo(l, dy, viento):
             l.punto(x1 - 2, y, "L")
 
 
+# Brazo estirado: tramos de 2 px (x, y) desde el hombro y la mano (x0, y0, x1, y1).
+BRAZO_ESTIRADO = {
+    "arriba": (((19, 17), (20, 16), (20, 15), (21, 14), (21, 13), (22, 12)), (23, 11, 24, 12)),
+    "saludo": (((20, 16), (21, 15), (22, 14), (23, 13), (23, 12), (23, 11), (23, 10)), (23, 8, 24, 9)),
+    "saludo2": (((20, 16), (21, 15), (22, 14), (23, 13), (24, 12), (25, 11), (25, 10)), (25, 8, 26, 9)),
+}
+
+
 def ropa(l, dy, brazo, pose_brazo="normal"):
     l.rect(14, 16 + dy, 20, 23 + dy, "C")
     l.punto(14, 16 + dy, "c")
@@ -136,16 +146,25 @@ def ropa(l, dy, brazo, pose_brazo="normal"):
     # Cordones de la sudadera.
     l.rect(19, 17 + dy, 19, 19 + dy, "D")
     l.rect(15, 16 + dy, 17, 16 + dy, "I")
-    if pose_brazo == "arriba":
-        # Estirado en diagonal hacia arriba y adelante (al caer).
-        for x, y in ((19, 17), (20, 16), (20, 15), (21, 14), (21, 13), (22, 12)):
+    if pose_brazo in BRAZO_ESTIRADO:
+        # Estirado hacia arriba: al caer, saludando, bailando, estirándose.
+        tramos, (hx0, hy0, hx1, hy1) = BRAZO_ESTIRADO[pose_brazo]
+        for x, y in tramos:
             l.rect(x, y + dy, x + 1, y + dy, "C")
-        l.rect(23, 11 + dy, 24, 12 + dy, "S")
+        l.rect(hx0, hy0 + dy, hx1, hy1 + dy, "S")
     elif pose_brazo == "adelante":
         # Horizontal hacia adelante (dash).
         l.rect(18, 18 + dy, 24, 19 + dy, "C")
         l.rect(18, 19 + dy, 24, 19 + dy, "c")
         l.rect(25, 18 + dy, 26, 19 + dy, "S")
+    elif pose_brazo == "celular":
+        # Codo doblado, sostiene el celular frente al pecho.
+        l.rect(16, 17 + dy, 17, 20 + dy, "C")
+        l.rect(16, 20 + dy, 20, 21 + dy, "C")
+        l.rect(16, 21 + dy, 20, 21 + dy, "c")
+        l.rect(21, 19 + dy, 22, 20 + dy, "S")
+        l.rect(21, 15 + dy, 23, 18 + dy, "F")
+        l.rect(21, 15 + dy, 21, 17 + dy, "f")
     else:
         # Brazo delantero (se mece al caminar).
         bx = 16 + brazo
@@ -212,6 +231,9 @@ def cabeza(l, dy, ojos, boca):
     elif ojos == "arriba":
         for x in (18, 21):
             l.rect(x, 11 + dy, x, 12 + dy, "E")
+    elif ojos == "abajo":
+        for x in (18, 21):
+            l.rect(x, 13 + dy, x, 14 + dy, "E")
     elif ojos == "cerrados":
         for x in (17, 18, 20, 21):
             l.punto(x, 13 + dy, "E")
@@ -245,7 +267,7 @@ def dibujar(estilo, *, dy=0, viento=0, brazo=0, piernas_pos=((0, 0), (0, 0)),
         ropa_brazo = Lienzo()
         ropa(ropa_brazo, alto, brazo, pose_brazo)
         for (x, y), c in ropa_brazo.px.items():
-            if c in ("C", "c", "S") and not (14 <= x <= 20 and 16 + alto <= y <= 23 + alto):
+            if c in ("C", "c", "S", "F", "f") and not (14 <= x <= 20 and 16 + alto <= y <= 23 + alto):
                 l.px[(x, y)] = c
     l.contorno()
     if piernas_pos == "sentada":
@@ -297,6 +319,21 @@ def cuadros():
         lista.append((f"caminar_{i}", {"dy": dy, "viento": 2 if i % 2 else 1,
                                        "brazo": brazo, "piernas_pos": pos}))
     lista += [
+        # Saludando con la mano.
+        ("saludar_0", {"pose_brazo": "saludo", "boca": "sonrisa"}),
+        ("saludar_1", {"pose_brazo": "saludo2", "boca": "sonrisa"}),
+        # Bailando: alterna brazo arriba y abajo, dando pasitos.
+        ("bailar_0", {"pose_brazo": "saludo", "piernas_pos": ((-1, 0), (1, 0)), "boca": "sonrisa"}),
+        ("bailar_1", {"brazo": 1, "piernas_pos": ((0, 2), (0, 0)), "dy": -1, "viento": 1, "boca": "sonrisa"}),
+        ("bailar_2", {"pose_brazo": "saludo2", "piernas_pos": ((1, 0), (-1, 0)),
+                      "ojos": "cerrados", "boca": "sonrisa"}),
+        ("bailar_3", {"brazo": -1, "piernas_pos": ((0, 0), (0, 2)), "dy": -1, "viento": 1, "boca": "sonrisa"}),
+        # Estirándose con un bostezo (antes de dormir).
+        ("estirar_0", {"pose_brazo": "saludo", "ojos": "cerrados", "boca": "abierta", "dy": -1}),
+        ("estirar_1", {"pose_brazo": "saludo", "ojos": "cerrados", "boca": "abierta"}),
+        # Mirando el celular; en el 2do cuadro se ríe.
+        ("celular_0", {"pose_brazo": "celular", "ojos": "abajo"}),
+        ("celular_1", {"pose_brazo": "celular", "ojos": "abajo", "boca": "sonrisa", "dy": 1}),
         # Saltar (impulso): piernas recogidas.
         ("saltar_0", {"piernas_pos": ((0, 2), (1, 2)), "dy": -1}),
         # Cayendo: brazo arriba y piernas sueltas.
@@ -334,7 +371,7 @@ def generar(nombre_estilo, carpeta=None):
 
 def muestra(ruta, escala=8):
     """Una fila por estilo con algunos cuadros, para elegir."""
-    nombres = ("quieta_0", "caminar_1", "caminar_3", "hablar_0", "dormir_0")
+    nombres = ("quieta_0", "caminar_1", "saludar_0", "bailar_2", "estirar_0", "celular_1", "dormir_0")
     args = dict(cuadros())
     lado = TAM * escala
     hoja = Image.new("RGBA", (lado * len(nombres), lado * len(ESTILOS)), (236, 236, 242, 255))
