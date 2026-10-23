@@ -1807,6 +1807,8 @@ def crear_evento(titulo: str, fecha: str, hora: str = None, duracion_minutos: in
         return "No entendí bien la fecha, ¿me la repites?"
     if mensaje and not agenda.menciona_dia(mensaje):
         dia = ahora.date()
+    elif mensaje:
+        dia = agenda.fecha_dicha(mensaje, ahora.date()) or dia
 
     if hora:
         inicio = agenda.interpretar_hora_dicha(dia, hora, agenda.parte_del_dia(mensaje), ahora)
@@ -1817,7 +1819,10 @@ def crear_evento(titulo: str, fecha: str, hora: str = None, duracion_minutos: in
         inicio = dia
         cuando = agenda.dia_relativo(dia, ahora.date())
 
-    titulo = titulo.strip(" .")
+    # "agrégame a la agenda X": a veces Groq deja "Agenda" en el título.
+    titulo = re.sub(r"^(?:(?:a )?(?:la|mi) )?(?:agenda|calendario)\b[:,]?\s*", "", titulo.strip(" ."),
+                    flags=re.IGNORECASE) or titulo
+    titulo = titulo[:1].upper() + titulo[1:]
     try:
         agenda.crear(titulo, inicio, int(duracion_minutos or 60))
     except agenda.PermisoVencido as e:
@@ -2299,11 +2304,11 @@ tools = [
         "type": "function",
         "function": {
             "name": "crear_evento",
-            "description": "Agrega un evento con fecha al calendario de Google (agéndame, tengo dentista el jueves).",
+            "description": "Agrega un evento con fecha al calendario de Google (agéndame, tengo dentista el jueves). Llámala directo, sin preguntar ni corregir el día de la semana: la fecha se revisa aquí.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "titulo": {"type": "string", "description": "Qué es, corto y sin la fecha."},
+                    "titulo": {"type": "string", "description": "Qué es, corto, sin la fecha ni la palabra agenda."},
                     "fecha": {"type": "string", "description": "AAAA-MM-DD"},
                     "hora": {
                         "type": "string",
@@ -3521,9 +3526,15 @@ TEMAS_TOOLS = {
         ("agregar_recado", "ver_recados", "borrar_recado"),
     ),
     "agenda": (
-        ("agenda", "calendario", "evento", "cita", "reunion", "que tengo",
+        ("agend", "calendario", "evento", "cita", "reunion", "que tengo",
          "tengo algo", "hora al", "dentista", "doctor", "medico", "cumple",
-         "planes", "esta semana", "ocupado"),
+         "planes", "esta semana", "ocupado",
+         # Una fecha u hora del reloj ("agrégame X el martes 27") ya es agenda.
+         "lunes", "martes", "miercoles", "jueves", "viernes", "sabado",
+         "domingo", r"el \d{1,2}\b", r"\d{1,2} de (?:" + "|".join(
+             ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+              "agosto", "septiembre", "octubre", "noviembre", "diciembre")) + ")",
+         r"a las? \d"),
         ("ver_agenda", "crear_evento"),
     ),
     "avatar": (

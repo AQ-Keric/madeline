@@ -35,6 +35,16 @@ class TestHoraDicha(unittest.TestCase):
     def test_24_horas(self):
         self.assertEqual(self.hora("16:30"), datetime(2026, 10, 19, 16, 30))
 
+    def test_fecha_dicha(self):
+        viernes = date(2026, 10, 23)
+        self.assertEqual(agenda.fecha_dicha("prueba el martes 27", viernes), date(2026, 10, 27))
+        self.assertEqual(agenda.fecha_dicha("el jueves a las 4", viernes), date(2026, 10, 29))
+        self.assertEqual(agenda.fecha_dicha("el viernes", viernes), date(2026, 10, 30))
+        self.assertEqual(agenda.fecha_dicha("el 5", viernes), date(2026, 11, 5))
+        self.assertEqual(agenda.fecha_dicha("el 10 de enero", viernes), date(2027, 1, 10))
+        self.assertEqual(agenda.fecha_dicha("mañana a las 10 de la mañana", viernes), date(2026, 10, 24))
+        self.assertIsNone(agenda.fecha_dicha("a las 9 de la mañana", viernes))
+
     def test_hora_invalida(self):
         self.assertIsNone(self.hora("25:00"))
         self.assertIsNone(self.hora("a las cuatro"))
@@ -91,6 +101,14 @@ class TestAgendaSinGoogle(unittest.TestCase):
         # Sin día dicho es hoy (aunque Groq diga otro), y "a las 4" es de tarde.
         self.assertEqual(crear.call_args[0][1], datetime(2026, 10, 19, 16, 0))
         self.assertEqual(respuesta, "Listo, agendé Dentista hoy a las 4 de la tarde.")
+
+    def test_fecha_y_titulo_se_corrigen_aqui(self):
+        with mock.patch.object(agenda, "crear") as crear, \
+                mock.patch.object(j, "datetime", wraps=datetime) as reloj:
+            reloj.now.return_value = datetime(2026, 10, 23, 19, 22)
+            j.crear_evento("Agenda Prueba de Base de Datos", "2026-12-27",
+                           mensaje="Agrégame a la agenda prueba de base de datos el martes 27.")
+        self.assertEqual(crear.call_args[0][:2], ("Prueba de Base de Datos", date(2026, 10, 27)))
 
     def test_ver_agenda(self):
         eventos = [

@@ -183,6 +183,59 @@ def menciona_dia(texto: str) -> bool:
     return bool(_DIA.search(_normalizar(texto)))
 
 
+_DIA_DEL_MES = re.compile(r"\b(?:el |dia )(?:\w+ )?(\d{1,2})\b(?! de la)(?!:)")
+_FECHA_CON_MES = re.compile(r"\b(\d{1,2}) de (" + "|".join(MESES) + r")\b")
+_MANANA = re.compile(r"\b(pasado )?(?<!de la )(?<!en la )(?<!por la )(?<!esta )manana\b")
+
+
+def fecha_dicha(texto: str, hoy: date) -> date | None:
+    """Fecha clara en lo que dijeron, o None si no hay.
+
+    gpt-oss se equivoca con los días de la semana ("el martes 27" lo
+    corregía a jueves), así que la fecha se calcula aquí. Si dicen el
+    número y el día de la semana, manda el número.
+    """
+    t = _normalizar(texto)
+
+    match = _FECHA_CON_MES.search(t)
+    if match:
+        dia, mes = int(match.group(1)), MESES.index(match.group(2)) + 1
+        for anio in (hoy.year, hoy.year + 1):
+            try:
+                fecha = date(anio, mes, dia)
+            except ValueError:
+                return None
+            if fecha >= hoy:
+                return fecha
+        return None
+
+    match = _DIA_DEL_MES.search(t)
+    if match and 1 <= int(match.group(1)) <= 31:
+        dia = int(match.group(1))
+        anio, mes = hoy.year, hoy.month
+        for _ in range(3):  # este mes o el próximo que tenga ese día
+            try:
+                fecha = date(anio, mes, dia)
+                if fecha >= hoy:
+                    return fecha
+            except ValueError:
+                pass
+            anio, mes = (anio + 1, 1) if mes == 12 else (anio, mes + 1)
+        return None
+
+    for numero, nombre in enumerate(_normalizar(d) for d in DIAS_SEMANA):
+        if re.search(rf"\b{nombre}\b", t):
+            # "el viernes" dicho un viernes es el de la otra semana.
+            return hoy + timedelta(days=(numero - hoy.weekday()) % 7 or 7)
+
+    if re.search(r"\bhoy\b", t):
+        return hoy
+    match = _MANANA.search(t)
+    if match:
+        return hoy + timedelta(days=2 if match.group(1) else 1)
+    return None
+
+
 def parte_del_dia(texto: str) -> str | None:
     """"manana", "tarde" o "noche" si lo dijeron junto a la hora."""
     match = _PARTE_DEL_DIA.search(_normalizar(texto))
