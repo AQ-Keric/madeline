@@ -52,6 +52,8 @@ ShellRoot {
         property bool saliendo: false
         property bool festejando: false  // arcoíris al llegar y al irse
         property string saludo: ""
+        // Lo que dice al aparecer (elige una al azar).
+        readonly property var saludos: ["¡Aquí ando!", "¡Ya llegué!", "Hey, Keric"]
         property bool haciaLaDerecha: true
         property int cuadro: 0
         property bool luzApagada: false
@@ -231,7 +233,7 @@ ShellRoot {
                 anillo.estallar(monita.x + ventana.lado / 2, monita.y + ventana.lado * 0.55);
                 ventana.entrando = false;
                 ventana.festejando = true;
-                ventana.saludo = "¡Hola!";
+                ventana.saludo = ventana.saludos[Math.floor(Math.random() * ventana.saludos.length)];
                 ventana.modo = "saltar";
                 ventana.mover(monita.x, monita.y - 33, 200, "", "sale", ventana.caer, 30);
                 finFestejo.restart();

@@ -36,7 +36,7 @@ sin gastar tokens.
   sudadera lila, audífonos) que usa tus ventanas como niveles de Celeste: pasea, se sube encima
   con un dash (con estela y el pelo azul) y se tira para abajo. Reacciona cuando escucha, piensa o habla (la luz
   de los audífonos pasa por el arcoíris), parpadea con la música y a veces se sienta a dormir.
-  Llega con destellos y un "¡Hola!"; "escóndete" la despide con un dash hacia arriba. No recibe clics, se esconde con apps en pantalla completa y gasta ~1,5 % de CPU.
+  Llega con destellos y un saludo ("¡Ya llegué!"); "escóndete" la despide con un dash hacia arriba. No recibe clics, se esconde con apps en pantalla completa y gasta ~1,5 % de CPU.
 - **App móvil (Flutter)**: con la misma Madeline pixel art animada en la cabecera (escucha, piensa
   y habla contigo); hablarle desde el celular, recibir la respuesta en audio, ver capturas,
   un panel de sensores del PC en tiempo real, un deck de botones, los recados y la agenda (también
