@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Backgroun
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from resultado import EstadoResultado, Resultado, normalizar_resultado
 
 # ============================================================
 # CONFIGURACIÓN
@@ -203,7 +204,14 @@ def ajustar_volumen(accion: str, porcentaje: int = 10, aplicacion: str = None) -
         return f"Error ejecutando pamixer: {e}"
 
 
-def cerrar_aplicacion(app_name: str) -> str:
+PROCESOS_PROTEGIDOS = {
+    "systemd", "hyprland", "waybar", "pipewire", "wireplumber", "dbus",
+    "madeline", "python", "python3", "bash", "sh", "sshd", "login", "init",
+    "systemd-journald", "systemd-udevd", "polkitd", "dunst", "mako",
+}
+
+
+def cerrar_aplicacion(app_name: str) -> Resultado:
     """Cierra una aplicación matando su proceso en Linux.
 
     Usa DICCIONARIO_APPS para resolver el nombre técnico (la misma
@@ -214,11 +222,27 @@ def cerrar_aplicacion(app_name: str) -> str:
     nombre_tecnico = resolver_app(app_name)
 
     if not nombre_tecnico:
-        return mensaje_app_desconocida("cerrar", app_name)
+        return Resultado(
+            ok=False,
+            mensaje=mensaje_app_desconocida("cerrar", app_name),
+            evidencia={"app_name": app_name, "encontrada": False},
+            estado=EstadoResultado.FAILURE,
+        )
 
     procesos = PROCESOS_CIERRE.get(nombre_tecnico, [nombre_tecnico])
 
+    # Protección de procesos esenciales
+    for proceso in procesos:
+        if proceso.lower() in PROCESOS_PROTEGIDOS:
+            return Resultado(
+                ok=False,
+                mensaje=f"Por seguridad, no se permite cerrar el proceso esencial '{proceso}'.",
+                evidencia={"app_name": app_name, "proceso": proceso, "protegido": True},
+                estado=EstadoResultado.FAILURE,
+            )
+
     cerrado_alguno = False
+    procesos_cerrados = []
 
     for proceso in procesos:
         resultado = subprocess.run(
@@ -227,13 +251,24 @@ def cerrar_aplicacion(app_name: str) -> str:
         )
         if resultado.returncode == 0:
             cerrado_alguno = True
+            procesos_cerrados.append(proceso)
 
     if cerrado_alguno:
-        return f"Se cerró la aplicación {app_name}."
+        return Resultado(
+            ok=True,
+            mensaje=f"Se cerró la aplicación {app_name}.",
+            evidencia={"app_name": app_name, "procesos": procesos_cerrados, "cerrado": True},
+            estado=EstadoResultado.SUCCESS,
+        )
 
-    return (
-        f"Pucha, no pude cerrar {app_name} "
-        f"(quizás ya estaba cerrada o el nombre del proceso es distinto)."
+    return Resultado(
+        ok=False,
+        mensaje=(
+            f"Pucha, no pude cerrar {app_name} "
+            f"(quizás ya estaba cerrada o el nombre del proceso es distinto)."
+        ),
+        evidencia={"app_name": app_name, "procesos": procesos, "cerrado": False},
+        estado=EstadoResultado.FAILURE,
     )
 
 
@@ -484,19 +519,30 @@ def programar_recordatorio(cantidad: int, unidad: str, mensaje: str) -> str:
 APPS_CERRAR_TODO = ["navegador", "minecraft", "bottles"]
 
 
-def cerrar_todo() -> str:
+def cerrar_todo() -> Resultado:
     """Cierra navegador y juegos de una pasada, reusando
     cerrar_aplicacion (y por lo tanto PROCESOS_CIERRE) en vez de
     mantener una lista de procesos aparte."""
-    cerradas = [
-        app for app in APPS_CERRAR_TODO
-        if cerrar_aplicacion(app).startswith("Se cerró")
-    ]
+    cerradas = []
+    for app in APPS_CERRAR_TODO:
+        res = cerrar_aplicacion(app)
+        if res.ok:
+            cerradas.append(app)
 
     if not cerradas:
-        return "No había nada que cerrar."
+        return Resultado(
+            ok=True,
+            mensaje="No había nada que cerrar.",
+            evidencia={"cerradas": []},
+            estado=EstadoResultado.SUCCESS,
+        )
 
-    return f"Limpieza hecha, cerré: {', '.join(cerradas)}."
+    return Resultado(
+        ok=True,
+        mensaje=f"Limpieza hecha, cerré: {', '.join(cerradas)}.",
+        evidencia={"cerradas": cerradas},
+        estado=EstadoResultado.SUCCESS,
+    )
 
 
 URL_CLIMA = "https://wttr.in/Villa+Alegre,Chile?format=j1&lang=es"
@@ -669,7 +715,7 @@ def estado_sistema() -> str:
         return f"No pude leer los sensores: {e}"
 
 
-def tomar_captura(ancho_max: int = 1920) -> str:
+def tomar_captura(ancho_max: int = 1920) -> Resultado:
     """Saca la captura usando grim en Hyprland y la comprime a JPEG.
 
     Cada captura se guarda con un ID único (uuid) en vez de un nombre
@@ -715,10 +761,34 @@ def tomar_captura(ancho_max: int = 1920) -> str:
                 f"se enviará el PNG original: {e}"
             )
 
-        return f"CAPTURA_LISTA:{captura_id}"
+        ruta_final = ruta_captura_disponible(captura_id)
+        if not ruta_final or not os.path.exists(ruta_final) or os.path.getsize(ruta_final) == 0:
+            return Resultado(
+                ok=False,
+                mensaje="Falló el módulo de captura de pantalla: el archivo no se generó o quedó vacío.",
+                evidencia={"captura_id": captura_id, "verificado": False},
+                estado=EstadoResultado.FAILURE,
+            )
+
+        return Resultado(
+            ok=True,
+            mensaje=f"CAPTURA_LISTA:{captura_id}",
+            evidencia={
+                "captura_id": captura_id,
+                "ruta": ruta_final,
+                "tamano_bytes": os.path.getsize(ruta_final),
+                "verificado": True,
+            },
+            estado=EstadoResultado.SUCCESS,
+        )
 
     except Exception as e:
-        return f"Falló el módulo de captura de pantalla: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Falló el módulo de captura de pantalla: {e}",
+            evidencia={"error": str(e), "verificado": False},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
 def ruta_captura_disponible(captura_id: str) -> str | None:
@@ -1166,7 +1236,31 @@ def abrir_pestanas_busqueda(consulta: str, tipo: str = "general") -> str:
     return f"Abrí {len(urls)} pestañas con resultados sobre {consulta}."
 
 
-def controlar_bluetooth(accion: str) -> str:
+def limpiar_ansi(texto: str) -> str:
+    """Elimina secuencias de escape ANSI de salidas de terminal."""
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", texto).strip()
+
+
+def verificar_conexion_bluetooth(mac: str, timeout: float = 2.0) -> Optional[bool]:
+    """Consulta a bluetoothctl info si el dispositivo figura Connected: yes."""
+    try:
+        res = subprocess.run(
+            ["bluetoothctl", "info", mac],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        salida = limpiar_ansi(res.stdout)
+        if "connected: yes" in salida.lower():
+            return True
+        if "connected: no" in salida.lower():
+            return False
+    except Exception:
+        pass
+    return None
+
+
+def controlar_bluetooth(accion: str) -> Resultado:
     """Enciende o apaga el adaptador Bluetooth (bluetoothctl/BlueZ)."""
     try:
         if accion == "encender":
@@ -1174,23 +1268,53 @@ def controlar_bluetooth(accion: str) -> str:
                 ["bluetoothctl", "power", "on"],
                 check=True, timeout=10, capture_output=True,
             )
-            return "Bluetooth encendido."
+            return Resultado(
+                ok=True,
+                mensaje="Bluetooth encendido.",
+                evidencia={"accion": "encender", "power": True},
+                estado=EstadoResultado.SUCCESS,
+            )
 
         if accion == "apagar":
             subprocess.run(
                 ["bluetoothctl", "power", "off"],
                 check=True, timeout=10, capture_output=True,
             )
-            return "Bluetooth apagado."
+            return Resultado(
+                ok=True,
+                mensaje="Bluetooth apagado.",
+                evidencia={"accion": "apagar", "power": False},
+                estado=EstadoResultado.SUCCESS,
+            )
 
-        return "Acción de Bluetooth no reconocida."
+        return Resultado(
+            ok=False,
+            mensaje="Acción de Bluetooth no reconocida.",
+            evidencia={"accion": accion},
+            estado=EstadoResultado.FAILURE,
+        )
 
     except subprocess.CalledProcessError as e:
-        return f"Error controlando el Bluetooth: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error controlando el Bluetooth: {e}",
+            evidencia={"error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
     except FileNotFoundError:
-        return "No encontré bluetoothctl instalado en el sistema."
+        return Resultado(
+            ok=False,
+            mensaje="No encontré bluetoothctl instalado en el sistema.",
+            evidencia={"error": "FileNotFoundError"},
+            estado=EstadoResultado.FAILURE,
+        )
     except Exception as e:
-        return f"Error controlando el Bluetooth: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error controlando el Bluetooth: {e}",
+            evidencia={"error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
 DISPOSITIVOS_BLUETOOTH = {
@@ -1206,15 +1330,20 @@ DISPOSITIVOS_BLUETOOTH = {
 }
 
 
-def conectar_bluetooth(dispositivo: str) -> str:
+def conectar_bluetooth(dispositivo: str) -> Resultado:
     """Conecta a un dispositivo Bluetooth ya emparejado previamente."""
     mac = DISPOSITIVOS_BLUETOOTH.get(dispositivo.strip().lower())
 
     if not mac:
-        return (
-            f"No tengo guardada la dirección de '{dispositivo}'. "
-            f"Emparejalo primero a mano con bluetoothctl y agregalo "
-            f"a DISPOSITIVOS_BLUETOOTH con su MAC (en minúscula)."
+        return Resultado(
+            ok=False,
+            mensaje=(
+                f"No tengo guardada la dirección de '{dispositivo}'. "
+                f"Emparejalo primero a mano con bluetoothctl y agregalo "
+                f"a DISPOSITIVOS_BLUETOOTH con su MAC (en minúscula)."
+            ),
+            evidencia={"dispositivo": dispositivo, "encontrado": False},
+            estado=EstadoResultado.FAILURE,
         )
 
     try:
@@ -1222,38 +1351,103 @@ def conectar_bluetooth(dispositivo: str) -> str:
             ["bluetoothctl", "connect", mac],
             capture_output=True, text=True, timeout=15,
         )
+        salida_limpia = limpiar_ansi(resultado.stdout)
+        verificado = verificar_conexion_bluetooth(mac)
 
-        if resultado.returncode == 0 or "successful" in resultado.stdout.lower():
-            return f"Conectado a {dispositivo}."
+        # Si el verificador confirma éxito, o si en tests/entornos mockeados
+        # el returncode es 0 y no hay fallos reportados
+        es_exitoso = False
+        if verificado is True:
+            es_exitoso = True
+        elif verificado is None:
+            if (resultado.returncode == 0 or "successful" in salida_limpia.lower()) and "failed" not in salida_limpia.lower():
+                es_exitoso = True
 
-        return f"No pude conectar a {dispositivo}: {resultado.stdout.strip()}"
+        if es_exitoso:
+            return Resultado(
+                ok=True,
+                mensaje=f"Conectado a {dispositivo}.",
+                evidencia={"dispositivo": dispositivo, "mac": mac, "conectado": True, "verificado": bool(verificado)},
+                estado=EstadoResultado.SUCCESS,
+            )
+
+        # Extraer mensaje de error limpio evitando volcar escapes ANSI
+        lineas_error = [
+            l.strip() for l in salida_limpia.splitlines()
+            if "failed" in l.lower() or "error" in l.lower()
+        ]
+        detalle = lineas_error[0] if lineas_error else (salida_limpia or "no se estableció la conexión")
+        return Resultado(
+            ok=False,
+            mensaje=f"No pude conectar a {dispositivo}: {detalle}",
+            evidencia={"dispositivo": dispositivo, "mac": mac, "conectado": False, "salida": salida_limpia},
+            estado=EstadoResultado.FAILURE,
+        )
 
     except subprocess.TimeoutExpired:
-        return f"Se agotó el tiempo intentando conectar a {dispositivo}."
+        return Resultado(
+            ok=False,
+            mensaje=f"Se agotó el tiempo intentando conectar a {dispositivo}.",
+            evidencia={"dispositivo": dispositivo, "mac": mac, "timeout": True},
+            estado=EstadoResultado.FAILURE,
+        )
     except Exception as e:
-        return f"Error conectando a {dispositivo}: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error conectando a {dispositivo}: {e}",
+            evidencia={"dispositivo": dispositivo, "mac": mac, "error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
-def desconectar_bluetooth(dispositivo: str) -> str:
+def desconectar_bluetooth(dispositivo: str) -> Resultado:
     """Desconecta un dispositivo Bluetooth ya conectado."""
     mac = DISPOSITIVOS_BLUETOOTH.get(dispositivo.strip().lower())
 
     if not mac:
-        return f"No tengo guardada la dirección de '{dispositivo}'."
+        return Resultado(
+            ok=False,
+            mensaje=f"No tengo guardada la dirección de '{dispositivo}'.",
+            evidencia={"dispositivo": dispositivo, "encontrado": False},
+            estado=EstadoResultado.FAILURE,
+        )
 
     try:
         resultado = subprocess.run(
             ["bluetoothctl", "disconnect", mac],
             capture_output=True, text=True, timeout=10,
         )
+        salida_limpia = limpiar_ansi(resultado.stdout)
+        verificado = verificar_conexion_bluetooth(mac)
 
-        if resultado.returncode == 0:
-            return f"Desconectado de {dispositivo}."
+        es_desconectado = False
+        if verificado is False:
+            es_desconectado = True
+        elif verificado is None and resultado.returncode == 0:
+            es_desconectado = True
 
-        return f"No pude desconectar {dispositivo}: {resultado.stdout.strip()}"
+        if es_desconectado:
+            return Resultado(
+                ok=True,
+                mensaje=f"Desconectado de {dispositivo}.",
+                evidencia={"dispositivo": dispositivo, "mac": mac, "conectado": False, "verificado": (verificado is False)},
+                estado=EstadoResultado.SUCCESS,
+            )
+
+        return Resultado(
+            ok=False,
+            mensaje=f"No pude desconectar {dispositivo}: {salida_limpia}",
+            evidencia={"dispositivo": dispositivo, "mac": mac, "conectado": True, "salida": salida_limpia},
+            estado=EstadoResultado.FAILURE,
+        )
 
     except Exception as e:
-        return f"Error desconectando de {dispositivo}: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error desconectando de {dispositivo}: {e}",
+            evidencia={"dispositivo": dispositivo, "mac": mac, "error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
 DICCIONARIO_APPS = {
@@ -1525,22 +1719,28 @@ def mensaje_app_desconocida(verbo: str, app_name: str) -> str:
 
 VERBOS_APP = {
     "abrir": [
-        "abre", "abres", "abrir", "ábreme",
-        "ejecuta", "ejecutar", "lanza", "lanzar",
-        "inicia", "iniciar",
+        "abre", "abres", "abrir", "abro", "ábreme", "abreme", "ábrete", "abrete",
+        "ejecuta", "ejecutar", "ejecuto", "lanza", "lanzar", "lanzo",
+        "inicia", "iniciar", "inicio",
         # "pon"/"poner" van SOLO en abrir, no en mover: son ambiguos
         # entre "abrir algo" y "mover algo", y abrir_aplicacion ya
         # soporta mandar la app recién abierta a un escritorio, así
         # que cubre el caso de "poner X en el escritorio Y" también.
-        "pon", "poner",
+        "pon", "poner", "pongo", "quiero abrir", "voy a abrir",
     ],
     "cerrar": [
-        "cierra", "cierras", "cerrar", "ciérralo", "ciérrame",
-        "mata", "termina", "terminar", "sal de", "salir de",
+        "cierra", "cierras", "cerrar", "cierro", "ciérralo", "cierralo",
+        "ciérrame", "cierrame", "ciérrate", "cierrate",
+        "mata", "matar", "mato", "termina", "terminar", "termino",
+        "sal de", "salir de", "quiero cerrar", "voy a cerrar",
     ],
     "mover": [
-        "mueve", "mueves", "mover", "muévelo", "muéveme",
-        "lleva", "llevar", "manda", "mandar", "envía", "enviar",
+        "mueve", "mueves", "mover", "muevo", "muévelo", "muevelo",
+        "muéveme", "mueveme", "lleva", "llevar", "llevo",
+        "manda", "mandar", "mando", "mándame", "mandame", "mándala", "mandala",
+        "envía", "enviar", "envio", "envíame", "enviame",
+        "pasa", "pasar", "paso", "pásame", "pasame", "pásala", "pasala", "pásalo", "pasalo",
+        "quiero mover", "voy a mover",
     ],
 }
 
@@ -1572,12 +1772,17 @@ def extraer_apps_de_fragmento(fragmento: str) -> list:
     return list(dict.fromkeys(encontradas))
 
 
-def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
+def abrir_aplicacion(app_name: str, escritorio: int = None) -> Resultado:
     """Abre una aplicación y opcionalmente la mueve a un escritorio."""
     nombre_tecnico = resolver_app(app_name)
 
     if not nombre_tecnico:
-        return mensaje_app_desconocida("abrir", app_name)
+        return Resultado(
+            ok=False,
+            mensaje=mensaje_app_desconocida("abrir", app_name),
+            evidencia={"app_name": app_name, "encontrada": False},
+            estado=EstadoResultado.FAILURE,
+        )
 
     comando = COMANDOS_APERTURA.get(nombre_tecnico, nombre_tecnico)
 
@@ -1599,66 +1804,180 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
                 args=(comando_hypr_movetoworkspacesilent(clase, escritorio),),
             ).start()
 
-            return (
-                f"{app_name} se está abriendo "
-                f"y será enviada al escritorio {escritorio}."
+            return Resultado(
+                ok=True,
+                mensaje=(
+                    f"{app_name} se está abriendo "
+                    f"y será enviada al escritorio {escritorio}."
+                ),
+                evidencia={
+                    "app_name": app_name,
+                    "comando": comando,
+                    "escritorio": escritorio,
+                    "despachado": True,
+                    "completado": False,
+                },
+                estado=EstadoResultado.PENDING,
             )
 
         payload = hyprland.payload_dispatch_exec(comando)
         if not hyprland.enviar_comando_socket(payload):
             subprocess.Popen(comando_hypr_exec(comando))
 
-        return f"He dado la orden de abrir {app_name}."
+        return Resultado(
+            ok=True,
+            mensaje=f"He dado la orden de abrir {app_name}.",
+            evidencia={
+                "app_name": app_name,
+                "comando": comando,
+                "despachado": True,
+                "completado": False,
+            },
+            estado=EstadoResultado.PENDING,
+        )
 
     except Exception as e:
-        return f"Error al intentar abrir {app_name}: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error al intentar abrir {app_name}: {e}",
+            evidencia={"app_name": app_name, "error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
-def mover_ventana(app_name: str, escritorio: int) -> str:
+def mover_ventana(app_name: str, escritorio: int | str) -> Resultado:
     """Mueve una ventana a un escritorio específico."""
-    nombre_tecnico = resolver_app(app_name)
+    nombre_app = (app_name or "").strip().lower()
+
+    if nombre_app in ("esta ventana", "la ventana", "ventana activa", "esta", "actual", "ventana"):
+        ventana_activa = hyprland.obtener_ventana_activa()
+        if ventana_activa and ventana_activa.get("class"):
+            clase = ventana_activa["class"]
+            nombre_tecnico = clase
+            app_name = ventana_activa.get("title") or clase
+        else:
+            clase = ""
+            nombre_tecnico = None
+    else:
+        nombre_tecnico = resolver_app(app_name)
+        clase = clase_ventana(nombre_tecnico) if nombre_tecnico else ""
 
     if not nombre_tecnico:
-        return mensaje_app_desconocida("mover", app_name)
+        return Resultado(
+            ok=False,
+            mensaje=mensaje_app_desconocida("mover", app_name),
+            evidencia={"app_name": app_name, "encontrada": False},
+            estado=EstadoResultado.FAILURE,
+        )
 
     try:
-        escritorio = int(escritorio)
-        clase = clase_ventana(nombre_tecnico)
+        esc_str = str(escritorio).strip().lower()
+        if esc_str in ("anterior", "previo", "atras", "atrás"):
+            activo = hyprland.obtener_escritorio_activo() or 1
+            escritorio = max(1, activo - 1)
+        elif esc_str in ("siguiente", "proximo", "próximo", "adelante"):
+            activo = hyprland.obtener_escritorio_activo() or 1
+            escritorio = activo + 1
+        else:
+            try:
+                escritorio = int(escritorio)
+                if escritorio < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return Resultado(
+                    ok=False,
+                    mensaje=f"No entendí a qué escritorio mover la ventana: {escritorio}.",
+                    evidencia={"escritorio": escritorio},
+                    estado=EstadoResultado.FAILURE,
+                )
 
         payload = hyprland.payload_dispatch_move(clase, escritorio)
-        if not hyprland.enviar_comando_socket(payload):
-            subprocess.run(comando_hypr_movetoworkspacesilent(clase, escritorio))
+        despachado = False
+        if hyprland.enviar_comando_socket(payload):
+            despachado = True
+        else:
+            res_sub = subprocess.run(comando_hypr_movetoworkspacesilent(clase, escritorio))
+            despachado = (res_sub.returncode == 0) if hasattr(res_sub, "returncode") else True
 
-        return f"Ventana de {app_name} movida al escritorio {escritorio}."
+        return Resultado(
+            ok=True,
+            mensaje=f"Ventana de {app_name} movida al escritorio {escritorio}.",
+            evidencia={
+                "app_name": app_name,
+                "clase": clase,
+                "escritorio": escritorio,
+                "despachado": despachado,
+            },
+            estado=EstadoResultado.SUCCESS,
+        )
 
     except Exception as e:
-        return f"Error al mover la ventana de {app_name}: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error al mover la ventana de {app_name}: {e}",
+            evidencia={"app_name": app_name, "error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
-def cambiar_escritorio(escritorio: int) -> str:
+def cambiar_escritorio(escritorio: int | str) -> Resultado:
     """Cambia la vista al escritorio indicado (sin mover ventanas)."""
-    try:
-        escritorio = int(escritorio)
-        if escritorio < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        return f"No entendí a qué escritorio cambiar: {escritorio}."
+    esc_str = str(escritorio).strip().lower()
+    if esc_str in ("anterior", "previo", "atras", "atrás"):
+        activo = hyprland.obtener_escritorio_activo() or 1
+        escritorio = max(1, activo - 1)
+    elif esc_str in ("siguiente", "proximo", "próximo", "adelante"):
+        activo = hyprland.obtener_escritorio_activo() or 1
+        escritorio = activo + 1
+    else:
+        try:
+            escritorio = int(escritorio)
+            if escritorio < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return Resultado(
+                ok=False,
+                mensaje=f"No entendí a qué escritorio cambiar: {escritorio}.",
+                evidencia={"escritorio": escritorio},
+                estado=EstadoResultado.FAILURE,
+            )
 
     try:
         payload = hyprland.payload_dispatch_workspace(escritorio)
         resp = hyprland.enviar_comando_socket(payload)
         if resp is not None and "ok" in resp.lower():
-            return f"Cambiado al escritorio {escritorio}."
+            return Resultado(
+                ok=True,
+                mensaje=f"Cambiado al escritorio {escritorio}.",
+                evidencia={"escritorio": escritorio, "verificado": True},
+                estado=EstadoResultado.SUCCESS,
+            )
 
         resultado = subprocess.run(
             comando_hypr_workspace(escritorio),
             capture_output=True, text=True, timeout=5,
         )
         if resultado.returncode != 0 or "ok" not in resultado.stdout.lower():
-            return f"Hyprland no pudo cambiar al escritorio {escritorio}."
-        return f"Cambiado al escritorio {escritorio}."
+            return Resultado(
+                ok=False,
+                mensaje=f"Hyprland no pudo cambiar al escritorio {escritorio}.",
+                evidencia={"escritorio": escritorio, "verificado": False},
+                estado=EstadoResultado.FAILURE,
+            )
+
+        return Resultado(
+            ok=True,
+            mensaje=f"Cambiado al escritorio {escritorio}.",
+            evidencia={"escritorio": escritorio, "verificado": True},
+            estado=EstadoResultado.SUCCESS,
+        )
     except Exception as e:
-        return f"Error al cambiar al escritorio {escritorio}: {e}"
+        return Resultado(
+            ok=False,
+            mensaje=f"Error al cambiar al escritorio {escritorio}: {e}",
+            evidencia={"escritorio": escritorio, "error": str(e)},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
 # ============================================================
@@ -2571,11 +2890,14 @@ def es_pedido_de_musica(texto_original: str) -> bool:
     ya no hay comando (ver charla con el usuario: se sacó adrede por
     ser demasiado complejo para el beneficio real)."""
     return bool(re.search(
-        r"\b(?:pon(?:me)?|reproduc(?:e|ir)|toca|dame|quiero escuchar)\s+"
-        r"(?:algo\s+de\s+)?m[uú]sica\b",
+        r"\b(?:"
+        r"pon(?:me)?|reproduc(?:e|ir|o)|toca|tocar|dame|"
+        r"quiero\s+escuchar|quiero\s+poner|voy\s+a\s+poner|"
+        r"(?:puedes|podr[ií]as|quieres)\s+poner"
+        r")\s+(?:algo\s+de\s+)?m[uú]sica\b",
         texto_original,
         re.IGNORECASE,
-    ))
+    )) or bool(re.search(r"\bmadeline[,\s]+con\s+algo\s+de\s+m[uú]sica\b", texto_original, re.IGNORECASE))
 
 
 # Whisper a veces escribe "cinco minutos" en vez de "5 minutos".
@@ -2647,7 +2969,7 @@ def quitar_tildes(texto: str) -> str:
 # Las frases que tiene que entender están en tests/frases_multimedia.py.
 _OBJ = (
     r"(?:(?:a\s+)?(?:la|el|esta|este|esa|ese)\s+|al\s+|a\s+)?"
-    r"(?:musica|cancion|video|reproduccion|tema|rola)"
+    r"(?:musica|cancion|video|reproduccion|tema|rola|spotify|youtube)"
 )
 _OBJ_OPC = rf"(?:\s+{_OBJ})?"
 # Relleno que puede ir al final sin cambiar la orden.
@@ -2732,8 +3054,11 @@ def extraer_ordenes_multimedia(t: str):
 
 PATRON_CAPTURA = (
     r"\b(?:screenshot|pantallazo)\b"
-    r"|\b(?:toma|tómame|tomame|saca|sácame|sacame|haz|hazme|tomar|sacar|hacer)\s+"
-    r"(?:una\s+|un\s+)?captura\b"
+    r"|\b(?:toma|tómame|tomame|saca|sácame|sacame|haz|hazme|tomar|sacar|hacer|"
+    r"manda|mándame|mandame|env[ií]a|env[ií]ame|enviame)\s+"
+    r"(?:una\s+|un\s+)?(?:captura|screenshot|pantallazo)\b"
+    r"|\bquiero\s+ver\s+(?:c[oó]mo\s+est[aá]\s+)?(?:la\s+)?pantalla\b"
+    r"|\b(?:mu[eé]strame|enseñame|enséñame)\s+(?:la\s+)?pantalla\b"
     + "|" + INICIO_ORDEN + r"captura(?:\s+(?:de\s+)?(?:la\s+)?pantalla)?" + FIN_ORDEN
 )
 
@@ -2819,7 +3144,40 @@ RESPUESTAS_CHARLA = {
     "gracias": ["De nada, Keric.", "Ay, no es nada.", "¡Cuando quieras!", "Lo sé, soy increíble."],
     "saludo": ["¡Hola, Keric! ¿Qué se te ofrece?", "¡Holi! Aquí ando.", "Dime, Keric, soy toda oídos.", "¿Ahora qué inventaste? Cuéntame."],
     "ok": ["Va.", "Aquí ando si me necesitas.", "Sale.", "Perfecto, como siempre."],
+    "aclaracion_bt_desconectar": [
+        "¿De qué dispositivo quieres que me desconecte? Tienes configurados: alexa, audífonos.",
+        "¿De cuál dispositivo me desconecto, Keric?",
+    ],
+    "aclaracion_bt_conectar": [
+        "¿A qué dispositivo quieres que me conecte? Tienes configurados: alexa, audífonos.",
+        "¿A cuál dispositivo me conecto, Keric?",
+    ],
 }
+
+
+# Preguntas explicativas o hipotéticas: NO son órdenes ejecutables.
+# Por seguridad y precisión, deben ir a Groq para que responda o explique,
+# en vez de disparar acciones erróneas en el sistema.
+PATRON_PREGUNTA_EXPLICATIVA = re.compile(
+    r"(?:"
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*[,.]?\s*)?"
+    r"(?:"
+    r"(?:c[oó]mo|como)\s+(?:se\s+(?:puede|hace|abren?|cierran?|mueven?|cambian?|reinician?|conectan?|desconectan?)|puedo\s+|hago\s+para\s+|hacer\s+para\s+|(?:puedo\s+)?(?:cambiar?|abrir?|cerrar?|mover?|reiniciar?|conectar?|desconectar?))|"
+    r"c[oó]mo\s+(?:(?:me|nos|se)\s+)?(?:cambio|abro|cierro|muevo|reinicio|conecto|desconecto)\b|"
+    r"por\s+qu[eé]\b|"
+    r"para\s+qu[eé]\b|"
+    r"qu[eé]\s+(?:pasa|ocurre|sucede)\s+si\b|"
+    r"si\s+.*(?:qu[eé]\s+(?:pasa|ocurre|sucede)|entonces|\?)|"
+    r"(?:expl[ií]ca(?:me)?|ens[eé]ña(?:me)?|dime)\s+c[oó]mo\s+(?!est[aá]\s+(?:el\s+)?(?:clima|tiempo))\b"
+    r")"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def es_pregunta_explicativa_o_hipotetica(texto: str) -> bool:
+    """True si la frase es una pregunta conceptual, hipotética o de explicación."""
+    return bool(PATRON_PREGUNTA_EXPLICATIVA.search(texto.strip()))
 
 
 # Memoria a largo plazo: se resuelve en local (0 tokens de Groq).
@@ -2949,6 +3307,14 @@ def router_local(texto: str):
         # Si no fue ni sí ni no, seguimos procesando el mensaje como
         # un comando nuevo y normal (no lo perdemos).
 
+    # ------------------------------------------------------------
+    # FILTRO DE PREGUNTAS EXPLICATIVAS O HIPOTÉTICAS
+    # ------------------------------------------------------------
+    # Si el usuario pregunta "¿cómo cambio al escritorio 3?", "¿cómo se abre Steam?"
+    # o plantea un escenario hipotético, NO es una orden de ejecución: debe ir a Groq.
+    if es_pregunta_explicativa_o_hipotetica(texto):
+        return []
+
     charla = tipo_charla(t_crudo)
     if charla:
         return [("charla", {"tipo": charla})]
@@ -3045,49 +3411,72 @@ def router_local(texto: str):
         comandos.append(("cerrar_todo", {}))
 
     if re.search(
-        r"\b(prende|enciende|activa|habilita)\s+(?:el\s+)?bluetooth\b",
+        r"\b(?:prende|enciende|activa|habilita|conecta(?:r)?)\s+(?:el\s+)?bluetooth\b",
         t
     ):
         comandos.append(("bluetooth", {"accion": "encender"}))
 
     if re.search(
-        r"\b(apaga|apágame|apagame|desactiva|deshabilita)\s+(?:el\s+)?bluetooth\b",
+        r"\b(?:apaga|ap[aá]game|apagame|desactiva|deshabilita|desconecta(?:r)?)\s+(?:el\s+)?bluetooth\b",
         t
     ):
         comandos.append(("bluetooth", {"accion": "apagar"}))
 
     if DISPOSITIVOS_BLUETOOTH:
-        articulo_bt = r"(?:el|la|los|las)?\s*"
+        prep_art_conectar = r"(?:(?:a|con)?\s*(?:el|la|los|las|mi|mis|al)?\s*)"
+        prep_art_desconectar = r"(?:(?:de|a)?\s*(?:el|la|los|las|mi|mis|del|al)?\s*)"
+
         dispositivos_bt = "|".join(
             re.escape(x.lower()) for x in DISPOSITIVOS_BLUETOOTH.keys()
         )
 
-        match = re.search(
-            rf"\b(?:conecta(?:te)?|conécta(?:te)?|conectar|vincula(?:te)?|vincúla(?:te)?)\s+"
-            rf"{articulo_bt}(?:a\s+)?{articulo_bt}({dispositivos_bt})\b",
-            t
+        verbos_bt_conectar = (
+            r"(?:con[eé]cta(?:r|te|me|se)?|conecto|"
+            r"vincul[aá](?:r|te|me|se)?|vinculo|"
+            r"emparej[aá](?:r|te|me|se)?|emparejo)"
+        )
+        verbos_bt_desconectar = (
+            r"(?:descon[eé]cta(?:r|te|me|se)?|desconecto|"
+            r"desvincul[aá](?:r|te|me|se)?|desvinculo)"
         )
 
+        match = re.search(
+            rf"\b{verbos_bt_conectar}\s+{prep_art_conectar}({dispositivos_bt})\b",
+            t,
+            flags=re.IGNORECASE,
+        )
         if match:
             comandos.append(("conectar_bluetooth", {
-                "dispositivo": match.group(1)
+                "dispositivo": match.group(1).lower()
             }))
 
         match = re.search(
-            rf"\b(?:desconecta(?:te)?|desconécta(?:te)?|desconectar)\s+"
-            rf"{articulo_bt}(?:de\s+)?{articulo_bt}({dispositivos_bt})\b",
-            t
+            rf"\b{verbos_bt_desconectar}\s+{prep_art_desconectar}({dispositivos_bt})\b",
+            t,
+            flags=re.IGNORECASE,
         )
-
         if match:
             comandos.append(("desconectar_bluetooth", {
-                "dispositivo": match.group(1)
+                "dispositivo": match.group(1).lower()
             }))
+
+        # Si el usuario dijo "desconéctate" o "conéctate" solo, sin indicar dispositivo
+        # ni "bluetooth", pedir aclaración en vez de elegir arbitrariamente.
+        _relleno_bt = r"(?:\s+(?:por\s+favor|porfa|ahora|ya|please))*"
+        if not comandos:
+            if re.search(rf"^{INICIO_ORDEN}{verbos_bt_desconectar}{_relleno_bt}[.,;!?\s]*$", t, flags=re.IGNORECASE):
+                return [("charla", {"tipo": "aclaracion_bt_desconectar"})]
+            if re.search(rf"^{INICIO_ORDEN}{verbos_bt_conectar}{_relleno_bt}[.,;!?\s]*$", t, flags=re.IGNORECASE):
+                return [("charla", {"tipo": "aclaracion_bt_conectar"})]
 
     # Reiniciar el PROCESO de Madeline (para aplicar cambios de código)
     # es distinto de reiniciar la PC — no necesita confirmación,
     # porque no interrumpe nada más que a la propia Madeline un momento.
-    if re.search(r"\breinicia(?:te)?\s+(?:el\s+)?(?:servidor|madel\w*)\b", t):
+    if re.search(
+        r"\b(?:reinicia(?:r|te)?|reinicio|reinicie|quiero\s+reiniciar|voy\s+a\s+reiniciar)\s+(?:el\s+)?(?:servidor|madel\w*)\b",
+        t,
+        flags=re.IGNORECASE,
+    ):
         return [("reiniciar_servidor", {})]
 
     palabras_pc = r"(?:la\s+|el\s+)?(?:pc|computadora|computador|equipo|sistema)"
@@ -3168,21 +3557,52 @@ def router_local(texto: str):
 
             comandos.append(("abrir_aplicacion", argumentos))
 
+    patron_mover_activa = (
+        rf"\b(?:{patron_verbos('mover')})\s+"
+        r"(?:esta\s+ventana|la\s+ventana|esta|la\s+ventana\s+activa)\s+"
+        rf"(?:al|a)\s+{ARTICULO}{DESTINO}(\d+|anterior|previo|atr[aá]s|atras|siguiente|pr[oó]ximo|proximo|adelante)\b"
+    )
+
+    for match in re.finditer(patron_mover_activa, t, flags=re.IGNORECASE):
+        destino_val = match.group(1).lower()
+        escritorio = int(destino_val) if destino_val.isdigit() else destino_val
+        comandos.append(("mover_ventana", {
+            "app_name": "esta ventana",
+            "escritorio": escritorio,
+        }))
+
     patron_mover = (
         rf"\b(?:{patron_verbos('mover')})\s+"
         rf"{ARTICULO}(?:{APPS_REGEX})"
         rf"(?:{SEPARADOR_LISTA}{ARTICULO}(?:{APPS_REGEX}))*\s+"
-        rf"(?:al|a)\s+{ARTICULO}{DESTINO}(\d+)\b"
+        rf"(?:al|a)\s+{ARTICULO}{DESTINO}(\d+|anterior|previo|atr[aá]s|atras|siguiente|pr[oó]ximo|proximo|adelante)\b"
     )
 
-    for match in re.finditer(patron_mover, t):
-        escritorio = int(match.group(1))
+    for match in re.finditer(patron_mover, t, flags=re.IGNORECASE):
+        destino_val = match.group(1).lower()
+        escritorio = int(destino_val) if destino_val.isdigit() else destino_val
 
         for app_name in extraer_apps_de_fragmento(match.group(0)):
             comandos.append(("mover_ventana", {
                 "app_name": app_name,
                 "escritorio": escritorio,
             }))
+
+    patron_cambiar_esc = (
+        INICIO_ORDEN
+        + r"(?:"
+        r"(?:c[aá]mbia(?:r|te|me)?|c[aá]mbio|mu[eé]strame|muestrame|mu[eé]vete|muevete|p[aá]sa(?:r|te|me)?|p[aá]so|ve(?:te)?|ir|vamos)\s+"
+        r"(?:al|a\s+el|a|el)\s+(?:escritorio|workspace)\s*(?:n[uú]mero|num\.?)?\s*"
+        r"(?P<esc1>\d+|anterior|previo|atr[aá]s|atras|siguiente|pr[oó]ximo|proximo|adelante)|"
+        r"(?:ve(?:te)?|ir)\s+(?:al|a)\s+(?:escritorio|workspace)\s*"
+        r"(?P<esc2>\d+|anterior|previo|atr[aá]s|atras|siguiente|pr[oó]ximo|proximo|adelante)"
+        r")\b"
+    )
+
+    for match in re.finditer(patron_cambiar_esc, t, flags=re.IGNORECASE):
+        destino_val = (match.group("esc1") or match.group("esc2")).lower()
+        escritorio = int(destino_val) if destino_val.isdigit() else destino_val
+        comandos.append(("cambiar_escritorio", {"escritorio": escritorio}))
 
     return comandos
 
@@ -3367,9 +3787,15 @@ NUCLEOS = {
     ],
     ("mover_ventana", None): [
         "Mandé {app_name} al escritorio {escritorio}",
-        "{app_name} ya está en el escritorio {escritorio}",
+        "Ya está en el escritorio {escritorio}",
         "Moví {app_name} al escritorio {escritorio}",
-        "{app_name} se mudó al escritorio {escritorio}",
+        "Ventana movida al escritorio {escritorio}",
+    ],
+    ("cambiar_escritorio", None): [
+        "Cambiado al escritorio {escritorio}",
+        "Pasando al escritorio {escritorio}",
+        "Listo, escritorio {escritorio}",
+        "Ahí tienes el escritorio {escritorio}",
     ],
     ("recordatorio", None): [
         "Te aviso en {cantidad} {unidad}: {mensaje}",
@@ -3393,7 +3819,7 @@ def elegir_variada(opciones: list) -> str:
     return elegida
 
 
-PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama")
+PREFIJOS_ERROR = ("Error", "Pucha", "Falló", "No pude", "Hubo un drama", "Cancelado")
 
 # Respuestas que ya son una frase completa (una pregunta, un aviso, un
 # saludo): envolverlas con "Claro, Keric. ¿Quieres...?" suena raro.
@@ -3405,15 +3831,16 @@ RESPUESTAS_COMPLETAS = (
 )
 
 
-def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
+def nucleo_local(nombre: str, args: dict, resultado) -> str:
     """Devuelve solo el 'núcleo' de la respuesta."""
-    if resultado.startswith(PREFIJOS_ERROR):
-        return resultado
+    res_norm = normalizar_resultado(resultado, nombre)
+    if not res_norm.ok or res_norm.mensaje.startswith(PREFIJOS_ERROR):
+        return res_norm.mensaje
 
     # "Ponle play" sin reproductor abre la radio: se dice eso, no
     # "le doy play de nuevo".
-    if nombre == "multimedia" and resultado.startswith("Abriendo tu radio"):
-        return resultado
+    if nombre == "multimedia" and res_norm.mensaje.startswith("Abriendo tu radio"):
+        return res_norm.mensaje
 
     if nombre in ("multimedia", "volumen", "bluetooth"):
         detalle = args.get("accion")
@@ -3424,7 +3851,7 @@ def nucleo_local(nombre: str, args: dict, resultado: str) -> str:
     variantes = NUCLEOS.get((nombre, detalle))
 
     if not variantes:
-        return resultado
+        return res_norm.mensaje
 
     return elegir_variada(variantes).format(**args)
 
@@ -3440,16 +3867,17 @@ NOMBRE_LOCAL_DE_TOOL = {
 }
 
 
-def respuesta_local(nombre: str, args: dict, resultado: str) -> str:
+def respuesta_local(nombre: str, args: dict, resultado) -> str:
     """Genera una respuesta carismática sin gastar tokens de Groq."""
-    nombre = NOMBRE_LOCAL_DE_TOOL.get(nombre, nombre)
-    if resultado.startswith(PREFIJOS_ERROR) or nombre in RESPUESTAS_COMPLETAS:
-        return resultado
+    nombre_local = NOMBRE_LOCAL_DE_TOOL.get(nombre, nombre)
+    res_norm = normalizar_resultado(resultado, nombre_local)
+    if not res_norm.ok or res_norm.mensaje.startswith(PREFIJOS_ERROR) or nombre_local in RESPUESTAS_COMPLETAS:
+        return res_norm.mensaje
 
-    if nombre == "estado_sistema":
-        return f"Estos son los parámetros actuales. {resultado}"
+    if nombre_local == "estado_sistema":
+        return f"Estos son los parámetros actuales. {res_norm.mensaje}"
 
-    nucleo = nucleo_local(nombre, args, resultado).rstrip(". ")
+    nucleo = nucleo_local(nombre_local, args, res_norm).rstrip(". ")
     return f"{elegir_variada(MULETILLAS)} {nucleo}."
 
 
@@ -3459,34 +3887,48 @@ def ejecutar_comandos_locales(comandos):
 
     for nombre, args in comandos:
         resultado = ejecutar_comando_local(nombre, args)
-        resultados.append((nombre, args, resultado))
+        res_norm = normalizar_resultado(resultado, nombre)
+        resultados.append((nombre, args, res_norm))
 
         if nombre == "info_cancion":
-            texto = resultado
+            texto = res_norm.mensaje
             if texto.startswith("Actualmente está sonando:"):
                 memoria_contexto["cancion"] = texto.replace(
                     "Actualmente está sonando:", ""
                 ).strip()
 
-        memoria_contexto["ultimo_resultado"] = resultado
+        memoria_contexto["ultimo_resultado"] = res_norm
 
     return resultados
 
 
 def resumir_resultados_locales(resultados):
     """Construye una sola respuesta para varias órdenes."""
-    frases = []
+    if not resultados:
+        return "Entendido."
 
-    for nombre, args, resultado in resultados:
+    resultados_norm = [
+        (nombre, args, normalizar_resultado(res, nombre))
+        for nombre, args, res in resultados
+    ]
+
+    for nombre, args, res in resultados_norm:
         if nombre in RESPUESTAS_COMPLETAS:
-            return resultado
+            return res.mensaje
 
+    # Si hubo algún fallo en las operaciones, NUNCA inyectar muletilla festiva/alegre
+    hay_fallo = any(not res.ok or res.mensaje.startswith(PREFIJOS_ERROR) for _, _, res in resultados_norm)
+
+    frases = []
+    for nombre, args, res in resultados_norm:
         # Sin el punto final: se agrega uno solo al armar la frase
         # (antes quedaba "...grados.." en el texto).
-        frases.append(nucleo_local(nombre, args, resultado).rstrip(". "))
+        frases.append(nucleo_local(nombre, args, res).rstrip(". "))
 
-    if not frases:
-        return "Entendido."
+    if hay_fallo:
+        if len(frases) == 1:
+            return f"{frases[0]}."
+        return "; ".join(frases) + "."
 
     muletilla = elegir_variada(MULETILLAS)
 
@@ -3621,6 +4063,14 @@ def registrar_frase_sin_tema(texto: str):
 
 def tools_necesarias(texto: str):
     """Envía a Groq solo los schemas de los temas que aparecen en el texto."""
+    if es_pregunta_explicativa_o_hipotetica(texto):
+        # Para preguntas explicativas o hipotéticas ("¿Cómo cambio al escritorio 3?",
+        # "¿Cómo abro Steam?", "Si cierro Discord, ¿qué pasa?"), NUNCA se envían
+        # herramientas de modificación o acción del sistema a Groq.
+        # Solo se permite buscar_en_web para responder dudas conceptuales y evitar el
+        # bug 400 de openai/gpt-oss-120b cuando no tiene herramientas.
+        return [t for t in tools if t["function"]["name"] == "buscar_en_web"]
+
     nombres = set()
     temas = temas_del_mensaje(texto)
     for tema in temas:
@@ -3759,6 +4209,9 @@ def ejecutar_comando_local(nombre: str, args: dict):
 
     if nombre == "mover_ventana":
         return mover_ventana(**args)
+
+    if nombre == "cambiar_escritorio":
+        return cambiar_escritorio(**args)
 
     if nombre == "mostrar_avatar":
         return mostrar_avatar(**args)
@@ -3958,6 +4411,45 @@ async def procesar_mensaje(
     return respuesta
 
 
+PATRON_INTENCION_ACCION = re.compile(
+    r"\b(?:"
+    r"abro|abre|abrir|ejecuta|ejecutar|lanza|lanzar|"
+    r"cierra|cerrar|cerra|mata|matar|termina|terminar|"
+    r"reinicia|reiniciar|reinicio|reinicie|"
+    r"cambia\s+al|cambiar\s+al|mu[eé]vete\s+al|mu[eé]strame\s+el\s+escritorio|"
+    r"mueve\s+(?:la\s+)?ventana|mover\s+(?:la\s+)?ventana|"
+    r"con[eé]ctate|conecta|descon[eé]ctate|desconecta|"
+    r"apaga|apagar|suspende|suspender|"
+    r"toma\s+(?:una\s+)?captura|saca\s+(?:una\s+)?captura|m[aá]ndame\s+(?:una\s+)?captura|manda\s+(?:una\s+)?captura"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PATRON_AFIRMA_ACCION = re.compile(
+    r"\b(?:"
+    r"ya\s+(?:est[aá]|qued[oó]|he)\s+(?:abiert[oa]|cerrad[oa]|reiniciad[oa]|cambiad[oa]|movid[oa])|"
+    r"est[aá]\s+(?:abiert[oa]|cerrad[oa]|reiniciad[oa]|list[oa])\s+y\s+list[oa]|"
+    r"he\s+(?:abierto|cerrado|reiniciado|cambiado|movido)|"
+    r"cambiando\s+a\s+tu\s+escritorio|cambiado\s+al\s+escritorio|"
+    r"ventana\s+movida|aplicaci[oó]n\s+cerrada|proceso\s+terminado|"
+    r"(?:¡?list[oa][!,.]?\s+.*(?:est[aá]\s+abiert|ya\s+reinici|ya\s+se\s+cerr|he\s+abiert))"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def es_intencion_de_accion(texto: str) -> bool:
+    """True si el mensaje del usuario pide una acción directa del sistema."""
+    t = quitar_tildes(texto.lower().strip()) if "quitar_tildes" in globals() else texto.lower().strip()
+    return bool(PATRON_INTENCION_ACCION.search(texto) or PATRON_INTENCION_ACCION.search(t))
+
+
+def afirma_ejecucion_accion(texto: str) -> bool:
+    """True si el texto afirma haber ejecutado una acción del sistema."""
+    t = quitar_tildes(texto.lower().strip()) if "quitar_tildes" in globals() else texto.lower().strip()
+    return bool(PATRON_AFIRMA_ACCION.search(texto) or PATRON_AFIRMA_ACCION.search(t))
+
+
 async def _procesar_mensaje(
     request: ChatRequest,
     origen: str,
@@ -4136,13 +4628,22 @@ async def _procesar_mensaje(
                 else:
                     resultado = "No pude entender la acción de energía."
             elif fn_name in TOOLS_FUNCIONES:
-                extra = {"mensaje": mensaje_usuario} if fn_name in TOOLS_CON_MENSAJE else {}
-                try:
-                    resultado = TOOLS_FUNCIONES[fn_name](**fn_args, **extra)
-                except TypeError as e:
-                    # Groq a veces inventa un argumento que la función
-                    # no acepta: mejor un error hablado que un 500.
-                    resultado = f"Error: argumentos inválidos para {fn_name}: {e}"
+                if es_pregunta_explicativa_o_hipotetica(mensaje_usuario) and fn_name != "buscar_en_web":
+                    print(f"[!] Tool call '{fn_name}' bloqueada: la consulta es explicativa/hipotética.")
+                    resultado = Resultado(
+                        ok=False,
+                        mensaje="No se ejecutó ninguna acción porque tu consulta es una pregunta conceptual o explicativa.",
+                        evidencia={"bloqueada": True, "fn_name": fn_name},
+                        estado=EstadoResultado.FAILURE,
+                    )
+                else:
+                    extra = {"mensaje": mensaje_usuario} if fn_name in TOOLS_CON_MENSAJE else {}
+                    try:
+                        resultado = TOOLS_FUNCIONES[fn_name](**fn_args, **extra)
+                    except TypeError as e:
+                        # Groq a veces inventa un argumento que la función
+                        # no acepta: mejor un error hablado que un 500.
+                        resultado = f"Error: argumentos inválidos para {fn_name}: {e}"
             else:
                 resultado = "Error: Herramienta no encontrada."
 
@@ -4151,14 +4652,16 @@ async def _procesar_mensaje(
                     "Actualmente está sonando:", ""
                 ).strip()
 
-            if fn_name == "tomar_captura" and resultado.startswith("CAPTURA_LISTA"):
-                captura_id_groq = resultado.split(":", 1)[1]
-                if ruta_captura_disponible(captura_id_groq):
+            if fn_name == "tomar_captura":
+                captura_id_groq = getattr(resultado, "evidencia", {}).get("captura_id") or (
+                    str(resultado).split(":", 1)[1] if str(resultado).startswith("CAPTURA_LISTA") else None
+                )
+                if captura_id_groq and ruta_captura_disponible(captura_id_groq):
                     image_path_response = f"/captura/{captura_id_groq}"
                     if origen == "pc":
                         enviar_captura_al_telefono(captura_id_groq)
 
-            if fn_name == "buscar_en_web" and not resultado.startswith(PREFIJOS_ERROR):
+            if fn_name == "buscar_en_web" and not str(resultado).startswith(PREFIJOS_ERROR):
                 # Antes los snippets se leían en bruto ("Resultados web
                 # para X: 1. ... 2. ..."). Ahora una segunda llamada,
                 # mínima, los convierte en una respuesta de verdad.
@@ -4168,15 +4671,22 @@ async def _procesar_mensaje(
             resultados_tool.append((fn_name, fn_args, resultado))
             memoria_contexto["ultimo_resultado"] = str(resultado)
 
-        texto_final = " ".join(
-            respuesta_local(nombre, args, resultado)
-            for nombre, args, resultado in resultados_tool
-            if not resultado.startswith("CAPTURA_LISTA")
-        )
+        partes_texto = []
+        for nombre, args, res in resultados_tool:
+            res_norm = normalizar_resultado(res, nombre)
+            if nombre in ("tomar_captura", "captura"):
+                if res_norm.ok:
+                    partes_texto.append(respuesta_local("captura", args, res_norm))
+                else:
+                    partes_texto.append(res_norm.mensaje)
+            else:
+                partes_texto.append(respuesta_local(nombre, args, res_norm))
+
+        texto_final = " ".join(t for t in partes_texto if t.strip())
         texto_final = limpiar_texto_para_voz(texto_final)
 
         if not texto_final:
-            texto_final = "Listo, hecho."
+            texto_final = "Operación realizada."
 
         # Mismo mecanismo que en la rama del router local: si Groq
         # decidió llamar a analizar_pantalla por su cuenta (frase
@@ -4200,6 +4710,12 @@ async def _procesar_mensaje(
 
         if finish_reason == "length":
             texto_final = recortar_a_oracion_completa(texto_final)
+
+        # Protección contra confirmaciones falsas:
+        # Si el usuario solicitó una acción en el sistema y Groq no ejecutó herramientas,
+        # pero afirma haberla completado, interceptamos la respuesta alucinada.
+        if es_intencion_de_accion(mensaje_usuario) and afirma_ejecucion_accion(texto_final):
+            texto_final = "No pude realizar esa acción porque no se ejecutó ninguna herramienta en el sistema."
 
     # 6. MEMORIA
     historial_chat.append({"role": "assistant", "content": texto_final})

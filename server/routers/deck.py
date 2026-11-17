@@ -79,9 +79,9 @@ def deck_accion_endpoint(accion: AccionDeck):
         raise HTTPException(status_code=400, detail="Faltan argumentos para ese botón.")
 
     image_path = None
-    if resultado.startswith("CAPTURA_LISTA"):
-        captura_id = resultado.split(":", 1)[1]
+    if str(resultado).startswith("CAPTURA_LISTA"):
+        captura_id = getattr(resultado, "evidencia", {}).get("captura_id") or str(resultado).split(":", 1)[1]
         if server.ruta_captura_disponible(captura_id):
             image_path = f"/captura/{captura_id}"
         resultado = "Captura lista."
-    return {"response": resultado, "image_path": image_path}
+    return {"response": str(resultado), "image_path": image_path}
