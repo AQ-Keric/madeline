@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'conexion.dart';
 import 'tema.dart';
+import 'widgets/vista_teclado_deck.dart';
 
 /// Botones como un Stream Deck: cada tecla ejecuta una acción directa
 /// en el PC (sin pasar por Groq). Las carpetas se abren en el mismo
@@ -21,7 +22,7 @@ class PantallaDeck extends StatefulWidget {
   State<PantallaDeck> createState() => _PantallaDeckState();
 }
 
-enum Carpeta { inicio, apps, multimedia, escritorios, sistema, bluetooth }
+enum Carpeta { inicio, apps, multimedia, escritorios, sistema, bluetooth, teclado }
 
 /// Una tecla del deck.
 class Tecla {
@@ -187,6 +188,7 @@ class _PantallaDeckState extends State<PantallaDeck> {
     (Carpeta.escritorios, 'Escritorios', Icons.space_dashboard_rounded, Colores.dash),
     (Carpeta.sistema, 'Sistema', Icons.memory_rounded, Colores.aviso),
     (Carpeta.bluetooth, 'Bluetooth', Icons.bluetooth_rounded, Color(0xFF8B7BFF)),
+    (Carpeta.teclado, 'Teclado RGB', Icons.keyboard_rounded, Color(0xFF00E5FF)),
   ];
 
   List<Tecla> _teclasMultimedia() {
@@ -273,6 +275,7 @@ class _PantallaDeckState extends State<PantallaDeck> {
         Carpeta.escritorios => 'Escritorios',
         Carpeta.sistema => 'Sistema',
         Carpeta.bluetooth => 'Bluetooth',
+        Carpeta.teclado => 'Teclado RGB',
       };
 
   Widget _tablero(List<Widget> teclas, {int columnas = 3}) {
@@ -383,6 +386,11 @@ class _PantallaDeckState extends State<PantallaDeck> {
             ),
           ],
         );
+      case Carpeta.teclado:
+        return VistaTecladoDeck(
+          conexion: _conexion,
+          alVolver: () => _abrir(Carpeta.inicio),
+        );
     }
   }
 
@@ -397,17 +405,18 @@ class _PantallaDeckState extends State<PantallaDeck> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
-            child: Row(
-              children: [
-                Text(_titulo, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                const Spacer(),
-                if (_carpeta == Carpeta.apps)
-                  const Text('Mantén presionada para más', style: TextStyle(color: Colores.textoSuave, fontSize: 12)),
-              ],
+          if (_carpeta != Carpeta.teclado)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+              child: Row(
+                children: [
+                  Text(_titulo, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                  const Spacer(),
+                  if (_carpeta == Carpeta.apps)
+                    const Text('Mantén presionada para más', style: TextStyle(color: Colores.textoSuave, fontSize: 12)),
+                ],
+              ),
             ),
-          ),
           Expanded(
             child: AnimatedSwitcher(
               duration: const Duration(milliseconds: 180),

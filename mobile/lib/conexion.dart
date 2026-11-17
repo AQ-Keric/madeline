@@ -192,12 +192,77 @@ class Conexion {
       .timeout(const Duration(seconds: 30)));
 
   // ------------------------------------------------------------
+  // Teclado RGB (Pegasum KAI 65% y perfiles)
+  // ------------------------------------------------------------
+
+  Future<Map<String, dynamic>?> deckTecladoEstado() => _getJson('/deck/teclado/estado');
+
+  Future<List<Map<String, dynamic>>?> deckTecladoTemas() async {
+    final datos = await _getJson('/deck/teclado/temas');
+    return (datos?['temas'] as List?)?.cast<Map<String, dynamic>>();
+  }
+
+  Future<bool> deckTecladoAplicar(String tema, {int? brillo, String? modelo}) async {
+    try {
+      final r = await _conReintento(() => http
+          .post(
+            Uri.parse('$base/deck/teclado/aplicar'),
+            headers: {'Content-Type': 'application/json', ...cabeceras},
+            body: jsonEncode({
+              'tema': tema,
+              if (brillo != null) 'brillo': brillo,
+              if (modelo != null) 'modelo': modelo,
+            }),
+          )
+          .timeout(const Duration(seconds: 10)));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> deckTecladoGuardarFavoritos(List<String> favoritos) async {
+    try {
+      final r = await _conReintento(() => http
+          .post(
+            Uri.parse('$base/deck/teclado/favoritos'),
+            headers: {'Content-Type': 'application/json', ...cabeceras},
+            body: jsonEncode({'favoritos': favoritos}),
+          )
+          .timeout(const Duration(seconds: 8)));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> deckTecladoCambiarModelo(String modelo) async {
+    try {
+      final r = await _conReintento(() => http
+          .post(
+            Uri.parse('$base/deck/teclado/modelo'),
+            headers: {'Content-Type': 'application/json', ...cabeceras},
+            body: jsonEncode({'modelo': modelo}),
+          )
+          .timeout(const Duration(seconds: 8)));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------
   // Recados y agenda (lo mismo que el panel de la barra del PC)
   // ------------------------------------------------------------
 
   Future<List<Map<String, dynamic>>?> recados() async {
     final datos = await _getJson('/recados');
-    return (datos?['recados'] as List?)?.cast<Map<String, dynamic>>();
+    final rec = datos?['recados'];
+    if (rec is List) return rec.cast<Map<String, dynamic>>();
+    if (rec is Map) {
+      return rec.values.whereType<Map<String, dynamic>>().toList();
+    }
+    return [];
   }
 
   Future<bool> agregarRecado(String texto) async {

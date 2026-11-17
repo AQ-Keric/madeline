@@ -1,3 +1,7 @@
+import sys
+if __name__ == "__main__":
+    sys.modules["madeline_server"] = sys.modules["__main__"]
+
 import asyncio
 import difflib
 import os
@@ -38,6 +42,8 @@ import memoria  # noqa: E402
 import deck  # noqa: E402
 import agenda  # noqa: E402
 import recados  # noqa: E402
+import teclado_control  # noqa: E402
+from services import hyprland  # noqa: E402
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -1064,6 +1070,38 @@ def buscar_urls_arxiv(consulta: str, cantidad: int = 3) -> list:
         return []
 
 
+# ============================================================
+# COMPATIBILIDAD CON HYPRLAND (Lua 0.57+ y versiones anteriores)
+# ============================================================
+
+_detectar_hyprland_lua = hyprland._detectar_hyprland_lua
+_USA_HYPRLAND_LUA = hyprland._USA_HYPRLAND_LUA
+
+
+def usa_hyprland_lua() -> bool:
+    """True si la versión instalada de Hyprland es >= 0.57 (requiere Lua en dispatch)."""
+    return hyprland.usa_hyprland_lua()
+
+
+def comando_hypr_exec(comando: str) -> list[str]:
+    if usa_hyprland_lua():
+        return ["hyprctl", "dispatch", f"hl.dsp.exec_cmd({json.dumps(comando)})"]
+    return ["hyprctl", "dispatch", "exec", comando]
+
+
+def comando_hypr_workspace(escritorio: int | str) -> list[str]:
+    if usa_hyprland_lua():
+        return ["hyprctl", "dispatch", f"hl.dsp.focus({{ workspace = '{escritorio}' }})"]
+    return ["hyprctl", "dispatch", "workspace", str(escritorio)]
+
+
+def comando_hypr_movetoworkspacesilent(clase: str, escritorio: int | str) -> list[str]:
+    if usa_hyprland_lua():
+        selector = f"class:.*{clase}.*"
+        return ["hyprctl", "dispatch", f"hl.dsp.window.move({{ window = '{selector}', workspace = {escritorio}, follow = false }})"]
+    return ["hyprctl", "dispatch", "movetoworkspacesilent", f"{escritorio},class:.*{clase}.*"]
+
+
 def abrir_url_en_navegador(url: str) -> bool:
     """Abre UNA URL como pestaña nueva en la ventana ya abierta del
     navegador ("-new-tab", no una ventana aparte).
@@ -1077,10 +1115,10 @@ def abrir_url_en_navegador(url: str) -> bool:
         return False
 
     nombre_tecnico = DICCIONARIO_APPS.get("navegador", "zen-browser")
-    subprocess.Popen([
-        "hyprctl", "dispatch", "exec",
-        f"{nombre_tecnico} -new-tab {shlex.quote(url)}",
-    ])
+    comando = f"{nombre_tecnico} -new-tab {shlex.quote(url)}"
+    payload = hyprland.payload_dispatch_exec(comando)
+    if not hyprland.enviar_comando_socket(payload):
+        subprocess.Popen(comando_hypr_exec(comando))
     return True
 
 
@@ -1548,9 +1586,9 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
             escritorio = int(escritorio)
             clase = clase_ventana(nombre_tecnico)
 
-            subprocess.Popen(
-                ["hyprctl", "dispatch", "exec", comando]
-            )
+            payload = hyprland.payload_dispatch_exec(comando)
+            if not hyprland.enviar_comando_socket(payload):
+                subprocess.Popen(comando_hypr_exec(comando))
 
             # Antes era un "exec && sleep 2 && move" con shell=True.
             # Mismo efecto, pero sin shell: el movimiento se agenda en
@@ -1558,10 +1596,7 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
             threading.Timer(
                 2,
                 subprocess.run,
-                args=([
-                    "hyprctl", "dispatch", "movetoworkspacesilent",
-                    f"{escritorio},class:.*{clase}.*",
-                ],),
+                args=(comando_hypr_movetoworkspacesilent(clase, escritorio),),
             ).start()
 
             return (
@@ -1569,9 +1604,9 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> str:
                 f"y será enviada al escritorio {escritorio}."
             )
 
-        subprocess.Popen(
-            ["hyprctl", "dispatch", "exec", comando]
-        )
+        payload = hyprland.payload_dispatch_exec(comando)
+        if not hyprland.enviar_comando_socket(payload):
+            subprocess.Popen(comando_hypr_exec(comando))
 
         return f"He dado la orden de abrir {app_name}."
 
@@ -1590,18 +1625,9 @@ def mover_ventana(app_name: str, escritorio: int) -> str:
         escritorio = int(escritorio)
         clase = clase_ventana(nombre_tecnico)
 
-        argumento_hyprland = (
-            f"{escritorio},class:.*{clase}.*"
-        )
-
-        subprocess.run(
-            [
-                "hyprctl",
-                "dispatch",
-                "movetoworkspacesilent",
-                argumento_hyprland,
-            ]
-        )
+        payload = hyprland.payload_dispatch_move(clase, escritorio)
+        if not hyprland.enviar_comando_socket(payload):
+            subprocess.run(comando_hypr_movetoworkspacesilent(clase, escritorio))
 
         return f"Ventana de {app_name} movida al escritorio {escritorio}."
 
@@ -1619,8 +1645,13 @@ def cambiar_escritorio(escritorio: int) -> str:
         return f"No entendí a qué escritorio cambiar: {escritorio}."
 
     try:
+        payload = hyprland.payload_dispatch_workspace(escritorio)
+        resp = hyprland.enviar_comando_socket(payload)
+        if resp is not None and "ok" in resp.lower():
+            return f"Cambiado al escritorio {escritorio}."
+
         resultado = subprocess.run(
-            ["hyprctl", "dispatch", "workspace", str(escritorio)],
+            comando_hypr_workspace(escritorio),
             capture_output=True, text=True, timeout=5,
         )
         if resultado.returncode != 0 or "ok" not in resultado.stdout.lower():
@@ -2781,6 +2812,7 @@ PATRON_CHARLA = re.compile(
     r"(?P<tipo>(?:muchas\s+)?gracias|hola|buenas|buenos d[ií]as|buenas tardes|"
     r"buenas noches|ok|okay|vale|listo|perfecto|genial|excelente)"
     r"(?:\s*,?\s*madel\w*)?[\s.!¡¿?]*$"
+    r"|^(?:oye\s+)?(?P<llamada>madel\w*)[\s.!¡¿?]*$"
 )
 
 RESPUESTAS_CHARLA = {
@@ -2869,7 +2901,9 @@ def tipo_charla(t: str):
     match = PATRON_CHARLA.match(t.strip())
     if not match:
         return None
-    palabra = match.group("tipo")
+    if match.group("llamada"):
+        return "saludo"
+    palabra = match.group("tipo") or ""
     if "gracias" in palabra:
         return "gracias"
     if palabra.startswith(("hola", "buen")):
@@ -2936,6 +2970,20 @@ def router_local(texto: str):
 
     if es_pedido_de_musica(texto):
         return [("radio_musica", {})]
+
+    if re.search(
+        r"\b(?:mu[eé]strate|sal a pasear|sal a la pantalla|sal a dar una vuelta)\b"
+        r"|^(?:madeline[,\s]+)?(?:sal|salt|salte|mu[eé]strate|aparece|as[oó]mate)[\s.!¡¿?]*$",
+        t_crudo,
+    ):
+        return [("mostrar_avatar", {"accion": "mostrar"})]
+
+    if re.search(
+        r"\b(?:esc[oó]ndete|escondete|oc[uú]ltate|ocultate|vete a tu rinc[oó]n|gu[aá]rdate|guardate)\b"
+        r"|^(?:madeline[,\s]+)?(?:esc[oó]ndete|escondete|oc[uú]ltate|ocultate)[\s.!¡¿?]*$",
+        t_crudo,
+    ):
+        return [("mostrar_avatar", {"accion": "esconder"})]
 
     recordatorio = extraer_recordatorio(texto)
     if recordatorio:
@@ -3539,7 +3587,7 @@ TEMAS_TOOLS = {
     ),
     "avatar": (
         ("avatar", "pase", "escond", "aparec", "mascota", "monit", "munec",
-         "sprite", "camina", "sal a"),
+         "sprite", "camina", "sal a", "muestrate", "asom"),
         ("mostrar_avatar",),
     ),
 }
@@ -3712,6 +3760,9 @@ def ejecutar_comando_local(nombre: str, args: dict):
     if nombre == "mover_ventana":
         return mover_ventana(**args)
 
+    if nombre == "mostrar_avatar":
+        return mostrar_avatar(**args)
+
     return "Comando local no reconocido."
 
 
@@ -3741,36 +3792,6 @@ async def dar_bienvenida() -> str:
     texto = f"{saludo} {clima}"
     await hablar_por_parlantes(texto)
     return texto
-
-
-@app.post("/bienvenida")
-async def bienvenida_endpoint():
-    """Dice la frase de bienvenida + clima por los parlantes del PC.
-
-    Esto NO lo dispara un comando de voz/texto del usuario — lo pensé
-    para que lo llame un exec-once de Hyprland (o lo que uses como
-    gestor de sesión) apenas arranca la sesión gráfica, justo después
-    de poner tu contraseña. Ver las instrucciones de instalación."""
-    texto = await dar_bienvenida()
-    return {"mensaje": texto}
-
-
-@app.get("/captura/{captura_id}")
-async def obtener_captura(captura_id: str, background_tasks: BackgroundTasks):
-    """Sirve la captura con ese ID específico (no 'la última' a secas,
-    para no mezclar capturas de solicitudes simultáneas distintas)."""
-    ruta = ruta_captura_disponible(captura_id)
-
-    if not ruta:
-        raise HTTPException(
-            status_code=404,
-            detail="Esa captura ya no está disponible (puede que haya expirado)."
-        )
-
-    media_type = "image/jpeg" if ruta.endswith(".jpg") else "image/png"
-    background_tasks.add_task(os.remove, ruta)
-
-    return FileResponse(ruta, media_type=media_type, background=background_tasks)
 
 # ============================================================
 # GROQ (plan gratuito: cada token cuenta)
@@ -4512,207 +4533,9 @@ ALUCINACIONES_WHISPER = (
 )
 
 
-@app.post("/callar")
-async def callar_endpoint():
-    """Corta lo que Madeline esté diciendo en el PC. Lo llama
-    madeline_mic.sh apenas presionas Win+J: antes la voz recién se
-    cortaba cuando TERMINABAS de grabar (al llegar el audio), así que
-    el micrófono grababa a Madeline hablando encima de tu orden."""
-    interrumpir_voz_pc()
-    poner_estado_avatar("escuchando")
-    return {"ok": True}
-
-
-@app.post(
-    "/comando_audio",
-    response_model=ChatResponse
-)
-async def comando_audio_endpoint(
-    audio: UploadFile = File(...),
-    origen: str = "pc"
-):
-    """
-    Recibe audio, lo transcribe con Whisper
-    y lo envía al cerebro principal de Madeline.
-
-    origen=pc:
-        Madeline habla por los parlantes del PC.
-
-    origen=telefono:
-        Madeline genera el audio y lo devuelve
-        para que Flutter lo reproduzca.
-    """
-
-    origen = origen.lower().strip()
-
-    if origen not in ("pc", "telefono"):
-        raise HTTPException(
-            status_code=400,
-            detail="El origen debe ser 'pc' o 'telefono'."
-        )
-
-    # Por si el cliente no llamó a /callar al empezar a grabar.
-    if origen == "pc":
-        interrumpir_voz_pc()
-
-    try:
-        # Los bytes van directo a Whisper: antes se escribían a /tmp y
-        # se volvían a leer, usando además el nombre de archivo que
-        # mandaba el cliente.
-        contenido = await audio.read()
-
-        transcripcion = await asyncio.to_thread(
-            client.audio.transcriptions.create,
-            file=(audio.filename or "audio.wav", contenido),
-            model="whisper-large-v3",
-            language="es",
-            prompt=PISTA_VOCABULARIO,
-        )
-
-        mensaje_usuario = transcripcion.text.strip()
-
-    except RateLimitError:
-        return await responder_sin_cuota(origen)
-
-    except Exception as e:
-        print(f"[ERROR WHISPER] {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error procesando el audio: {e}"
-        )
-
-    # Whisper "alucina" estas frases con audio vacío o puro ruido. Sin
-    # este filtro, una grabación en silencio terminaba en una llamada
-    # a Groq por "Subtítulos realizados por la comunidad de Amara.org".
-    if re.search(ALUCINACIONES_WHISPER, mensaje_usuario, re.IGNORECASE):
-        mensaje_usuario = ""
-
-    # --------------------------------------------------------
-    # 3. VALIDAR TRANSCRIPCIÓN
-    # --------------------------------------------------------
-
-    if not mensaje_usuario:
-        raise HTTPException(
-            status_code=400,
-            detail="No se detectó voz."
-        )
-
-    print(
-        f"[🎙️ Voz detectada - {origen}]: "
-        f"{mensaje_usuario}"
-    )
-
-    # --------------------------------------------------------
-    # 4. ENVIAR AL CEREBRO PRINCIPAL
-    # --------------------------------------------------------
-
-    request_data = ChatRequest(
-        message=mensaje_usuario
-    )
-
-    resultado = await procesar_mensaje(
-        request_data,
-        origen=origen
-    )
-
-    # IMPORTANTE:
-    #
-    # Ya NO hacemos:
-    #
-    # await hablar_por_parlantes(...)
-    #
-    # porque procesar_mensaje() ya decidió dónde
-    # debe salir la voz.
-    #
-
-    resultado.transcripcion = mensaje_usuario
-    return resultado
-
-
-@app.post(
-    "/comando_texto",
-    response_model=ChatResponse
-)
-async def recibir_texto(
-    comando: ComandoTexto,
-    origen: str = "pc"
-):
-
-    origen = origen.lower().strip()
-
-    if origen not in ("pc", "telefono"):
-        raise HTTPException(
-            status_code=400,
-            detail="El origen debe ser 'pc' o 'telefono'."
-        )
-
-    if not comando.texto.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="El texto no puede estar vacío."
-        )
-
-    print(
-        f"[⌨️ Texto - {origen}]: "
-        f"{comando.texto}"
-    )
-
-    request_data = ChatRequest(
-        message=comando.texto
-    )
-
-    resultado = await procesar_mensaje(
-        request_data,
-        origen=origen
-    )
-
-    return resultado
-
-@app.get("/bandeja")
-def bandeja_endpoint():
-    """Capturas pedidas desde el PC que el celular todavía no bajó."""
-    return {"capturas": [{"id": c["id"], "creada": c["creada"]} for c in capturas_en_bandeja()]}
-
-
-@app.get("/bandeja/{captura_id}")
-def bandeja_captura_endpoint(captura_id: str, background_tasks: BackgroundTasks):
-    """Entrega una captura de la bandeja y la borra (se baja una vez)."""
-    captura = next((c for c in capturas_en_bandeja() if c["id"] == captura_id), None)
-    if not captura:
-        raise HTTPException(status_code=404, detail="Esa captura ya no está en la bandeja.")
-    background_tasks.add_task(os.remove, captura["ruta"])
-    media_type = "image/jpeg" if captura["ruta"].endswith(".jpg") else "image/png"
-    return FileResponse(captura["ruta"], media_type=media_type, background=background_tasks)
-
-
-@app.get("/sensores")
-def sensores_endpoint():
-    """Estado de hardware en tiempo real para el panel del celular.
-
-    Es "def" (no "async def") a propósito: FastAPI lo corre en un hilo
-    aparte, así la consulta cada 2 s del celular no frena al resto del
-    servidor. Mantiene el formato de siempre (strings, "N/A" si no hay
-    dato) para no tener que cambiar la app."""
-    try:
-        s = leer_sensores()
-        return {
-            "ram_usada": str(s["ram_usada"]),
-            "ram_total": str(s["ram_total"]),
-            "cpu_uso": str(s["cpu_uso"]),
-            "cpu_temp": str(s["cpu_temp"]) if s["cpu_temp"] is not None else "N/A",
-            "gpu_uso": s["gpu_uso"] or "0",
-            "gpu_temp": s["gpu_temp"] or "N/A",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
 # ============================================================
-# DECK: botones del celular (como un Stream Deck)
+# ACCIONES PERMITIDAS EN EL STREAM DECK
 # ============================================================
-# Cada botón llama a una tool directo, sin router ni Groq: 0 tokens.
-# Solo estas tools y estos argumentos; las tools mismas validan los
-# valores (lista blanca de apps, acciones conocidas, números).
 DECK_ACCIONES = {
     "abrir_aplicacion": {"app_name", "escritorio"},
     "cerrar_aplicacion": {"app_name"},
@@ -4731,122 +4554,24 @@ DECK_ACCIONES = {
     "cerrar_todo": set(),
     "control_energia": {"accion"},
     "mostrar_avatar": {"accion"},
+    "aplicar_tema_teclado": {"tema", "brillo", "modelo"},
+    "apagar_teclado": set(),
 }
 
-
-@app.get("/deck/apps")
-def deck_apps_endpoint():
-    """Las apps de DICCIONARIO_APPS con su nombre para mostrar."""
-    return {"apps": deck.catalogo(DICCIONARIO_APPS, COMANDOS_APERTURA)}
-
-
-@app.get("/deck/icono/{app_id}")
-def deck_icono_endpoint(app_id: str):
-    if app_id not in APPS_PERMITIDAS:
-        raise HTTPException(status_code=404, detail="Esa app no está en la lista.")
-    ruta = deck.icono_png(app_id, COMANDOS_APERTURA.get(app_id, app_id))
-    if not ruta:
-        raise HTTPException(status_code=404, detail="Esa app no tiene ícono.")
-    # Los íconos casi nunca cambian: que el celular los guarde un día.
-    return FileResponse(ruta, media_type="image/png",
-                        headers={"Cache-Control": "max-age=86400"})
-
-
-@app.get("/deck/estado")
-def deck_estado_endpoint():
-    """Escritorios en uso, el activo, los dispositivos Bluetooth y si el
-    avatar está paseando por la pantalla."""
-    escritorios, activo = [], None
-    try:
-        lista = subprocess.run(["hyprctl", "workspaces", "-j"],
-                               capture_output=True, text=True, timeout=3)
-        escritorios = sorted(w["id"] for w in json.loads(lista.stdout) if w["id"] > 0)
-        actual = subprocess.run(["hyprctl", "activeworkspace", "-j"],
-                                capture_output=True, text=True, timeout=3)
-        activo = json.loads(actual.stdout)["id"]
-    except Exception as e:
-        print(f"[!] No pude leer los escritorios de Hyprland: {e}")
-
-    # Un nombre por dispositivo (hay alias con y sin tilde).
-    bluetooth = list({mac: nombre for nombre, mac in reversed(DISPOSITIVOS_BLUETOOTH.items())}.values())[::-1]
-    return {"escritorios": escritorios, "activo": activo, "bluetooth": bluetooth,
-            "avatar": os.path.exists(MARCA_AVATAR_ACTIVO)}
-
-
-@app.post("/deck/accion")
-def deck_accion_endpoint(accion: AccionDeck):
-    """Ejecuta el botón. Es "def" para que FastAPI lo corra en un hilo
-    aparte: las tools usan subprocess y no deben frenar al servidor."""
-    permitidos = DECK_ACCIONES.get(accion.tool)
-    if permitidos is None:
-        raise HTTPException(status_code=400, detail="Ese botón no existe.")
-    if not set(accion.args) <= permitidos or not all(
-        isinstance(v, (str, int)) for v in accion.args.values()
-    ):
-        raise HTTPException(status_code=400, detail="Argumentos inválidos para ese botón.")
-
-    print(f"[🎛️ Deck] {accion.tool} {accion.args}")
-    try:
-        # control_energia no está en TOOLS_FUNCIONES (por voz pide
-        # confirmación); en el deck la confirmación la pide la app.
-        funcion = control_energia if accion.tool == "control_energia" else TOOLS_FUNCIONES[accion.tool]
-        resultado = funcion(**accion.args)
-    except TypeError:
-        raise HTTPException(status_code=400, detail="Faltan argumentos para ese botón.")
-
-    image_path = None
-    if resultado.startswith("CAPTURA_LISTA"):
-        captura_id = resultado.split(":", 1)[1]
-        if ruta_captura_disponible(captura_id):
-            image_path = f"/captura/{captura_id}"
-        resultado = "Captura lista."
-    return {"response": resultado, "image_path": image_path}
-
-
 # ============================================================
-# RECADOS Y AGENDA PARA EL CELULAR
+# ROUTERS MODULARIZADOS
 # ============================================================
-# Lo mismo que el panel de la barra: leer, agregar y tachar sin Groq.
+from routers.teclado import router as router_teclado, TecladoAplicar, TecladoFavoritos, TecladoModelo
+from routers.recados_agenda import router as router_recados_agenda, RecadoNuevo
+from routers.sistema import router as router_sistema
+from routers.deck import router as router_deck, AccionDeck
+from routers.audio import router as router_audio, ChatRequest, ChatResponse, ComandoTexto
 
-class RecadoNuevo(BaseModel):
-    texto: str
-
-
-@app.get("/recados")
-def recados_endpoint():
-    return {"recados": recados.listar()}
-
-
-@app.post("/recados")
-def recados_agregar_endpoint(nuevo: RecadoNuevo):
-    texto = nuevo.texto.strip()
-    if not texto or len(texto) > 300:
-        raise HTTPException(status_code=400, detail="El recado está vacío o es muy largo.")
-    return recados.agregar(texto)
-
-
-@app.delete("/recados/{id_recado}")
-def recados_borrar_endpoint(id_recado: int):
-    if recados.borrar(id_recado) is None:
-        raise HTTPException(status_code=404, detail="Ese recado ya no está.")
-    return {"ok": True}
-
-
-@app.get("/agenda")
-def agenda_endpoint(dias: int = 7):
-    """Eventos desde hoy. Es "def": la API de Google tarda ~0.5 s."""
-    hoy = datetime.now().date()
-    try:
-        eventos = agenda.eventos_entre(hoy, hoy + timedelta(days=max(1, min(dias, 31))))
-    except agenda.SinAgenda as e:
-        return {"eventos": [], "error": str(e)}
-    return {
-        "eventos": [
-            {"fecha": e["fecha"].isoformat(), "hora": e["hora"], "titulo": e["titulo"]}
-            for e in eventos
-        ],
-        "error": None,
-    }
+app.include_router(router_teclado)
+app.include_router(router_recados_agenda)
+app.include_router(router_sistema)
+app.include_router(router_deck)
+app.include_router(router_audio)
 
 
 if __name__ == "__main__":

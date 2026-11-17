@@ -92,26 +92,62 @@ class TestRouterLocal(unittest.TestCase):
         )
         self.assertIsNone(j.memoria_contexto["confirmacion_pendiente"])
 
+    def test_avatar_mostrar_y_esconder(self):
+        self.assertEqual(
+            j.router_local("Madeline, sal"),
+            [("mostrar_avatar", {"accion": "mostrar"})],
+        )
+        self.assertEqual(
+            j.router_local("Madeline, sal."),
+            [("mostrar_avatar", {"accion": "mostrar"})],
+        )
+        self.assertEqual(
+            j.router_local("MADELINE, SAL."),
+            [("mostrar_avatar", {"accion": "mostrar"})],
+        )
+        self.assertEqual(
+            j.router_local("MADELINE SALT"),
+            [("mostrar_avatar", {"accion": "mostrar"})],
+        )
+        self.assertEqual(
+            j.router_local("muéstrate"),
+            [("mostrar_avatar", {"accion": "mostrar"})],
+        )
+        self.assertEqual(
+            j.router_local("sal a pasear"),
+            [("mostrar_avatar", {"accion": "mostrar"})],
+        )
+        self.assertEqual(
+            j.router_local("Madeline, escóndete"),
+            [("mostrar_avatar", {"accion": "esconder"})],
+        )
+        self.assertEqual(
+            j.router_local("Madeline, escóndete."),
+            [("mostrar_avatar", {"accion": "esconder"})],
+        )
+        self.assertEqual(
+            j.router_local("escóndete"),
+            [("mostrar_avatar", {"accion": "esconder"})],
+        )
+
 
 @mock.patch.object(j.subprocess, "run")
 @mock.patch.object(j.subprocess, "Popen")
 class TestListaBlancaApps(unittest.TestCase):
     def test_abrir_app_conocida_usa_nombre_tecnico(self, popen, run):
         j.abrir_aplicacion("discord")
-        popen.assert_called_once_with(
-            ["hyprctl", "dispatch", "exec", "vesktop"]
-        )
+        popen.assert_called_once_with(j.comando_hypr_exec("vesktop"))
 
     def test_abrir_juego_de_steam_usa_su_appid(self, popen, run):
         j.abrir_aplicacion("hades")
         popen.assert_called_once_with(
-            ["hyprctl", "dispatch", "exec", "steam steam://rungameid/1145360"]
+            j.comando_hypr_exec("steam steam://rungameid/1145360")
         )
 
     def test_alias_en_espanol_abre_la_app_real(self, popen, run):
         j.abrir_aplicacion("excel")
         popen.assert_called_once_with(
-            ["hyprctl", "dispatch", "exec", "libreoffice --calc"]
+            j.comando_hypr_exec("libreoffice --calc")
         )
 
     def test_cerrar_libreoffice_mata_soffice(self, popen, run):
@@ -129,14 +165,11 @@ class TestListaBlancaApps(unittest.TestCase):
         with mock.patch.object(j.threading, "Timer") as timer:
             j.abrir_aplicacion("discord", escritorio=2)
 
-        popen.assert_called_once_with(
-            ["hyprctl", "dispatch", "exec", "vesktop"]
-        )
+        popen.assert_called_once_with(j.comando_hypr_exec("vesktop"))
         _, kwargs = timer.call_args
         self.assertEqual(
             kwargs["args"][0],
-            ["hyprctl", "dispatch", "movetoworkspacesilent",
-             "2,class:.*vesktop.*"],
+            j.comando_hypr_movetoworkspacesilent("vesktop", 2),
         )
 
     def test_escritorio_invalido_no_ejecuta_nada(self, popen, run):
@@ -158,7 +191,7 @@ class TestListaBlancaApps(unittest.TestCase):
         run.return_value = mock.Mock(returncode=0, stdout="ok")
         resultado = j.cambiar_escritorio(3)
         self.assertEqual(
-            run.call_args.args[0], ["hyprctl", "dispatch", "workspace", "3"]
+            run.call_args.args[0], j.comando_hypr_workspace(3)
         )
         self.assertEqual(resultado, "Cambiado al escritorio 3.")
 
@@ -174,7 +207,16 @@ class TestUrlsNavegador(unittest.TestCase):
         url = 'https://ejemplo.com/"; rm -rf ~ #$(whoami)'
         self.assertTrue(j.abrir_url_en_navegador(url))
 
-        comando = popen.call_args[0][0][3]
+        llamada = popen.call_args[0][0]
+        if j.usa_hyprland_lua():
+            import json
+            arg = llamada[2]
+            self.assertTrue(arg.startswith("hl.dsp.exec_cmd("))
+            cmd_json = arg[len("hl.dsp.exec_cmd("):-1]
+            comando = json.loads(cmd_json)
+        else:
+            comando = llamada[3]
+
         # La shell que usa hyprctl tiene que ver exactamente 3 palabras:
         # navegador, -new-tab y la URL intacta.
         self.assertEqual(
@@ -185,6 +227,38 @@ class TestUrlsNavegador(unittest.TestCase):
         self.assertFalse(j.abrir_url_en_navegador("file:///etc/passwd"))
         self.assertFalse(j.abrir_url_en_navegador("javascript:alert(1)"))
         popen.assert_not_called()
+
+
+class TestCompatibilidadHyprland(unittest.TestCase):
+    def test_comandos_lua(self):
+        with mock.patch.object(j, "usa_hyprland_lua", return_value=True):
+            self.assertEqual(
+                j.comando_hypr_exec("vesktop"),
+                ["hyprctl", "dispatch", 'hl.dsp.exec_cmd("vesktop")'],
+            )
+            self.assertEqual(
+                j.comando_hypr_workspace(2),
+                ["hyprctl", "dispatch", "hl.dsp.focus({ workspace = '2' })"],
+            )
+            self.assertEqual(
+                j.comando_hypr_movetoworkspacesilent("vesktop", 3),
+                ["hyprctl", "dispatch", "hl.dsp.window.move({ window = 'class:.*vesktop.*', workspace = 3, follow = false })"],
+            )
+
+    def test_comandos_legacy(self):
+        with mock.patch.object(j, "usa_hyprland_lua", return_value=False):
+            self.assertEqual(
+                j.comando_hypr_exec("vesktop"),
+                ["hyprctl", "dispatch", "exec", "vesktop"],
+            )
+            self.assertEqual(
+                j.comando_hypr_workspace(2),
+                ["hyprctl", "dispatch", "workspace", "2"],
+            )
+            self.assertEqual(
+                j.comando_hypr_movetoworkspacesilent("vesktop", 3),
+                ["hyprctl", "dispatch", "movetoworkspacesilent", "3,class:.*vesktop.*"],
+            )
 
 
 def respuesta_groq_con_tool(nombre: str, argumentos: str):
@@ -262,6 +336,8 @@ class TestOrdenesCortas(unittest.TestCase):
         "gracias madeline": [("charla", {"tipo": "gracias"})],
         "Madeline. Gracias.": [("charla", {"tipo": "gracias"})],
         "Hola.": [("charla", {"tipo": "saludo"})],
+        "Madeline": [("charla", {"tipo": "saludo"})],
+        "Oye Madeline.": [("charla", {"tipo": "saludo"})],
         "abre discord y pausa la música": [
             ("multimedia", {"accion": "pausar"}),
             ("abrir_aplicacion", {"app_name": "discord"}),
