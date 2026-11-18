@@ -5,26 +5,11 @@ import os
 import re
 from groq import RateLimitError
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from pydantic import BaseModel
-
-import madeline_server as server
+from core.models import ChatRequest, ChatResponse, ComandoTexto
 
 router = APIRouter(tags=["audio"])
 
-
-class ChatRequest(BaseModel):
-    message: str
-
-
-class ChatResponse(BaseModel):
-    response: str
-    audio_url: str | None = None
-    image_path: str | None = None
-    transcripcion: str | None = None
-
-
-class ComandoTexto(BaseModel):
-    texto: str
+import madeline_server as server
 
 
 @router.post("/callar")

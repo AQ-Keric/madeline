@@ -3,19 +3,14 @@
 import os
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from core.models import AccionDeck
+
+router = APIRouter(prefix="/deck", tags=["deck"])
 
 import deck
 import teclado_control
 from services import hyprland
 import madeline_server as server
-
-router = APIRouter(prefix="/deck", tags=["deck"])
-
-
-class AccionDeck(BaseModel):
-    tool: str
-    args: dict = {}
 
 
 @router.get("/apps")
