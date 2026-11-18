@@ -300,10 +300,16 @@ class AccionDeck(BaseModel):
 # ============================================================
 
 import services.audio as _audio
+import services.system as _system
 
 ajustar_volumen = _audio.ajustar_volumen
 hay_reproductor = _audio.hay_reproductor
 info_cancion = _audio.info_cancion
+
+_leer_proc_stat = _system._leer_proc_stat
+uso_cpu = _system.uso_cpu
+leer_sensores = _system.leer_sensores
+control_energia = _system.control_energia
 
 
 PROCESOS_PROTEGIDOS = {
@@ -434,23 +440,6 @@ def reiniciar_servidor_madeline() -> str:
         "Reiniciando el servidor de Madeline. "
         "Va a tardar unos segundos en volver."
     )
-
-
-def control_energia(accion: str) -> str:
-    """Apaga o reinicia el sistema operativo."""
-    try:
-        if accion == "apagar":
-            subprocess.Popen(["systemctl", "poweroff"])
-            return "Iniciando secuencia de apagado completo."
-
-        elif accion == "reiniciar":
-            subprocess.Popen(["systemctl", "reboot"])
-            return "Reiniciando el sistema."
-
-        return "Acción de energía no reconocida."
-
-    except Exception as e:
-        return f"Error intentando cambiar el estado de energía: {e}"
 
 
 def gestor_paquetes_disponible() -> str:
@@ -649,85 +638,11 @@ def reporte_clima(dia: str = "ahora") -> str:
 
 
 # ------------------------------------------------------------
-# SENSORES (compartido por estado_sistema y /sensores)
+# SENSORES Y ESTADO DEL SISTEMA (Presentación)
 # ------------------------------------------------------------
-# Se leen /proc y /sys directo en vez de "free | awk", "top -bn1" y
-# "cat" con shell=True: es más rápido (top tardaba ~0.5 s en cada
-# consulta del celular, cada 2 s) y más preciso (el primer muestreo
-# de top -bn1 no refleja bien el uso actual).
-
-_MUESTRA_CPU = None  # (momento, total, inactivo) de la lectura anterior
-
-
-def _leer_proc_stat():
-    with open("/proc/stat") as f:
-        # Solo los 8 primeros campos: guest y guest_nice ya vienen
-        # incluidos dentro de user y nice.
-        valores = [int(x) for x in f.readline().split()[1:9]]
-    # idle + iowait cuentan como tiempo inactivo
-    return sum(valores), valores[3] + valores[4]
-
-
-def uso_cpu() -> float:
-    """% de uso de CPU desde la lectura anterior. Si no hay una
-    lectura reciente (< 10 s), mide durante 0.2 s."""
-    global _MUESTRA_CPU
-
-    ahora = time.monotonic()
-    total, inactivo = _leer_proc_stat()
-
-    if _MUESTRA_CPU is None or ahora - _MUESTRA_CPU[0] > 10:
-        time.sleep(0.2)
-        total_previo, inactivo_previo = total, inactivo
-        ahora = time.monotonic()
-        total, inactivo = _leer_proc_stat()
-    else:
-        _, total_previo, inactivo_previo = _MUESTRA_CPU
-
-    _MUESTRA_CPU = (ahora, total, inactivo)
-
-    delta_total = total - total_previo
-    if delta_total <= 0:
-        return 0.0
-    return round(100 * (1 - (inactivo - inactivo_previo) / delta_total), 1)
-
-
-def leer_sensores() -> dict:
-    """RAM (MB), CPU (% y °C) y GPU NVIDIA (% y °C, None si está
-    apagada por el sistema híbrido o no hay nvidia-smi)."""
-    memoria = {}
-    with open("/proc/meminfo") as f:
-        for linea in f:
-            clave, valor = linea.split(":", 1)
-            memoria[clave] = int(valor.split()[0])  # en kB
-
-    ram_total = memoria["MemTotal"] // 1024
-    ram_usada = ram_total - memoria["MemAvailable"] // 1024
-
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp") as f:
-            cpu_temp = int(f.read().strip()) // 1000
-    except Exception:
-        cpu_temp = None
-
-    try:
-        gpu_info = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=3, check=True,
-        ).stdout.strip()
-        gpu_uso, gpu_temp = [x.strip() for x in gpu_info.split(",")]
-    except Exception:
-        gpu_uso, gpu_temp = None, None
-
-    return {
-        "ram_usada": ram_usada,
-        "ram_total": ram_total,
-        "cpu_uso": uso_cpu(),
-        "cpu_temp": cpu_temp,
-        "gpu_uso": gpu_uso,
-        "gpu_temp": gpu_temp,
-    }
+# La telemetría de hardware (RAM, CPU, temperaturas, GPU) se gestiona
+# en services.system. Aquí se mantiene el formateo fonético y la
+# composición del mensaje hablado para la interacción del usuario.
 
 
 def _gb(megas: int) -> str:
