@@ -119,6 +119,14 @@ def _similares(vector, tipos=None):
     ]
 
 
+STOPWORDS_MEMORIA = {
+    "madeline", "keric", "favor", "gracias", "hola", "puedes", "quiero",
+    "hacer", "decir", "dije", "como", "cuando", "donde", "porque", "este",
+    "esta", "esto", "estos", "estas", "todo", "toda", "todos", "todas",
+    "algo", "nada", "bueno", "bien", "para", "pero", "tiene", "tengo",
+}
+
+
 def _sin_tildes(texto: str) -> str:
     return "".join(
         c for c in unicodedata.normalize("NFD", texto.lower())
@@ -127,23 +135,55 @@ def _sin_tildes(texto: str) -> str:
 
 
 def _palabras_clave(texto: str) -> set:
-    return {p for p in re.findall(r"\w+", _sin_tildes(texto)) if len(p) >= 4}
+    return {
+        p for p in re.findall(r"\w+", _sin_tildes(texto))
+        if len(p) >= 4 and p not in STOPWORDS_MEMORIA
+    }
 
 
 def _por_palabras_clave(consulta: str, tipos=None):
-    """Respaldo sin Ollama: [(coincidencias, id, tipo, texto, creado)]."""
+    """Respaldo sin Ollama con scoring BM25/F1 normalizado y umbral mínimo."""
     claves = _palabras_clave(consulta)
     if not claves:
         return []
+
+    # MEM-03: Regla absoluta de término único. Si la consulta tiene un solo término
+    # informativo, se restringe a priori de forma absoluta a recuerdos de tipo 'dato'.
+    if len(claves) == 1:
+        if tipos is not None:
+            tipos = set(tipos) & {"dato"}
+        else:
+            tipos = {"dato"}
+        if not tipos:
+            return []
+
     filas = _db().execute("SELECT id, tipo, texto, creado FROM recuerdos").fetchall()
     puntajes = []
+    len_q = len(claves)
+
     for id_, tipo, texto, creado in filas:
         if tipos and tipo not in tipos:
             continue
-        coincidencias = len(claves & _palabras_clave(texto))
-        if coincidencias:
-            puntajes.append((coincidencias, id_, tipo, texto, creado))
-    return sorted(puntajes, key=lambda p: (-p[0], -p[4]))
+        claves_rec = _palabras_clave(texto)
+        interseccion = claves & claves_rec
+        if not interseccion:
+            continue
+
+        c_q = len(interseccion) / len_q
+        c_r = len(interseccion) / len(claves_rec) if claves_rec else 0.0
+        f1 = (2.0 * c_q * c_r) / (c_q + c_r + 1e-6)
+
+        multiplicador = 1.25 if tipo == "dato" else 1.0
+        score = f1 * multiplicador
+
+        # Umbral mínimo de relevancia: descartar coincidencias débiles
+        if score < 0.40:
+            continue
+
+        puntajes.append((score, id_, tipo, texto, creado))
+
+    # Desempate determinista: 1º mayor score, 2º prioridad 'dato', 3º más reciente
+    return sorted(puntajes, key=lambda p: (-p[0], 0 if p[2] == "dato" else 1, -p[4]))
 
 
 def guardar(texto: str, tipo: str = "dato") -> str:
@@ -183,14 +223,19 @@ def guardar_conversacion(pregunta: str, respuesta: str):
 def buscar(consulta: str, k: int = 3) -> list:
     """Los k recuerdos más relevantes para la consulta (puede ser
     ninguno). Cada uno con su fecha, recortado para gastar poco."""
+    claves = _palabras_clave(consulta)
+    if not claves:
+        return []
+
+    tipos_filtro = {"dato"} if len(claves) == 1 else None
     limite_reciente = time.time() - SEGUNDOS_HISTORIAL_RECIENTE
     vector = _embedding(consulta, consulta=True)
 
     with _lock:
         if vector is not None:
-            candidatos = [c for c in _similares(vector) if c[0] >= UMBRAL_RELEVANCIA]
+            candidatos = [c for c in _similares(vector, tipos=tipos_filtro) if c[0] >= UMBRAL_RELEVANCIA]
         else:
-            candidatos = _por_palabras_clave(consulta)
+            candidatos = _por_palabras_clave(consulta, tipos=tipos_filtro)
 
     elegidos = [
         c for c in candidatos

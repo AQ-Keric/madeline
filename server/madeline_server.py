@@ -67,7 +67,7 @@ MODEL = "openai/gpt-oss-120b"
 class TurnoConversacion:
     usuario: str
     asistente: str
-    timestamp: float = field(default_factory=time.time)
+    timestamp: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -75,8 +75,15 @@ class AccionLocalReciente:
     comando: str
     args: dict
     resultado: Any
-    timestamp: float = field(default_factory=time.time)
+    timestamp: float = field(default_factory=time.monotonic)
     origen: str = "pc"
+
+
+def _calcular_edad(timestamp: float) -> float:
+    """Calcula la edad en segundos soportando tanto time.monotonic() como time.time()."""
+    if timestamp > 1_000_000_000:
+        return max(0.0, time.time() - timestamp)
+    return max(0.0, time.monotonic() - timestamp)
 
 
 historiales_por_origen = {
@@ -126,16 +133,80 @@ class HistorialChatCompat(list):
 historial_chat = HistorialChatCompat()
 MAX_HISTORIAL = 3
 
+class MemoriaContextoDict(dict):
+    """Diccionario de compatibilidad para memoria_contexto que aísla confirmaciones
+    pendientes por origen ('pc', 'telefono') y aplica un TTL monótono de 30.0 segundos."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._confirmaciones = {
+            "pc": None,
+            "telefono": None,
+        }
+
+    def clear(self):
+        super().clear()
+        self._confirmaciones = {
+            "pc": None,
+            "telefono": None,
+        }
+        super().__setitem__("cancion", None)
+        super().__setitem__("ultimo_resultado", None)
+        super().__setitem__("confirmacion_pendiente", None)
+
+    def obtener_confirmacion(self, origen: str = "pc") -> Optional[dict]:
+        conf = self._confirmaciones.get(origen)
+        if not conf:
+            return None
+        # Validar TTL monótono de 30.0 segundos
+        if time.monotonic() - conf.get("timestamp", 0.0) > 30.0:
+            self._confirmaciones[origen] = None
+            if origen == "pc":
+                super().__setitem__("confirmacion_pendiente", None)
+            return None
+        return conf.get("data")
+
+    def fijar_confirmacion(self, datos: Optional[dict], origen: str = "pc"):
+        if datos is None:
+            self._confirmaciones[origen] = None
+            if origen == "pc":
+                super().__setitem__("confirmacion_pendiente", None)
+        else:
+            self._confirmaciones[origen] = {
+                "data": datos,
+                "timestamp": time.monotonic(),
+            }
+            if origen == "pc":
+                super().__setitem__("confirmacion_pendiente", datos)
+
+    def __getitem__(self, key):
+        if key == "confirmacion_pendiente":
+            return self.obtener_confirmacion("pc")
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        if key == "confirmacion_pendiente":
+            self.fijar_confirmacion(value, "pc")
+        else:
+            super().__setitem__(key, value)
+
+    def get(self, key, default=None):
+        if key == "confirmacion_pendiente":
+            val = self.obtener_confirmacion("pc")
+            return val if val is not None else default
+        return super().get(key, default)
+
+
 # Memoria contextual ligera: no se envía a Groq salvo que una pregunta
 # realmente necesite contexto.
-memoria_contexto = {
+memoria_contexto = MemoriaContextoDict({
     "cancion": None,
     "ultimo_resultado": None,
     # Acción destructiva esperando un "sí"/"no" del usuario antes de
     # ejecutarse (ver sección de energía en router_local). None = no
     # hay nada pendiente.
     "confirmacion_pendiente": None,
-}
+})
 
 app = FastAPI(title="Madeline API", description="API para la asistente Madeline optimizada con Groq")
 
@@ -1907,6 +1978,7 @@ def abrir_aplicacion(app_name: str, escritorio: int = None) -> Resultado:
 def mover_ventana(app_name: str, escritorio: int | str) -> Resultado:
     """Mueve una ventana a un escritorio específico."""
     nombre_app = (app_name or "").strip().lower()
+    address = None
 
     if nombre_app in ("esta ventana", "la ventana", "ventana activa", "esta", "actual", "ventana"):
         ventana_activa = hyprland.obtener_ventana_activa()
@@ -1914,6 +1986,7 @@ def mover_ventana(app_name: str, escritorio: int | str) -> Resultado:
             clase = ventana_activa["class"]
             nombre_tecnico = clase
             app_name = ventana_activa.get("title") or clase
+            address = ventana_activa.get("address")
         else:
             clase = ""
             nombre_tecnico = None
@@ -1928,6 +2001,11 @@ def mover_ventana(app_name: str, escritorio: int | str) -> Resultado:
             evidencia={"app_name": app_name, "encontrada": False},
             estado=EstadoResultado.FAILURE,
         )
+
+    if not address:
+        ventana_activa = hyprland.obtener_ventana_activa()
+        if ventana_activa and ventana_activa.get("address"):
+            address = ventana_activa.get("address")
 
     try:
         esc_str = str(escritorio).strip().lower()
@@ -1958,15 +2036,19 @@ def mover_ventana(app_name: str, escritorio: int | str) -> Resultado:
             res_sub = subprocess.run(comando_hypr_movetoworkspacesilent(clase, escritorio))
             despachado = (res_sub.returncode == 0) if hasattr(res_sub, "returncode") else True
 
+        evidencia_res = {
+            "app_name": app_name,
+            "clase": clase,
+            "escritorio": escritorio,
+            "despachado": despachado,
+        }
+        if address:
+            evidencia_res["address"] = address
+
         return Resultado(
             ok=True,
             mensaje=f"Ventana de {app_name} movida al escritorio {escritorio}.",
-            evidencia={
-                "app_name": app_name,
-                "clase": clase,
-                "escritorio": escritorio,
-                "despachado": despachado,
-            },
+            evidencia=evidencia_res,
             estado=EstadoResultado.SUCCESS,
         )
 
@@ -3179,6 +3261,120 @@ def es_pregunta_explicativa_o_hipotetica(texto: str) -> bool:
     return bool(PATRON_PREGUNTA_EXPLICATIVA.search(texto.strip()))
 
 
+PATRON_PREGUNTA_CONCEPTUAL = re.compile(
+    r"\b(?:qu[eé]\s+(?:es|son)\b|c[oó]mo\s+(?:funciona|se\s+calcula)\b)",
+    re.IGNORECASE,
+)
+
+
+PATRON_ORDEN_NEGADA = re.compile(
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
+    r"(?:no\s+|nunca\s+|jam[aá]s\s+)"
+    r"(?:quiero\s+que\s+|deseo\s+que\s+|vayas\s+a\s+|te\s+ocurra\s+|se\s+te\s+ocurra\s+)?"
+    r"(?:abras?|cierres?|apagues?|reinicies?|subas?|bajes?|pongas?|cambies?|muevas?|ejecutes?|toques?|pauses?|silencies?|mutees?|"
+    r"abrir|cerrar|apagar|reiniciar|subir|bajar|poner|cambiar|mover|ejecutar|pausar|silenciar|mutear)\b",
+    re.IGNORECASE,
+)
+
+
+def es_orden_negada(texto: str) -> bool:
+    """True si la frase es una orden explícitamente negada ('no abras...', 'nunca apagues...')."""
+    return bool(PATRON_ORDEN_NEGADA.search(texto.strip()))
+
+
+PATRON_REPETICION = re.compile(
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?(?:por\s+favor\s*,?\s*)?"
+    r"(?:"
+    r"haz(?:lo)?\s+(?:de\s+nuevo|otra\s+vez)|"
+    r"rep[ií]te(?:lo)?(?:\s+(?:eso|la\s+acci[oó]n|el\s+comando))?|"
+    r"vuelve\s+a\s+hacer(?:lo)?|"
+    r"(?:de\s+nuevo|otra\s+vez)\s*(?:por\s+favor)?$|"
+    r"una\s+vez\s+m[aá]s|"
+    r"(?:sube|baja|siguiente)\s+(?:de\s+nuevo|otra\s+vez)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PATRON_CORRECCION = re.compile(
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
+    r"(?:"
+    r"no\s*,\s*(?:me\s+refer[ií]a|quise\s+decir|eso\s+no|me\s+equivoqu[eé]|era\s+|te\s+dije|nada\s+de\s+eso|abre\b|pon\b|haz\b|mejor\b)|"
+    r"no\s+espera\b|no\s*,?\s*cancela\s+eso|correcci[oó]n\b|"
+    r"espera\s*,\s*no\b|"
+    r"no\s*,\s*en\s+realidad\b"
+    r")",
+    re.IGNORECASE,
+)
+
+PATRON_SEGUIMIENTO_ESTADO = re.compile(
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
+    r"(?:"
+    r"por\s+qu[eé]\s+(?:fall[oó]|hiciste\s+eso|no\s+(?:se\s+pudo|abri[oó]|cerr[oó]|funcion[oó]))|"
+    r"qu[eé]\s+(?:pas[oó]|sucedi[oó]|ocurri[oó])|"
+    r"(?:se\s+)?funcion[oó]\s*\??$|"
+    r"(?:se\s+)?(?:abri[oó]|cerr[oó])\s*(?:bien|\??$)|"
+    r"(?:qued[oó]|est[aá])\s+(?:abiert[oa]|cerrad[oa]|bien)|"
+    r"en\s+qu[eé]\s+estado\s+qued[oó]"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PATRON_SEGUIMIENTO_PROCEDIMIENTO = re.compile(
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
+    r"(?:"
+    r"c[oó]mo\s+(?:lo|la|los|las)\s+(?:cierro|abro|apago|muevo|termino|cancelo)|"
+    r"y\s+(?:despu[eé]s|ahora\s+qu[eé]|luego)|"
+    r"qu[eé]\s+(?:hago\s+ahora|sigue|debo\s+hacer)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PATRON_ANAFORA_CONVERSACIONAL = re.compile(
+    r"^[¿¡]?\s*(?:oye\s+)?(?:madel\w*\s*,?\s*)?"
+    r"(?:"
+    r"(?:y\s+)?por\s+qu[eé](?:\s+(?:dijiste|pusiste|mencionaste)\s+.*|\s*\??$)|"
+    r"y\s+eso\s*\??$|"
+    r"cu[aá]ndo\s*\??$|"
+    r"d[oó]nde\s*\??$|"
+    r"qui[eé]n\s+(?:era|fue)\s*\??$|"
+    r"contin[uú]a\b|sigue\s+(?:cont[aá]ndome|explicando)|"
+    r"y\s+el\s+(?:segundo|tercero|otro)\b|"
+    r"y\s+(?:qu[eé]|por\s+qu[eé])\s+.*\b(?:la|lo|las|los|eso|esa|aquel|aquella)\b|"
+    r"a\s+qu[eé]\s+te\s+refieres"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def clasificar_intencion_seguimiento(texto: str) -> str:
+    """Clasifica la intención comunicativa de seguimiento, corrección o repetición."""
+    t = texto.strip()
+    if PATRON_REPETICION.search(t):
+        return "REPETICION_ACCION"
+    if PATRON_CORRECCION.search(t):
+        return "CORRECCION_USUARIO"
+    if PATRON_SEGUIMIENTO_ESTADO.search(t):
+        return "SEGUIMIENTO_ESTADO"
+    if PATRON_SEGUIMIENTO_PROCEDIMIENTO.search(t):
+        return "SEGUIMIENTO_PROCEDIMIENTO"
+    if PATRON_ANAFORA_CONVERSACIONAL.search(t):
+        return "ANAFORA_CONVERSACIONAL"
+    return "NINGUNO"
+
+
+def es_correccion_ambigua(texto: str) -> bool:
+    """True si es una corrección que rechaza sin proporcionar un nuevo objetivo."""
+    t = texto.strip().lower()
+    patrones_ambiguos = [
+        r"^no\s*,?\s*eso\s+no\b",
+        r"^no\s*,?\s*me\s+refer[ií]a\s+a\s+otra\s+cosa\b",
+        r"^no\s*,?\s*nada\s+de\s+eso\b",
+        r"^no\s*,?\s*te\s+equivocaste\b",
+        r"^no\s*,?\s*olv[ií]dalo\b",
+    ]
+    return any(re.search(p, t) for p in patrones_ambiguos)
+
+
 # Memoria a largo plazo: se resuelve en local (0 tokens de Groq).
 # "recuerda que" no choca con los recordatorios: esos dicen
 # "recuérdame en N minutos".
@@ -3268,7 +3464,7 @@ def tipo_charla(t: str):
     return "ok"
 
 
-def router_local(texto: str):
+def router_local(texto: str, origen: str = "pc"):
     """Detecta múltiples comandos locales dentro del mismo mensaje.
 
     El router es solo un atajo gratis para órdenes cortas y obvias
@@ -3286,25 +3482,32 @@ def router_local(texto: str):
     # Si el mensaje anterior dejó una acción destructiva esperando
     # confirmación, este mensaje se interpreta como la respuesta a
     # esa pregunta ANTES que como un comando nuevo.
-    if memoria_contexto.get("confirmacion_pendiente"):
-        pendiente = memoria_contexto["confirmacion_pendiente"]
-
+    conf_pendiente = memoria_contexto.obtener_confirmacion(origen)
+    if conf_pendiente:
         if re.search(
             r"\b(s[ií]|confirmo|dale|procede|afirmativo|adelante|hazlo|hágalo|hagalo)\b",
             t_crudo
         ):
-            memoria_contexto["confirmacion_pendiente"] = None
-            return [("energia", pendiente)]
+            memoria_contexto.fijar_confirmacion(None, origen=origen)
+            return [("energia", conf_pendiente)]
 
         # Cualquier otra cosa cancela lo pendiente — nunca se queda
         # "colgado" esperando sí/no para siempre.
-        memoria_contexto["confirmacion_pendiente"] = None
+        memoria_contexto.fijar_confirmacion(None, origen=origen)
 
         if re.search(r"\b(no|cancela|cancelar|negativo|olv[ií]dalo)\b", t_crudo):
             return [("confirmacion_cancelada", {})]
 
         # Si no fue ni sí ni no, seguimos procesando el mensaje como
         # un comando nuevo y normal (no lo perdemos).
+
+    # ------------------------------------------------------------
+    # FILTRO DE ÓRDENES NEGADAS
+    # ------------------------------------------------------------
+    # Si el usuario dice "No abras Steam", "Nunca apagues el PC", etc.,
+    # el router local NO debe ejecutar ninguna acción.
+    if es_orden_negada(texto):
+        return []
 
     # ------------------------------------------------------------
     # FILTRO DE PREGUNTAS EXPLICATIVAS O HIPOTÉTICAS
@@ -3491,7 +3694,7 @@ def router_local(texto: str):
         rf"|\bapaga(?:r)?\s+{palabras_pc}\b",
         t
     ):
-        memoria_contexto["confirmacion_pendiente"] = {"accion": "apagar"}
+        memoria_contexto.fijar_confirmacion({"accion": "apagar"}, origen=origen)
         return [("confirmar_accion", {"accion": "apagar"})]
 
     if re.search(
@@ -3499,7 +3702,7 @@ def router_local(texto: str):
         rf"|\breinicia(?:r)?\s+{palabras_pc}\b",
         t
     ):
-        memoria_contexto["confirmacion_pendiente"] = {"accion": "reiniciar"}
+        memoria_contexto.fijar_confirmacion({"accion": "reiniciar"}, origen=origen)
         return [("confirmar_accion", {"accion": "reiniciar"})]
 
     palabras_actualizar = (
@@ -3901,7 +4104,7 @@ def ejecutar_comandos_locales(comandos, origen: str = "pc"):
             comando=nombre,
             args=args,
             resultado=res_norm,
-            timestamp=time.time(),
+            timestamp=time.monotonic(),
             origen=origen,
         )
 
@@ -4099,10 +4302,9 @@ PATRON_BUSQUEDA_FALLBACK = re.compile(
 
 def tools_necesarias(texto: str):
     """Envía a Groq solo los schemas de los temas que aparecen en el texto."""
-    if es_pregunta_explicativa_o_hipotetica(texto):
-        # Para preguntas explicativas o hipotéticas ("¿Cómo cambio al escritorio 3?",
-        # "¿Cómo abro Steam?", "Si cierro Discord, ¿qué pasa?"), NUNCA se envían
-        # herramientas de modificación o acción del sistema a Groq.
+    if es_pregunta_explicativa_o_hipotetica(texto) or es_orden_negada(texto):
+        # Para preguntas explicativas, hipotéticas u órdenes negadas ("No abras Discord"),
+        # NUNCA se envían herramientas de modificación o acción del sistema a Groq.
         # Solo se permite buscar_en_web para responder dudas conceptuales y evitar el
         # bug 400 de openai/gpt-oss-120b cuando no tiene herramientas.
         return [t for t in tools if t["function"]["name"] == "buscar_en_web"]
@@ -4160,7 +4362,7 @@ def contexto_para_pregunta(texto: str, origen: str = "pc") -> str:
     """Devuelve solo el contexto mínimo necesario para una pregunta."""
     t = texto.lower()
 
-    if memoria_contexto["cancion"] and any(
+    if memoria_contexto.get("cancion") and any(
         palabra in t
         for palabra in [
             "canción", "cancion", "tema", "artista",
@@ -4174,10 +4376,21 @@ def contexto_para_pregunta(texto: str, origen: str = "pc") -> str:
         )
 
     accion_reciente = acciones_locales_recientes.get(origen)
-    if accion_reciente and (time.time() - accion_reciente.timestamp <= 120.0):
+    if accion_reciente and (_calcular_edad(accion_reciente.timestamp) <= 120.0):
+        intencion = clasificar_intencion_seguimiento(texto)
         t_sin_tildes = quitar_tildes(texto) if "quitar_tildes" in globals() else texto
-        if PATRON_SEGUIMIENTO_ACCION.search(texto) or PATRON_SEGUIMIENTO_ACCION.search(t_sin_tildes):
-            delta = int(time.time() - accion_reciente.timestamp)
+
+        debe_inyectar = False
+        if PATRON_PREGUNTA_CONCEPTUAL.search(texto):
+            debe_inyectar = False
+        elif intencion in ("SEGUIMIENTO_ESTADO", "SEGUIMIENTO_PROCEDIMIENTO"):
+            debe_inyectar = True
+        elif not es_pregunta_explicativa_o_hipotetica(texto):
+            if PATRON_SEGUIMIENTO_ACCION.search(texto) or PATRON_SEGUIMIENTO_ACCION.search(t_sin_tildes):
+                debe_inyectar = True
+
+        if debe_inyectar:
+            delta = int(_calcular_edad(accion_reciente.timestamp))
             estado_val = getattr(accion_reciente.resultado, "estado", None)
             if hasattr(estado_val, "value"):
                 estado_nombre = estado_val.value.upper()
@@ -4195,7 +4408,7 @@ def contexto_para_pregunta(texto: str, origen: str = "pc") -> str:
                 f"- Estado: {estado_nombre} ({msg}.{evid_str})"
             )
 
-    if memoria_contexto["ultimo_resultado"] and any(
+    if memoria_contexto.get("ultimo_resultado") and any(
         palabra in t
         for palabra in ["eso", "esa", "ese", "lo anterior", "antes", "respuesta"]
     ):
@@ -4546,6 +4759,63 @@ def afirma_ejecucion_accion(texto: str) -> bool:
     return bool(PATRON_AFIRMA_ACCION.search(texto) or PATRON_AFIRMA_ACCION.search(t))
 
 
+def procesar_repeticion_accion(origen: str = "pc") -> tuple[bool, str]:
+    """Procesa una solicitud de repetición segura de la última acción local.
+    Devuelve (exito, respuesta_texto)."""
+    accion_reciente = acciones_locales_recientes.get(origen)
+    if not accion_reciente or (_calcular_edad(accion_reciente.timestamp) > 120.0):
+        return False, "No tengo ninguna acción reciente para repetir, Keric."
+
+    res_ant = accion_reciente.resultado
+    estado_ant = getattr(res_ant, "estado", None)
+
+    # Bloqueo si está PENDING
+    if estado_ant == EstadoResultado.PENDING:
+        return True, "La orden anterior todavía se está iniciando en el sistema, Keric. Por favor espera a que termine de cargar."
+
+    cmd = accion_reciente.comando
+    args = dict(accion_reciente.args)
+
+    # Bloqueo o confirmación para acciones destructivas
+    if cmd in ("energia", "control_energia", "confirmar_accion", "cerrar_todo"):
+        memoria_contexto.fijar_confirmacion(args, origen=origen)
+        verbo = "apagar" if args.get("accion") == "apagar" else "reiniciar" if args.get("accion") == "reiniciar" else "cerrar todas las aplicaciones"
+        return True, f"¿Confirmas que quieres {verbo} el sistema, Keric? Di 'sí' para seguir."
+
+    # Mute toggle: estrictamente bloqueado contra repetición automática
+    if cmd in ("volumen", "ajustar_volumen") and args.get("accion") in ("mutear", "mute", "toggle"):
+        return True, "El comando de silencio es una alternancia. ¿Quieres silenciar o reactivar el sonido?"
+
+    # Mover ventana: verificar address de la ventana activa
+    if cmd == "mover_ventana":
+        ventana_actual = hyprland.obtener_ventana_activa()
+        if not ventana_actual:
+            return True, "El foco de la ventana cambió o no se pudo identificar. Por favor indícame qué ventana quieres mover y a qué escritorio."
+        address_previo = (getattr(res_ant, "evidencia", {}) or {}).get("address")
+        address_actual = ventana_actual.get("address")
+        if not address_previo or address_actual != address_previo:
+            return True, "El foco de la ventana cambió. Por favor indícame qué ventana quieres mover y a qué escritorio."
+
+    # Para volumen absoluto (setear / fijar): idempotente
+    if cmd in ("volumen", "ajustar_volumen") and args.get("accion") in ("setear", "fijar"):
+        res = ejecutar_comando_local(cmd, args)
+        res_norm = normalizar_resultado(res, cmd)
+        acciones_locales_recientes[origen] = AccionLocalReciente(
+            comando=cmd, args=args, resultado=res_norm, timestamp=time.monotonic(), origen=origen
+        )
+        porc = args.get("porcentaje", args.get("valor", 0))
+        return True, f"El volumen ya se encuentra al {porc}%."
+
+    # Ejecutar la acción repetida
+    res = ejecutar_comando_local(cmd, args)
+    res_norm = normalizar_resultado(res, cmd)
+    acciones_locales_recientes[origen] = AccionLocalReciente(
+        comando=cmd, args=args, resultado=res_norm, timestamp=time.monotonic(), origen=origen
+    )
+    texto = respuesta_local(cmd, args, res_norm)
+    return True, texto
+
+
 async def _procesar_mensaje(
     request: ChatRequest,
     origen: str,
@@ -4568,9 +4838,79 @@ async def _procesar_mensaje(
         print(f"[Usuario] {mensaje_usuario}")
 
         image_path_response = None
+        ahora_mono = time.monotonic()
+        intencion = clasificar_intencion_seguimiento(mensaje_usuario)
+
+        # 1. REPETICIÓN SEGURA DE ACCIÓN PREVIA
+        if intencion == "REPETICION_ACCION":
+            exito_rep, resp_rep = procesar_repeticion_accion(origen=origen)
+            registro["ruta"] = "repeticion"
+            print(f"[Madeline] {resp_rep}")
+            audio_path_response = await procesar_salida_de_voz(resp_rep, origen)
+            return ChatResponse(
+                response=resp_rep,
+                image_path=None,
+                audio_path=audio_path_response
+            )
+
+        # 2. CORRECCIÓN DE INTENCIÓN DEL USUARIO
+        if intencion == "CORRECCION_USUARIO":
+            if es_correccion_ambigua(mensaje_usuario):
+                texto_resp = "Entendido, ¿qué prefieres que haga?"
+                audio_path_response = await procesar_salida_de_voz(texto_resp, origen)
+                return ChatResponse(response=texto_resp, audio_path=audio_path_response)
+
+            if memoria_contexto.obtener_confirmacion(origen):
+                memoria_contexto.fijar_confirmacion(None, origen=origen)
+
+            sub_msg = re.sub(
+                r"^[¿¡]?\s*no\s*,\s*(?:quise\s+decir|era|me\s+refer[ií]a\s+a)?\s*",
+                "",
+                mensaje_usuario,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            if sub_msg:
+                acc_prev = acciones_locales_recientes.get(origen)
+                if acc_prev and acc_prev.comando in ("abrir_aplicacion", "cerrar_aplicacion"):
+                    app_res = resolver_app(sub_msg)
+                    if app_res:
+                        cmd_corr = acc_prev.comando
+                        args_corr = {"app_name": sub_msg}
+                        res_corr = ejecutar_comando_local(cmd_corr, args_corr)
+                        res_norm = normalizar_resultado(res_corr, cmd_corr)
+                        acciones_locales_recientes[origen] = AccionLocalReciente(
+                            comando=cmd_corr, args=args_corr, resultado=res_norm, timestamp=time.monotonic(), origen=origen
+                        )
+                        texto_resp = f"Entendido, abro {sub_msg}." if cmd_corr == "abrir_aplicacion" else f"Entendido, cierro {sub_msg}."
+                        audio_path_response = await procesar_salida_de_voz(texto_resp, origen)
+                        return ChatResponse(response=texto_resp, audio_path=audio_path_response)
+
+                mensaje_usuario = sub_msg
+
+        # 3. CONSULTA SOBRE ACCIÓN PENDING EN PROGRESO
+        accion_reciente = acciones_locales_recientes.get(origen)
+        if intencion == "SEGUIMIENTO_ESTADO" and accion_reciente and getattr(accion_reciente.resultado, "estado", None) == EstadoResultado.PENDING:
+            texto_resp = "La orden fue emitida y la ventana se encuentra cargando en segundo plano."
+            audio_path_response = await procesar_salida_de_voz(texto_resp, origen)
+            return ChatResponse(response=texto_resp, audio_path=audio_path_response)
+
+        # 4. GESTIÓN DE EXPIRACIÓN COLD Y ANÁFORAS EN FRÍO
+        turnos_origen = historiales_por_origen.get(origen, [])
+        turnos_activos = [t for t in turnos_origen if _calcular_edad(t.timestamp) <= 300.0]
+        historiales_por_origen[origen] = turnos_activos
+        if origen == "pc":
+            historial_chat.sincronizar_desde_turnos(turnos_activos)
+
+        tiene_accion_reciente = (accion_reciente is not None and (_calcular_edad(accion_reciente.timestamp) <= 120.0))
+        if intencion in ("ANAFORA_CONVERSACIONAL", "SEGUIMIENTO_ESTADO", "SEGUIMIENTO_PROCEDIMIENTO"):
+            if not turnos_activos and not tiene_accion_reciente:
+                texto_resp = "No he hecho ninguna acción reciente, Keric. ¿A qué te refieres?"
+                audio_path_response = await procesar_salida_de_voz(texto_resp, origen)
+                return ChatResponse(response=texto_resp, audio_path=audio_path_response)
 
         # 2. ROUTER LOCAL
-        comandos = router_local(mensaje_usuario)
+        comandos = router_local(mensaje_usuario, origen=origen)
 
         # Datos que Keric cuenta al pasar ("estoy aprendiendo Flutter"):
         # se guardan sin interrumpir lo que sea que pidió.
@@ -4656,10 +4996,18 @@ async def _procesar_mensaje(
             print(f"[*] Memoria: {recuerdos}")
             mensajes.append({"role": "system", "content": recuerdos})
 
-        # Incorporar el turno anterior completo si existe (en orden cronológico: user -> assistant)
-        for t in historiales_por_origen.get(origen, []):
-            mensajes.append({"role": "user", "content": t.usuario})
-            mensajes.append({"role": "assistant", "content": t.asistente})
+        # Incorporar turnos conversacionales activos según ventana HOT o WARM
+        for t in turnos_activos:
+            edad = _calcular_edad(t.timestamp)
+            if edad <= 60.0:
+                # HOT: siempre se incluye
+                mensajes.append({"role": "user", "content": t.usuario})
+                mensajes.append({"role": "assistant", "content": t.asistente})
+            elif edad <= 300.0:
+                # WARM: solo si hay intención anafórica o de seguimiento
+                if intencion in ("ANAFORA_CONVERSACIONAL", "CORRECCION_USUARIO", "SEGUIMIENTO_ESTADO", "SEGUIMIENTO_PROCEDIMIENTO"):
+                    mensajes.append({"role": "user", "content": t.usuario})
+                    mensajes.append({"role": "assistant", "content": t.asistente})
 
         # Mensaje actual del usuario SIEMPRE al final:
         mensajes.append({"role": "user", "content": mensaje_usuario})
@@ -4710,7 +5058,7 @@ async def _procesar_mensaje(
                 if fn_name == "control_energia":
                     accion = fn_args.get("accion")
                     if accion in ("apagar", "reiniciar"):
-                        memoria_contexto["confirmacion_pendiente"] = {"accion": accion}
+                        memoria_contexto.fijar_confirmacion({"accion": accion}, origen=origen)
                         fn_name = "confirmar_accion"
                         resultado = ejecutar_comando_local(
                             "confirmar_accion", {"accion": accion}
@@ -4718,11 +5066,16 @@ async def _procesar_mensaje(
                     else:
                         resultado = "No pude entender la acción de energía."
                 elif fn_name in TOOLS_FUNCIONES:
-                    if es_pregunta_explicativa_o_hipotetica(mensaje_usuario) and fn_name != "buscar_en_web":
-                        print(f"[!] Tool call '{fn_name}' bloqueada: la consulta es explicativa/hipotética.")
+                    if (es_pregunta_explicativa_o_hipotetica(mensaje_usuario) or es_orden_negada(mensaje_usuario)) and fn_name != "buscar_en_web":
+                        print(f"[!] Tool call '{fn_name}' bloqueada: la consulta es explicativa/hipotética u orden negada.")
+                        msg_bloqueo = (
+                            "No se ejecutó ninguna acción porque tu consulta es una pregunta conceptual o explicativa."
+                            if es_pregunta_explicativa_o_hipotetica(mensaje_usuario)
+                            else "No se ejecutó ninguna acción porque tu consulta es una orden negada."
+                        )
                         resultado = Resultado(
                             ok=False,
-                            mensaje="No se ejecutó ninguna acción porque tu consulta es una pregunta conceptual o explicativa.",
+                            mensaje=msg_bloqueo,
                             evidencia={"bloqueada": True, "fn_name": fn_name},
                             estado=EstadoResultado.FAILURE,
                         )
@@ -4794,7 +5147,7 @@ async def _procesar_mensaje(
                 texto_final = "No pude realizar esa acción porque no se ejecutó ninguna herramienta en el sistema."
 
         # 6. MEMORIA / COMMIT ATÓMICO DEL TURNO
-        nuevo_turno = TurnoConversacion(usuario=mensaje_usuario, asistente=texto_final, timestamp=time.time())
+        nuevo_turno = TurnoConversacion(usuario=mensaje_usuario, asistente=texto_final, timestamp=time.monotonic())
         historiales_por_origen[origen].append(nuevo_turno)
         if len(historiales_por_origen[origen]) > MAX_TURNOS:
             historiales_por_origen[origen] = historiales_por_origen[origen][-MAX_TURNOS:]

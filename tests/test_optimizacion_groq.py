@@ -574,5 +574,470 @@ class TestHistorialConversacionalStage32(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ms.obtener_lock_origen("pc").locked())
 
 
+class TestStage33ComportamientoConversacional(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ms.historiales_por_origen["pc"].clear()
+        ms.historiales_por_origen["telefono"].clear()
+        ms.historial_chat.clear()
+        ms.acciones_locales_recientes["pc"] = None
+        ms.acciones_locales_recientes["telefono"] = None
+        ms.memoria_contexto.clear()
+
+        patch_voz = mock.patch.object(ms, "procesar_salida_de_voz", mock.AsyncMock(return_value=None))
+        patch_voz.start()
+        self.addCleanup(patch_voz.stop)
+
+        def limpiar():
+            ms.historiales_por_origen["pc"].clear()
+            ms.historiales_por_origen["telefono"].clear()
+            ms.historial_chat.clear()
+            ms.acciones_locales_recientes["pc"] = None
+            ms.acciones_locales_recientes["telefono"] = None
+            ms.memoria_contexto.clear()
+        self.addCleanup(limpiar)
+
+    # ------------------------------------------------------------
+    # BLOQUE A: Integración y Multi-Turno
+    # ------------------------------------------------------------
+    async def test_T33_INT_01_accion_causa_repeticion(self):
+        """Secuencia completa: Acción local -> Causa -> Repetición segura."""
+        with mock.patch.object(ms, "ajustar_volumen", return_value=Resultado(ok=True, mensaje="Volumen al 50%", estado=EstadoResultado.SUCCESS)) as mock_vol, \
+             mock.patch.object(ms.client.chat.completions, "create") as mock_groq:
+
+            # Turno 1: Orden local directa
+            res1 = await ms.procesar_mensaje(ms.ChatRequest(message="Sube el volumen un 10%"), origen="pc")
+            self.assertEqual(mock_vol.call_count, 1)
+            self.assertIsNotNone(ms.acciones_locales_recientes["pc"])
+            self.assertEqual(ms.acciones_locales_recientes["pc"].resultado.estado, EstadoResultado.SUCCESS)
+
+            # Turno 2: Pregunta sobre causa a Groq
+            mock_groq.return_value = mock_respuesta_groq("Fue porque me pediste subir el volumen.")
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="¿Por qué hiciste eso?"), origen="pc")
+            mensajes_enviados = mock_groq.call_args.kwargs["messages"]
+            system_contexts = [m["content"] for m in mensajes_enviados if m["role"] == "system"]
+            self.assertTrue(any("volumen" in c and "SUCCESS" in c for c in system_contexts))
+
+            # Turno 3: Repetición segura (no llama a Groq)
+            mock_groq.reset_mock()
+            res3 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            mock_groq.assert_not_called()
+            self.assertEqual(mock_vol.call_count, 2)
+            self.assertTrue(any(w in res3.response.lower() for w in ("volumen", "ruido", "10%")))
+
+    async def test_T33_INT_02_preservacion_n1_dialogo_tras_orden_local_n2(self):
+        """Un comando local no destruye la conversación de Nivel 1."""
+        with mock.patch.object(ms.client.chat.completions, "create") as mock_groq, \
+             mock.patch.object(ms, "control_multimedia", return_value=Resultado(ok=True, mensaje="Música pausada", estado=EstadoResultado.SUCCESS)):
+
+            # Turno 1: Diálogo conceptual
+            mock_groq.return_value = mock_respuesta_groq("La teoría de la relatividad especial describe el espacio-tiempo.")
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿Qué es la teoría de la relatividad especial?"), origen="pc")
+            self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+
+            # Turno 2: Orden local de música
+            res_local = await ms.procesar_mensaje(ms.ChatRequest(message="Pausa la música"), origen="pc")
+            self.assertIsNotNone(ms.acciones_locales_recientes["pc"])
+            self.assertEqual(ms.acciones_locales_recientes["pc"].comando, "multimedia")
+            self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+            self.assertEqual(ms.historiales_por_origen["pc"][0].usuario, "¿Qué es la teoría de la relatividad especial?")
+
+            # Turno 3: Seguimiento conceptual
+            mock_groq.reset_mock()
+            mock_groq.return_value = mock_respuesta_groq("El experimento de Michelson-Morley la confirmó.")
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿Y qué experimentos la confirmaron?"), origen="pc")
+
+            mensajes_enviados = mock_groq.call_args.kwargs["messages"]
+            usuarios = [m["content"] for m in mensajes_enviados if m["role"] == "user"]
+            self.assertIn("¿Qué es la teoría de la relatividad especial?", usuarios)
+            self.assertNotIn("Pausa la música", usuarios)
+            self.assertFalse(any("multimedia" in m["content"] for m in mensajes_enviados))
+
+    async def test_T33_INT_03_fallo_local_explica_evidencia_sin_exito_falso(self):
+        """Fallo local transmite evidencia técnica sin afirmar falso éxito."""
+        with mock.patch.object(ms, "control_multimedia", return_value=Resultado(
+            ok=False, mensaje="No se encontró un reproductor activo", evidencia={"exit_code": 1}, estado=EstadoResultado.FAILURE
+        )), mock.patch.object(ms.client.chat.completions, "create") as mock_groq:
+
+            # Turno 1: Fallo local
+            res1 = await ms.procesar_mensaje(ms.ChatRequest(message="Pausa la música"), origen="pc")
+            self.assertEqual(ms.acciones_locales_recientes["pc"].resultado.estado, EstadoResultado.FAILURE)
+
+            # Turno 2: Pregunta por qué falló
+            mock_groq.return_value = mock_respuesta_groq("Falló porque playerctl reportó código 1: no había ningún reproductor activo.")
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="¿Por qué falló?"), origen="pc")
+
+            sys_contexts = [m["content"] for m in mock_groq.call_args.kwargs["messages"] if m["role"] == "system"]
+            self.assertTrue(any("FAILURE" in c and "exit_code" in c for c in sys_contexts))
+            self.assertNotIn("Música pausada con éxito", res2.response)
+
+    async def test_T33_INT_04_seguimiento_factico_tras_tool_groq_sin_reinvocacion(self):
+        """Consulta sobre una herramienta previa se responde conversacionalmente sin re-invocar tools."""
+        call_tool = mock.MagicMock()
+        call_tool.function.name = "info_cancion"
+        call_tool.function.arguments = json.dumps({})
+
+        with mock.patch.object(ms.client.chat.completions, "create") as mock_groq, \
+             mock.patch.object(ms, "info_cancion", return_value="Actualmente está sonando: Bohemian Rhapsody de Queen"):
+
+            # Turno 1: Tool call
+            mock_groq.return_value = mock_respuesta_groq("", tool_calls=[call_tool])
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿Qué canción está sonando?"), origen="pc")
+
+            # Turno 2: Seguimiento fáctico
+            tools_t2 = ms.tools_necesarias("¿En qué año se lanzó?")
+            self.assertNotIn("control_multimedia", [t["function"]["name"] for t in tools_t2])
+            self.assertNotIn("abrir_radio_musica", [t["function"]["name"] for t in tools_t2])
+
+            mock_groq.reset_mock()
+            mock_groq.return_value = mock_respuesta_groq("Se lanzó en 1975 en el álbum A Night at the Opera.")
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="¿En qué año se lanzó?"), origen="pc")
+            self.assertIn("1975", res2.response)
+
+    # ------------------------------------------------------------
+    # BLOQUE B: Repetición Segura y Manejo de Estados
+    # ------------------------------------------------------------
+    async def test_T33_REP_01_volumen_relativo_incrementa(self):
+        """Repetir una orden relativa incrementa progresivamente."""
+        with mock.patch.object(ms, "ajustar_volumen", side_effect=[
+            Resultado(ok=True, mensaje="Volumen al 45%", estado=EstadoResultado.SUCCESS),
+            Resultado(ok=True, mensaje="Volumen al 60%", estado=EstadoResultado.SUCCESS),
+        ]) as mock_vol:
+            await ms.procesar_mensaje(ms.ChatRequest(message="Sube el volumen 15%"), origen="pc")
+            self.assertEqual(mock_vol.call_args.kwargs, {"accion": "subir", "porcentaje": 15})
+
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertEqual(mock_vol.call_count, 2)
+            self.assertEqual(mock_vol.call_args.kwargs, {"accion": "subir", "porcentaje": 15})
+
+    async def test_T33_REP_02_volumen_absoluto_idempotente(self):
+        """Repetir una orden absoluta es idempotente e informativo."""
+        with mock.patch.object(ms, "ajustar_volumen", return_value=Resultado(ok=True, mensaje="Volumen fijado al 40%", estado=EstadoResultado.SUCCESS)) as mock_vol:
+            await ms.procesar_mensaje(ms.ChatRequest(message="Pon el volumen al 40%"), origen="pc")
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Repítelo"), origen="pc")
+            self.assertIn("40%", res2.response)
+
+    async def test_T33_REP_03_mute_toggle_bloqueado(self):
+        """El toggle de mute está estrictamente bloqueado contra repetición automática."""
+        with mock.patch.object(ms, "ajustar_volumen", return_value=Resultado(ok=True, mensaje="Audio silenciado", estado=EstadoResultado.SUCCESS)) as mock_vol:
+            await ms.procesar_mensaje(ms.ChatRequest(message="Mutea el audio"), origen="pc")
+            self.assertEqual(mock_vol.call_count, 1)
+
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertEqual(mock_vol.call_count, 1)
+            self.assertIn("alternancia", res2.response)
+            self.assertIn("silenciar o reactivar", res2.response)
+
+    async def test_T33_REP_04_multimedia_siguiente_y_pausa(self):
+        """Repetición de control multimedia seguro."""
+        with mock.patch.object(ms, "control_multimedia", return_value=Resultado(ok=True, mensaje="Pista siguiente", estado=EstadoResultado.SUCCESS)) as mock_media:
+            await ms.procesar_mensaje(ms.ChatRequest(message="Siguiente canción"), origen="pc")
+            self.assertEqual(mock_media.call_count, 1)
+
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Otra vez"), origen="pc")
+            self.assertEqual(mock_media.call_count, 2)
+
+    async def test_T33_REP_05_mover_ventana_bloqueada_distinto_address(self):
+        """Repetición de mover_ventana bloqueada si el address de foco cambió."""
+        with mock.patch.object(ms.hyprland, "obtener_ventana_activa", side_effect=[
+            {"address": "0x1234", "class": "firefox", "title": "Firefox"},
+            {"address": "0x5678", "class": "alacritty", "title": "Terminal"},
+        ]), mock.patch.object(ms.hyprland, "enviar_comando_socket", return_value=True):
+
+            await ms.procesar_mensaje(ms.ChatRequest(message="Mueve esta ventana al escritorio 2"), origen="pc")
+            self.assertEqual(ms.acciones_locales_recientes["pc"].resultado.evidencia.get("address"), "0x1234")
+
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertIn("El foco de la ventana cambió", res2.response)
+
+    async def test_T33_REP_06_mover_ventana_permitida_mismo_address(self):
+        """Repetición de mover_ventana permitida si conserva identidad del address."""
+        with mock.patch.object(ms.hyprland, "obtener_ventana_activa", return_value={
+            "address": "0x1234", "class": "firefox", "title": "Firefox"
+        }), mock.patch.object(ms.hyprland, "enviar_comando_socket", return_value=True):
+
+            await ms.procesar_mensaje(ms.ChatRequest(message="Mueve esta ventana al escritorio 2"), origen="pc")
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertIn("escritorio 2", res2.response)
+
+    async def test_T33_REP_07_acciones_destructivas_exigen_confirmacion_en_repeticion(self):
+        """Acciones destructivas exigen confirmación en repetición."""
+        res_ok = Resultado(ok=True, mensaje="Sistema apagándose", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("energia", {"accion": "apagar"}, res_ok, time.monotonic(), "pc")
+
+        with mock.patch.object(ms, "ejecutar_comando_local") as mock_cmd:
+            res = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertIn("Confirmas que quieres apagar el sistema", res.response)
+            self.assertIsNotNone(ms.memoria_contexto.obtener_confirmacion("pc"))
+            mock_cmd.assert_not_called()
+
+    # ------------------------------------------------------------
+    # BLOQUE C: Semántica de Estados PENDING y FAILURE
+    # ------------------------------------------------------------
+    async def test_T33_STA_01_estado_pending_bloquea_segundo_despacho(self):
+        """Estado PENDING bloquea segundo despacho en segundo plano."""
+        res_pending = Resultado(ok=True, mensaje="Abriendo Steam...", evidencia={"app": "steam"}, estado=EstadoResultado.PENDING)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("abrir_aplicacion", {"app_name": "steam"}, res_pending, time.monotonic(), "pc")
+
+        with mock.patch.object(ms, "ejecutar_comando_local") as mock_cmd:
+            res = await ms.procesar_mensaje(ms.ChatRequest(message="Repítelo"), origen="pc")
+            self.assertIn("todavía se está iniciando", res.response)
+            mock_cmd.assert_not_called()
+
+    async def test_T33_STA_02_consulta_estado_pending_informa_carga(self):
+        """Consulta sobre estado PENDING informa que se encuentra cargando."""
+        res_pending = Resultado(ok=True, mensaje="Abriendo Steam...", evidencia={"app": "steam"}, estado=EstadoResultado.PENDING)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("abrir_aplicacion", {"app_name": "steam"}, res_pending, time.monotonic(), "pc")
+
+        res = await ms.procesar_mensaje(ms.ChatRequest(message="¿Qué pasó?"), origen="pc")
+        self.assertIn("cargando en segundo plano", res.response)
+
+    # ------------------------------------------------------------
+    # BLOQUE D: Robustez Adversarial y Negaciones
+    # ------------------------------------------------------------
+    async def test_T33_ADV_01_pregunta_hipotetica_destructiva_no_ejecuta(self):
+        """Preguntas hipotéticas destructivas no ejecutan acciones."""
+        cmd = ms.router_local("Si apago el PC con comandos, ¿se guardan mis pestañas?")
+        self.assertEqual(cmd, [])
+
+        tools = ms.tools_necesarias("Si apago el PC con comandos, ¿se guardan mis pestañas?")
+        self.assertEqual([t["function"]["name"] for t in tools], ["buscar_en_web"])
+        self.assertIsNone(ms.memoria_contexto.obtener_confirmacion("pc"))
+
+    async def test_T33_ADV_02_orden_negada_bloqueo_triple_capa(self):
+        """Orden negada bloqueada por router local, tools_necesarias y guardián de ejecución."""
+        self.assertEqual(ms.router_local("No abras Steam"), [])
+
+        tools = ms.tools_necesarias("No abras Steam")
+        self.assertEqual([t["function"]["name"] for t in tools], ["buscar_en_web"])
+
+        call_mock = mock.MagicMock()
+        call_mock.function.name = "abrir_aplicacion"
+        call_mock.function.arguments = json.dumps({"app_name": "steam"})
+
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("", tool_calls=[call_mock])):
+            res = await ms.procesar_mensaje(ms.ChatRequest(message="No abras Steam"), origen="pc")
+            self.assertIn("No se ejecutó ninguna acción porque tu consulta es una orden negada", res.response)
+
+    async def test_T33_ADV_03_anafora_sin_referente_en_frio_pide_contexto(self):
+        """Anáfora sin referente en frío pide contexto sin alucinar."""
+        res = await ms.procesar_mensaje(ms.ChatRequest(message="¿Por qué hiciste eso?"), origen="pc")
+        self.assertIn("No he hecho ninguna acción reciente, Keric. ¿A qué te refieres?", res.response)
+
+    async def test_T33_ADV_04_inmunidad_falsos_positivos_conceptuales_n2_no_inyectado(self):
+        """Sustantivos técnicos en preguntas conceptuales no inyectan contexto N2."""
+        res_vol = Resultado(ok=True, mensaje="Volumen al 40%", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"porcentaje": 40}, res_vol, time.monotonic(), "pc")
+
+        self.assertEqual(ms.contexto_para_pregunta("¿Qué es el volumen de una esfera?", "pc"), "")
+        self.assertEqual(ms.contexto_para_pregunta("¿Cómo se calcula el volumen de un cubo?", "pc"), "")
+        self.assertEqual(ms.contexto_para_pregunta("¿Qué es una ventana de Johari?", "pc"), "")
+        self.assertEqual(ms.contexto_para_pregunta("¿Cómo funciona la pantalla táctil?", "pc"), "")
+
+    # ------------------------------------------------------------
+    # BLOQUE E: Concurrencia y Aislamiento por Dispositivo
+    # ------------------------------------------------------------
+    async def test_T33_CONC_01_solicitudes_simultaneas_pc_telefono_aisladas(self):
+        """Peticiones simultáneas PC y Teléfono no interfieren sus historiales ni estados."""
+        with mock.patch.object(ms, "abrir_aplicacion", return_value=Resultado(ok=True, mensaje="Firefox abierto", estado=EstadoResultado.SUCCESS)), \
+             mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("La distancia es 384,400 km.")):
+
+            t1 = asyncio.create_task(ms.procesar_mensaje(ms.ChatRequest(message="Abre Firefox"), origen="pc"))
+            t2 = asyncio.create_task(ms.procesar_mensaje(ms.ChatRequest(message="¿Cuál es la distancia a la Luna?"), origen="telefono"))
+            await asyncio.gather(t1, t2)
+
+            self.assertEqual(len(ms.historiales_por_origen["telefono"]), 1)
+            self.assertEqual(ms.historiales_por_origen["telefono"][0].usuario, "¿Cuál es la distancia a la Luna?")
+            self.assertEqual(len(ms.historiales_por_origen["pc"]), 0)
+            self.assertIsNotNone(ms.acciones_locales_recientes["pc"])
+            self.assertIsNone(ms.acciones_locales_recientes["telefono"])
+
+    async def test_T33_CONC_02_repeticion_telefono_no_accede_accion_pc(self):
+        """Repetición en Teléfono no accede a acciones locales de PC."""
+        res_vol = Resultado(ok=True, mensaje="Volumen al 70%", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"accion": "subir", "porcentaje": 10}, res_vol, time.monotonic(), "pc")
+
+        res_tel = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="telefono")
+        self.assertIn("No tengo ninguna acción reciente para repetir", res_tel.response)
+
+    async def test_T33_CONC_03_cancelacion_pc_libera_lock_y_hilo_tardio_no_corrompe(self):
+        """Cancelación en PC libera lock y teléfono sigue funcionando sin demora."""
+        import threading
+        evento = threading.Event()
+
+        def side_effect_bloqueado(*args, **kwargs):
+            evento.wait(timeout=1.0)
+            return mock_respuesta_groq("Respuesta tardía")
+
+        self.addCleanup(evento.set)
+
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=side_effect_bloqueado):
+            task_pc = asyncio.create_task(ms.procesar_mensaje(ms.ChatRequest(message="Consulta larga PC"), origen="pc"))
+            await asyncio.sleep(0.01)
+            task_pc.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task_pc
+
+        self.assertFalse(ms.obtener_lock_origen("pc").locked())
+
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Respuesta teléfono OK")):
+            res_tel = await ms.procesar_mensaje(ms.ChatRequest(message="Consulta teléfono"), origen="telefono")
+            self.assertIn("Respuesta teléfono OK", res_tel.response)
+
+    # ------------------------------------------------------------
+    # BLOQUE F: Límites Temporales Exactos (Reloj Monotónico)
+    # ------------------------------------------------------------
+    async def test_T33_TIME_01_fronteras_ventana_caliente_tibia_59_60_61(self):
+        """Límites exactos de ventana HOT (<= 60s) vs WARM (> 60s)."""
+        t0 = 1000.0
+        with mock.patch.object(time, "monotonic", return_value=t0):
+            # 59s: Pregunta independiente en ventana caliente incluye turno previo
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta inicial", asistente="Respuesta inicial", timestamp=t0 - 59.0)
+            ]
+            with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("4")) as mock_groq:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿Cuánto es 2 + 2?"), origen="pc")
+                msgs = mock_groq.call_args.kwargs["messages"]
+                self.assertTrue(any(m.get("content") == "Pregunta inicial" for m in msgs))
+
+            # 60s exacto: Frontera inclusiva HOT
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta inicial", asistente="Respuesta inicial", timestamp=t0 - 60.0)
+            ]
+            with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("4")) as mock_groq:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿Cuánto es 2 + 2?"), origen="pc")
+                msgs = mock_groq.call_args.kwargs["messages"]
+                self.assertTrue(any(m.get("content") == "Pregunta inicial" for m in msgs))
+
+            # 61s: Ventana tibia excluye pregunta independiente sin anáfora
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta inicial", asistente="Respuesta inicial", timestamp=t0 - 61.0)
+            ]
+            with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("4")) as mock_groq:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿Cuánto es 2 + 2?"), origen="pc")
+                msgs = mock_groq.call_args.kwargs["messages"]
+                self.assertFalse(any(m.get("content") == "Pregunta inicial" for m in msgs))
+
+            # 61s: Ventana tibia incluye pregunta con anáfora
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta inicial", asistente="Respuesta inicial", timestamp=t0 - 61.0)
+            ]
+            with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Explicación")) as mock_groq:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿Y por qué dijiste eso?"), origen="pc")
+                msgs = mock_groq.call_args.kwargs["messages"]
+                self.assertTrue(any(m.get("content") == "Pregunta inicial" for m in msgs))
+
+    async def test_T33_TIME_02_fronteras_vigencia_accion_local_119_120_121(self):
+        """Límites exactos de vigencia de acción local (<= 120s)."""
+        t0 = 1000.0
+        res_ok = Resultado(ok=True, mensaje="Volumen al 50%", estado=EstadoResultado.SUCCESS)
+        with mock.patch.object(time, "monotonic", return_value=t0):
+            # 119s: Activo
+            ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"porcentaje": 50}, res_ok, t0 - 119.0, "pc")
+            self.assertIn("SUCCESS", ms.contexto_para_pregunta("¿Por qué hiciste eso?", "pc"))
+
+            # 120s exacto: Frontera inclusiva activo
+            ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"porcentaje": 50}, res_ok, t0 - 120.0, "pc")
+            self.assertIn("SUCCESS", ms.contexto_para_pregunta("¿Por qué hiciste eso?", "pc"))
+
+            # 121s: Expirado
+            ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"porcentaje": 50}, res_ok, t0 - 121.0, "pc")
+            self.assertEqual(ms.contexto_para_pregunta("¿Por qué hiciste eso?", "pc"), "")
+
+    async def test_T33_TIME_03_fronteras_ventana_fria_299_300_301(self):
+        """Límites exactos de ventana fría (> 300s)."""
+        t0 = 1000.0
+        with mock.patch.object(time, "monotonic", return_value=t0):
+            # 299s: WARM elegible para anáfora
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta previa", asistente="Respuesta previa", timestamp=t0 - 299.0)
+            ]
+            with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Explicación")) as mock_groq:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿Por qué?"), origen="pc")
+                msgs = mock_groq.call_args.kwargs["messages"]
+                self.assertTrue(any(m.get("content") == "Pregunta previa" for m in msgs))
+
+            # 300s exacto: WARM elegible
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta previa", asistente="Respuesta previa", timestamp=t0 - 300.0)
+            ]
+            with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Explicación")) as mock_groq:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿Por qué?"), origen="pc")
+                msgs = mock_groq.call_args.kwargs["messages"]
+                self.assertTrue(any(m.get("content") == "Pregunta previa" for m in msgs))
+
+            # 301s: COLD -> purgado de RAM
+            ms.historiales_por_origen["pc"] = [
+                ms.TurnoConversacion(usuario="Pregunta previa", asistente="Respuesta previa", timestamp=t0 - 301.0)
+            ]
+            res = await ms.procesar_mensaje(ms.ChatRequest(message="¿Por qué?"), origen="pc")
+            self.assertIn("No he hecho ninguna acción reciente, Keric. ¿A qué te refieres?", res.response)
+
+    # ------------------------------------------------------------
+    # BLOQUE G: Memoria Persistente y Scoring Léxico
+    # ------------------------------------------------------------
+    def test_T33_MEM_01_abstencion_ante_stopwords_cortesia(self):
+        """Consultas compuestas solo por stopwords se abstienen inmediatamente."""
+        import memoria
+        self.assertEqual(memoria.buscar("Madeline, por favor, dime qué hora es"), [])
+
+    async def test_T33_MEM_02_inhibicion_memoria_en_ordenes_operativas(self):
+        """Órdenes operativas no consultan memoria a largo plazo."""
+        with mock.patch.object(ms.memoria, "contexto_recuerdos") as mock_ctx_mem, \
+             mock.patch.object(ms, "ejecutar_comando_local", return_value="ok"):
+            await ms.procesar_mensaje(ms.ChatRequest(message="Abre la terminal"), origen="pc")
+            mock_ctx_mem.assert_not_called()
+
+    def test_T33_MEM_03_termino_unico_excluye_conversacion_y_recupera_dato(self):
+        """Consulta con término único excluye recuerdos conversacionales y recupera dato conciso."""
+        import memoria
+        memoria.guardar("Estoy aprendiendo Flutter", "dato")
+        memoria.guardar("Keric preguntó: Usuario habló largo rato — Madeline respondió: Conversación extensa sobre Flutter y otros temas de desarrollo móvil", "conversacion")
+
+        candidatos = memoria._por_palabras_clave("Flutter")
+        self.assertTrue(len(candidatos) >= 1)
+        self.assertTrue(all(c[2] == "dato" for c in candidatos))
+
+        resultados = memoria.buscar("Flutter")
+        self.assertTrue(len(resultados) >= 1)
+        self.assertTrue(any("Estoy aprendiendo Flutter" in r for r in resultados))
+
+    def test_T33_MEM_04_resolucion_empates_prioriza_dato(self):
+        """Resolución de empates léxicos prioriza tipo 'dato' sobre 'conversacion'."""
+        import memoria
+        memoria.guardar("Kotlin y Android", "dato")
+        memoria.guardar("Keric preguntó: Charla Android — Madeline respondió: Kotlin y Android", "conversacion")
+
+        resultados = memoria._por_palabras_clave("Kotlin Android")
+        self.assertTrue(len(resultados) >= 2)
+        self.assertEqual(resultados[0][2], "dato")
+
+    # ------------------------------------------------------------
+    # BLOQUE H: Manejo de Correcciones del Usuario
+    # ------------------------------------------------------------
+    async def test_T33_CORR_01_correccion_accion_ejecutada_no_finge_cancelacion(self):
+        """Corrección sobre acción ejecutada abre nuevo objetivo sin fingir deshacer."""
+        with mock.patch.object(ms, "abrir_aplicacion", side_effect=[
+            Resultado(ok=True, mensaje="Steam abierto", estado=EstadoResultado.SUCCESS),
+            Resultado(ok=True, mensaje="Firefox abierto", estado=EstadoResultado.SUCCESS),
+        ]):
+            await ms.procesar_mensaje(ms.ChatRequest(message="Abre Steam"), origen="pc")
+            res_corr = await ms.procesar_mensaje(ms.ChatRequest(message="No, quise decir Firefox"), origen="pc")
+
+            self.assertIn("Firefox", res_corr.response)
+            self.assertNotIn("Steam fue cancelado", res_corr.response)
+            self.assertEqual(ms.acciones_locales_recientes["pc"].args["app_name"], "Firefox")
+
+    async def test_T33_CORR_02_correccion_ambigua_pide_clarificacion(self):
+        """Corrección ambigua sin objetivo pide aclaración sin ejecutar herramientas."""
+        with mock.patch.object(ms, "ejecutar_comando_local") as mock_cmd:
+            res1 = await ms.procesar_mensaje(ms.ChatRequest(message="No, eso no"), origen="pc")
+            self.assertIn("¿qué prefieres que haga?", res1.response)
+            mock_cmd.assert_not_called()
+
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="No, me refería a otra cosa"), origen="pc")
+            self.assertIn("¿qué prefieres que haga?", res2.response)
+            mock_cmd.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
