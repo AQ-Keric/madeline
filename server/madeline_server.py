@@ -122,6 +122,7 @@ class HistorialChatCompat(list):
         super().clear()
         historiales_por_origen["pc"].clear()
         acciones_locales_recientes["pc"] = None
+        memoria_contexto.fijar_ultimo_resultado(None, "pc")
 
     def sincronizar_desde_turnos(self, turnos: list):
         super().clear()
@@ -135,7 +136,8 @@ MAX_HISTORIAL = 3
 
 class MemoriaContextoDict(dict):
     """Diccionario de compatibilidad para memoria_contexto que aísla confirmaciones
-    pendientes por origen ('pc', 'telefono') y aplica un TTL monótono de 30.0 segundos."""
+    pendientes y últimos resultados por origen ('pc', 'telefono') y aplica un TTL monótono
+    de 30.0 segundos a las confirmaciones."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -143,10 +145,18 @@ class MemoriaContextoDict(dict):
             "pc": None,
             "telefono": None,
         }
+        self._ultimos_resultados = {
+            "pc": None,
+            "telefono": None,
+        }
 
     def clear(self):
         super().clear()
         self._confirmaciones = {
+            "pc": None,
+            "telefono": None,
+        }
+        self._ultimos_resultados = {
             "pc": None,
             "telefono": None,
         }
@@ -179,20 +189,35 @@ class MemoriaContextoDict(dict):
             if origen == "pc":
                 super().__setitem__("confirmacion_pendiente", datos)
 
+    def obtener_ultimo_resultado(self, origen: str = "pc") -> Any:
+        return self._ultimos_resultados.get(origen)
+
+    def fijar_ultimo_resultado(self, resultado: Any, origen: str = "pc"):
+        self._ultimos_resultados[origen] = resultado
+        if origen == "pc":
+            super().__setitem__("ultimo_resultado", resultado)
+
     def __getitem__(self, key):
         if key == "confirmacion_pendiente":
             return self.obtener_confirmacion("pc")
+        if key == "ultimo_resultado":
+            return self.obtener_ultimo_resultado("pc")
         return super().__getitem__(key)
 
     def __setitem__(self, key, value):
         if key == "confirmacion_pendiente":
             self.fijar_confirmacion(value, "pc")
+        elif key == "ultimo_resultado":
+            self.fijar_ultimo_resultado(value, "pc")
         else:
             super().__setitem__(key, value)
 
     def get(self, key, default=None):
         if key == "confirmacion_pendiente":
             val = self.obtener_confirmacion("pc")
+            return val if val is not None else default
+        if key == "ultimo_resultado":
+            val = self.obtener_ultimo_resultado("pc")
             return val if val is not None else default
         return super().get(key, default)
 
@@ -4111,7 +4136,7 @@ def ejecutar_comandos_locales(comandos, origen: str = "pc"):
                     "Actualmente está sonando:", ""
                 ).strip()
 
-        memoria_contexto["ultimo_resultado"] = res_norm
+        memoria_contexto.fijar_ultimo_resultado(res_norm, origen=origen)
         acciones_locales_recientes[origen] = AccionLocalReciente(
             comando=nombre,
             args=args,
@@ -4420,11 +4445,12 @@ def contexto_para_pregunta(texto: str, origen: str = "pc") -> str:
                 f"- Estado: {estado_nombre} ({msg}.{evid_str})"
             )
 
-    if memoria_contexto.get("ultimo_resultado") and any(
+    ultimo_res = memoria_contexto.obtener_ultimo_resultado(origen)
+    if ultimo_res and any(
         palabra in t
         for palabra in ["eso", "esa", "ese", "lo anterior", "antes", "respuesta"]
     ):
-        ultimo_str = str(memoria_contexto["ultimo_resultado"])
+        ultimo_str = str(ultimo_res)
         turnos_origen = historiales_por_origen.get(origen, [])
         if turnos_origen and ultimo_str in turnos_origen[-1].asistente:
             return ""
@@ -4848,6 +4874,7 @@ def procesar_repeticion_accion(origen: str = "pc") -> tuple[bool, str]:
         acciones_locales_recientes[origen] = AccionLocalReciente(
             comando=cmd, args=args, resultado=res_norm, timestamp=time.monotonic(), origen=origen
         )
+        memoria_contexto.fijar_ultimo_resultado(res_norm, origen=origen)
         texto = respuesta_local(cmd, args, res_norm)
         return True, texto
 
@@ -4858,6 +4885,7 @@ def procesar_repeticion_accion(origen: str = "pc") -> tuple[bool, str]:
         acciones_locales_recientes[origen] = AccionLocalReciente(
             comando=cmd, args=args, resultado=res_norm, timestamp=time.monotonic(), origen=origen
         )
+        memoria_contexto.fijar_ultimo_resultado(res_norm, origen=origen)
         porc = args.get("porcentaje", args.get("valor", 0))
         return True, f"El volumen ya se encuentra al {porc}%."
 
@@ -4867,6 +4895,7 @@ def procesar_repeticion_accion(origen: str = "pc") -> tuple[bool, str]:
     acciones_locales_recientes[origen] = AccionLocalReciente(
         comando=cmd, args=args, resultado=res_norm, timestamp=time.monotonic(), origen=origen
     )
+    memoria_contexto.fijar_ultimo_resultado(res_norm, origen=origen)
     texto = respuesta_local(cmd, args, res_norm)
     return True, texto
 
@@ -5162,7 +5191,7 @@ async def _procesar_mensaje(
                     fn_name = "respuesta_busqueda"
 
                 resultados_tool.append((fn_name, fn_args, resultado))
-                memoria_contexto["ultimo_resultado"] = str(resultado)
+                memoria_contexto.fijar_ultimo_resultado(str(resultado), origen=origen)
 
             partes_texto = []
             for nombre, args, res in resultados_tool:

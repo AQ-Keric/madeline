@@ -1005,6 +1005,32 @@ class TestStage33ComportamientoConversacional(unittest.IsolatedAsyncioTestCase):
             res_tel = await ms.procesar_mensaje(ms.ChatRequest(message="Consulta teléfono"), origen="telefono")
             self.assertIn("Respuesta teléfono OK", res_tel.response)
 
+    async def test_T33_CONC_04_ultimo_resultado_aislado_entre_pc_y_telefono(self):
+        """ultimo_resultado está estrictamente aislado por origen sin contaminación cruzada."""
+        # 1. Acción en PC fija ultimo_resultado en PC
+        ms.memoria_contexto.fijar_ultimo_resultado("Resultado PC", origen="pc")
+        self.assertEqual(ms.memoria_contexto.obtener_ultimo_resultado("pc"), "Resultado PC")
+        self.assertIsNone(ms.memoria_contexto.obtener_ultimo_resultado("telefono"))
+
+        # 2. Teléfono no tiene fallback ni contaminación desde PC
+        ctx_tel = ms.contexto_para_pregunta("¿por qué dijiste esa respuesta?", origen="telefono")
+        self.assertEqual(ctx_tel, "")
+
+        # 3. PC sí accede a su propio resultado
+        ctx_pc = ms.contexto_para_pregunta("¿por qué dijiste esa respuesta?", origen="pc")
+        self.assertIn("Resultado PC", ctx_pc)
+
+        # 4. Acción en teléfono fija su propio resultado sin contaminar PC
+        ms.memoria_contexto.fijar_ultimo_resultado("Resultado Teléfono", origen="telefono")
+        self.assertEqual(ms.memoria_contexto.obtener_ultimo_resultado("telefono"), "Resultado Teléfono")
+        ctx_tel2 = ms.contexto_para_pregunta("¿por qué dijiste esa respuesta?", origen="telefono")
+        self.assertIn("Resultado Teléfono", ctx_tel2)
+
+        # 5. PC conserva su propio resultado inalterado
+        ctx_pc2 = ms.contexto_para_pregunta("¿por qué dijiste esa respuesta?", origen="pc")
+        self.assertIn("Resultado PC", ctx_pc2)
+        self.assertNotIn("Resultado Teléfono", ctx_pc2)
+
     # ------------------------------------------------------------
     # BLOQUE F: Límites Temporales Exactos (Reloj Monotónico)
     # ------------------------------------------------------------
