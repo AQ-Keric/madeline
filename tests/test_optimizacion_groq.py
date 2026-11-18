@@ -736,28 +736,84 @@ class TestStage33ComportamientoConversacional(unittest.IsolatedAsyncioTestCase):
             res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Otra vez"), origen="pc")
             self.assertEqual(mock_media.call_count, 2)
 
-    async def test_T33_REP_05_mover_ventana_bloqueada_distinto_address(self):
-        """Repetición de mover_ventana bloqueada si el address de foco cambió."""
-        with mock.patch.object(ms.hyprland, "obtener_ventana_activa", side_effect=[
-            {"address": "0x1234", "class": "firefox", "title": "Firefox"},
-            {"address": "0x5678", "class": "alacritty", "title": "Terminal"},
-        ]), mock.patch.object(ms.hyprland, "enviar_comando_socket", return_value=True):
+    async def test_T33_REP_05_mover_ventana_bloqueada_si_no_existe_o_sin_address(self):
+        """Repetición bloqueada si la ventana original no existe o no tiene address."""
+        # 1. Sin address
+        res_sin_addr = Resultado(ok=True, mensaje="Ventana movida", evidencia={"escritorio": 2}, estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("mover_ventana", {"app_name": "esta ventana", "escritorio": 2}, res_sin_addr, time.monotonic(), "pc")
+        res1 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+        self.assertIn("No se pudo identificar la ventana original", res1.response)
 
-            await ms.procesar_mensaje(ms.ChatRequest(message="Mueve esta ventana al escritorio 2"), origen="pc")
-            self.assertEqual(ms.acciones_locales_recientes["pc"].resultado.evidencia.get("address"), "0x1234")
-
+        # 2. Con address pero ventana ya no existe en listar_ventanas
+        res_ok = Resultado(ok=True, mensaje="Ventana movida", evidencia={"address": "0x1234", "escritorio": 2}, estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("mover_ventana", {"app_name": "esta ventana", "escritorio": 2}, res_ok, time.monotonic(), "pc")
+        with mock.patch.object(ms.hyprland, "listar_ventanas", return_value=[{"address": "0x9999", "class": "terminal"}]), \
+             mock.patch.object(ms.hyprland, "enviar_comando_socket") as mock_sock:
             res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
-            self.assertIn("El foco de la ventana cambió", res2.response)
+            self.assertIn("ya no se encuentra abierta", res2.response)
+            mock_sock.assert_not_called()
 
     async def test_T33_REP_06_mover_ventana_permitida_mismo_address(self):
         """Repetición de mover_ventana permitida si conserva identidad del address."""
+        ventanas_abiertas = [{"address": "0x1234", "class": "firefox", "title": "Firefox"}]
         with mock.patch.object(ms.hyprland, "obtener_ventana_activa", return_value={
             "address": "0x1234", "class": "firefox", "title": "Firefox"
-        }), mock.patch.object(ms.hyprland, "enviar_comando_socket", return_value=True):
+        }), mock.patch.object(ms.hyprland, "listar_ventanas", return_value=ventanas_abiertas), \
+           mock.patch.object(ms.hyprland, "enviar_comando_socket", return_value=True) as mock_socket:
 
             await ms.procesar_mensaje(ms.ChatRequest(message="Mueve esta ventana al escritorio 2"), origen="pc")
             res2 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
             self.assertIn("escritorio 2", res2.response)
+            self.assertIn("address:0x1234", mock_socket.call_args[0][0])
+
+    async def test_T33_REP_06b_perdio_foco_pero_sigue_abierta_mueve_address_original(self):
+        """La ventana original sigue existiendo pero perdió el foco: se mueve sobre su address original."""
+        res_ok = Resultado(ok=True, mensaje="Ventana movida", evidencia={"address": "0x1234", "class": "firefox", "escritorio": 2}, estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("mover_ventana", {"app_name": "esta ventana", "escritorio": 2}, res_ok, time.monotonic(), "pc")
+
+        # Foco activo es OTRA ventana ("0x9999", terminal)
+        ventana_enfocada = {"address": "0x9999", "class": "alacritty", "title": "Terminal"}
+        ventanas_abiertas = [
+            {"address": "0x1234", "class": "firefox", "title": "Firefox"},
+            ventana_enfocada,
+        ]
+
+        with mock.patch.object(ms.hyprland, "obtener_ventana_activa", return_value=ventana_enfocada), \
+             mock.patch.object(ms.hyprland, "listar_ventanas", return_value=ventanas_abiertas), \
+             mock.patch.object(ms.hyprland, "enviar_comando_socket", return_value=True) as mock_socket:
+
+            res = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertIn("escritorio 2", res.response)
+            # Verifica que el comando contiene explícitamente el address original y NO el de la enfocada
+            self.assertEqual(mock_socket.call_count, 1)
+            payload_enviado = mock_socket.call_args[0][0]
+            self.assertIn("address:0x1234", payload_enviado)
+            self.assertNotIn("0x9999", payload_enviado)
+
+    async def test_T33_REP_06c_consulta_ventanas_falla_bloquea_repeticion(self):
+        """Fallo al consultar ventanas abiertas bloquea la repetición."""
+        res_ok = Resultado(ok=True, mensaje="Ventana movida", evidencia={"address": "0x1234", "class": "firefox", "escritorio": 2}, estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("mover_ventana", {"app_name": "esta ventana", "escritorio": 2}, res_ok, time.monotonic(), "pc")
+
+        with mock.patch.object(ms.hyprland, "listar_ventanas", side_effect=RuntimeError("Error socket")), \
+             mock.patch.object(ms.hyprland, "enviar_comando_socket") as mock_socket:
+
+            res = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertIn("No se pudo consultar la lista de ventanas", res.response)
+            mock_socket.assert_not_called()
+
+    def test_T33_REP_06d_despacho_hyprland_contiene_address_explicito(self):
+        """Comando de despacho a Hyprland contiene explícitamente address:<address>."""
+        payload_lua = ms.hyprland.payload_dispatch_move_address("0xABCD", 4)
+        self.assertIn("address:0xABCD", payload_lua)
+        cmd_lua = ms.hyprland.comando_hypr_movetoworkspacesilent_address("0xABCD", 4)
+        self.assertTrue(any("address:0xABCD" in arg for arg in cmd_lua))
+
+        with mock.patch.object(ms.hyprland, "usa_hyprland_lua", return_value=False):
+            payload_legacy = ms.hyprland.payload_dispatch_move_address("0xABCD", 4)
+            self.assertEqual(payload_legacy, "dispatch movetoworkspacesilent 4,address:0xABCD")
+            cmd_legacy = ms.hyprland.comando_hypr_movetoworkspacesilent_address("0xABCD", 4)
+            self.assertEqual(cmd_legacy, ["hyprctl", "dispatch", "movetoworkspacesilent", "4,address:0xABCD"])
 
     async def test_T33_REP_07_acciones_destructivas_exigen_confirmacion_en_repeticion(self):
         """Acciones destructivas exigen confirmación en repetición."""
@@ -769,6 +825,72 @@ class TestStage33ComportamientoConversacional(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Confirmas que quieres apagar el sistema", res.response)
             self.assertIsNotNone(ms.memoria_contexto.obtener_confirmacion("pc"))
             mock_cmd.assert_not_called()
+
+    def test_T33_REP_07b_confirmacion_valida_exactamente_30s(self):
+        """Confirmación destructiva es válida exactamente a los 30.0 segundos."""
+        t0 = 1000.0
+        with mock.patch.object(time, "monotonic", return_value=t0):
+            ms.memoria_contexto.fijar_confirmacion({"accion": "apagar"}, origen="pc")
+
+        with mock.patch.object(time, "monotonic", return_value=t0 + 30.0):
+            cmd = ms.router_local("sí", origen="pc")
+            self.assertEqual(cmd, [("energia", {"accion": "apagar"})])
+            self.assertIsNone(ms.memoria_contexto.obtener_confirmacion("pc"))
+
+    def test_T33_REP_07c_confirmacion_expirada_tras_30s(self):
+        """Confirmación destructiva expira después de los 30.0 segundos."""
+        t0 = 1000.0
+        with mock.patch.object(time, "monotonic", return_value=t0):
+            ms.memoria_contexto.fijar_confirmacion({"accion": "apagar"}, origen="pc")
+
+        with mock.patch.object(time, "monotonic", return_value=t0 + 30.01):
+            cmd = ms.router_local("sí", origen="pc")
+            self.assertEqual(cmd, [])
+            self.assertIsNone(ms.memoria_contexto.obtener_confirmacion("pc"))
+
+    def test_T33_REP_07d_telefono_no_consume_confirmacion_pc(self):
+        """Confirmación pendiente en PC no puede ser consumida desde teléfono."""
+        ms.router_local("apaga el pc", origen="pc")
+        self.assertEqual(ms.memoria_contexto.obtener_confirmacion("pc"), {"accion": "apagar"})
+        self.assertIsNone(ms.memoria_contexto.obtener_confirmacion("telefono"))
+
+        # Teléfono dice "sí"
+        cmd_tel = ms.router_local("sí", origen="telefono")
+        self.assertEqual(cmd_tel, [])
+        self.assertEqual(ms.memoria_contexto.obtener_confirmacion("pc"), {"accion": "apagar"})
+
+        # PC dice "sí" y sí consume
+        cmd_pc = ms.router_local("sí", origen="pc")
+        self.assertEqual(cmd_pc, [("energia", {"accion": "apagar"})])
+        self.assertIsNone(ms.memoria_contexto.obtener_confirmacion("pc"))
+
+    def test_T33_REP_07e_dos_confirmaciones_consecutivas_no_duplican_accion(self):
+        """Dos confirmaciones afirmativas consecutivas no duplican la acción destructiva."""
+        ms.router_local("apaga el pc", origen="pc")
+        cmd1 = ms.router_local("sí", origen="pc")
+        self.assertEqual(cmd1, [("energia", {"accion": "apagar"})])
+
+        # Segundo "sí" consecutivo
+        cmd2 = ms.router_local("sí", origen="pc")
+        self.assertEqual(cmd2, [])
+
+    async def test_T33_REP_07f_accion_destructiva_ejecutada_exige_nueva_confirmacion_al_repetir(self):
+        """Acción destructiva ejecutada exige un nuevo ciclo completo de confirmación al repetirse."""
+        res_ok = Resultado(ok=True, mensaje="Apagando", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("energia", {"accion": "apagar"}, res_ok, time.monotonic(), "pc")
+
+        with mock.patch.object(ms, "ejecutar_comando_local", return_value="Apagando") as mock_exec:
+            # Repetición exige confirmación
+            res1 = await ms.procesar_mensaje(ms.ChatRequest(message="Hazlo de nuevo"), origen="pc")
+            self.assertIn("Confirmas que quieres apagar el sistema", res1.response)
+            mock_exec.assert_not_called()
+            self.assertEqual(ms.memoria_contexto.obtener_confirmacion("pc"), {"accion": "apagar"})
+
+            # Usuario confirma con "sí"
+            res2 = await ms.procesar_mensaje(ms.ChatRequest(message="sí"), origen="pc")
+            self.assertIn("Apagando", res2.response)
+            mock_exec.assert_called_once_with("energia", {"accion": "apagar"})
+            self.assertIsNone(ms.memoria_contexto.obtener_confirmacion("pc"))
 
     # ------------------------------------------------------------
     # BLOQUE C: Semántica de Estados PENDING y FAILURE

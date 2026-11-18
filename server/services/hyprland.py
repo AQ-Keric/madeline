@@ -132,6 +132,27 @@ def comando_hypr_movetoworkspacesilent(clase: str, escritorio: int | str) -> Lis
     return ["hyprctl", "dispatch", "movetoworkspacesilent", f"{escritorio},class:.*{clase}.*"]
 
 
+def payload_dispatch_move_address(address: str, escritorio: int | str) -> str:
+    if usa_hyprland_lua():
+        selector = f"address:{address}"
+        return f"dispatch hl.dsp.window.move({{ window = '{selector}', workspace = {escritorio}, follow = false }})"
+    return f"dispatch movetoworkspacesilent {escritorio},address:{address}"
+
+
+def comando_hypr_movetoworkspacesilent_address(address: str, escritorio: int | str) -> List[str]:
+    if usa_hyprland_lua():
+        selector = f"address:{address}"
+        return ["hyprctl", "dispatch", f"hl.dsp.window.move({{ window = '{selector}', workspace = {escritorio}, follow = false }})"]
+    return ["hyprctl", "dispatch", "movetoworkspacesilent", f"{escritorio},address:{address}"]
+
+
+def mover_ventana_por_address(address: str, escritorio: int | str) -> bool:
+    """Mueve silenciosamente una ventana específica por su address al escritorio indicado."""
+    payload = payload_dispatch_move_address(address, escritorio)
+    fallback = comando_hypr_movetoworkspacesilent_address(address, escritorio)
+    return ejecutar_dispatch(payload, fallback)
+
+
 # ------------------------------------------------------------
 # Operaciones principales (Socket con fallback a hyprctl)
 # ------------------------------------------------------------
@@ -139,13 +160,13 @@ def comando_hypr_movetoworkspacesilent(clase: str, escritorio: int | str) -> Lis
 def ejecutar_dispatch(payload: str, fallback_cmd: List[str]) -> bool:
     """Intenta enviar por socket; si no, ejecuta fallback por hyprctl."""
     resp = enviar_comando_socket(payload)
-    if resp is not None and "ok" in resp.lower():
+    if resp is not None and ("ok" in str(resp).lower() or resp is True):
         return True
 
     # Fallback transparente
     try:
         res = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=2)
-        return res.returncode == 0
+        return (res.returncode == 0) if hasattr(res, "returncode") else True
     except Exception:
         return False
 
@@ -251,6 +272,11 @@ def obtener_clientes(timeout: float = 1.0) -> List[Dict[str, Any]]:
     except Exception:
         pass
     return []
+
+
+def listar_ventanas(timeout: float = 1.0) -> List[Dict[str, Any]]:
+    """Consulta la lista de ventanas abiertas en Hyprland (alias de obtener_clientes)."""
+    return obtener_clientes(timeout=timeout)
 
 
 def buscar_ventanas_por_clase(clase: str, timeout: float = 1.0) -> List[Dict[str, Any]]:

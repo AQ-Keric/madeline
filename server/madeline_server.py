@@ -1302,6 +1302,10 @@ def comando_hypr_movetoworkspacesilent(clase: str, escritorio: int | str) -> lis
     return ["hyprctl", "dispatch", "movetoworkspacesilent", f"{escritorio},class:.*{clase}.*"]
 
 
+def comando_hypr_movetoworkspacesilent_address(address: str, escritorio: int | str) -> list[str]:
+    return hyprland.comando_hypr_movetoworkspacesilent_address(address, escritorio)
+
+
 def abrir_url_en_navegador(url: str) -> bool:
     """Abre UNA URL como pestaña nueva en la ventana ya abierta del
     navegador ("-new-tab", no una ventana aparte).
@@ -2002,10 +2006,18 @@ def mover_ventana(app_name: str, escritorio: int | str) -> Resultado:
             estado=EstadoResultado.FAILURE,
         )
 
-    if not address:
+    if not address and clase:
         ventana_activa = hyprland.obtener_ventana_activa()
-        if ventana_activa and ventana_activa.get("address"):
+        if ventana_activa and clase.lower() in str(ventana_activa.get("class", "")).lower():
             address = ventana_activa.get("address")
+        else:
+            try:
+                clientes = hyprland.obtener_clientes()
+                c_match = next((c for c in clientes if isinstance(c, dict) and clase.lower() in str(c.get("class", "")).lower()), None)
+                if c_match:
+                    address = c_match.get("address")
+            except Exception:
+                pass
 
     try:
         esc_str = str(escritorio).strip().lower()
@@ -4786,15 +4798,58 @@ def procesar_repeticion_accion(origen: str = "pc") -> tuple[bool, str]:
     if cmd in ("volumen", "ajustar_volumen") and args.get("accion") in ("mutear", "mute", "toggle"):
         return True, "El comando de silencio es una alternancia. ¿Quieres silenciar o reactivar el sonido?"
 
-    # Mover ventana: verificar address de la ventana activa
+    # Mover ventana: verificar existencia e identidad de la ventana original por address
     if cmd == "mover_ventana":
-        ventana_actual = hyprland.obtener_ventana_activa()
-        if not ventana_actual:
-            return True, "El foco de la ventana cambió o no se pudo identificar. Por favor indícame qué ventana quieres mover y a qué escritorio."
         address_previo = (getattr(res_ant, "evidencia", {}) or {}).get("address")
-        address_actual = ventana_actual.get("address")
-        if not address_previo or address_actual != address_previo:
-            return True, "El foco de la ventana cambió. Por favor indícame qué ventana quieres mover y a qué escritorio."
+        if not address_previo:
+            return True, "No se pudo identificar la ventana original. Por favor indícame qué ventana quieres mover y a qué escritorio."
+
+        try:
+            ventanas = hyprland.listar_ventanas()
+        except Exception:
+            ventanas = None
+
+        if ventanas is None:
+            return True, "No se pudo consultar la lista de ventanas en el sistema. Por favor indícame qué ventana quieres mover y a qué escritorio."
+
+        ventana_target = next((v for v in ventanas if isinstance(v, dict) and v.get("address") == address_previo), None)
+        if not ventana_target:
+            return True, "La ventana original ya no se encuentra abierta. Por favor indícame qué ventana quieres mover y a qué escritorio."
+
+        escritorio = args.get("escritorio")
+        esc_str = str(escritorio).strip().lower()
+        if esc_str in ("anterior", "previo", "atras", "atrás"):
+            activo = hyprland.obtener_escritorio_activo() or 1
+            esc_final = max(1, activo - 1)
+        elif esc_str in ("siguiente", "proximo", "próximo", "adelante"):
+            activo = hyprland.obtener_escritorio_activo() or 1
+            esc_final = activo + 1
+        else:
+            try:
+                esc_final = int(escritorio)
+            except (TypeError, ValueError):
+                esc_final = escritorio
+
+        app_name = ventana_target.get("title") or ventana_target.get("class") or args.get("app_name", "esta ventana")
+        despachado = hyprland.mover_ventana_por_address(address_previo, esc_final)
+
+        res_norm = Resultado(
+            ok=despachado,
+            mensaje=f"Ventana de {app_name} movida al escritorio {esc_final}." if despachado else f"No pude mover la ventana al escritorio {esc_final}.",
+            evidencia={
+                "app_name": app_name,
+                "clase": ventana_target.get("class", ""),
+                "escritorio": esc_final,
+                "despachado": despachado,
+                "address": address_previo,
+            },
+            estado=EstadoResultado.SUCCESS if despachado else EstadoResultado.FAILURE,
+        )
+        acciones_locales_recientes[origen] = AccionLocalReciente(
+            comando=cmd, args=args, resultado=res_norm, timestamp=time.monotonic(), origen=origen
+        )
+        texto = respuesta_local(cmd, args, res_norm)
+        return True, texto
 
     # Para volumen absoluto (setear / fijar): idempotente
     if cmd in ("volumen", "ajustar_volumen") and args.get("accion") in ("setear", "fijar"):
