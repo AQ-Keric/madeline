@@ -10,13 +10,26 @@ Verificaciones obligatorias:
 7. Protección contra ejecución accidental de herramientas (Stage 1 y 2).
 8. Confirmación de que tool_choice no se envía cuando no existen herramientas.
 """
+import asyncio
 import json
+import time
 import unittest
 from unittest import mock
 
+from fastapi import HTTPException
+from groq import APITimeoutError, RateLimitError
+import httpx
 import entorno  # noqa: F401
 import madeline_server as ms
 from resultado import EstadoResultado, Resultado
+
+
+def error_sin_cuota():
+    return RateLimitError(
+        "rate limit",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com")),
+        body=None,
+    )
 
 
 def nombres_tools(texto: str) -> set[str]:
@@ -280,6 +293,285 @@ class TestToolChoiceOmitidoSinHerramientas(unittest.IsolatedAsyncioTestCase):
             kwargs = mock_create.call_args[1]
             self.assertNotIn("tools", kwargs)
             self.assertNotIn("tool_choice", kwargs)
+
+
+class TestHistorialConversacionalStage32(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        patcher = mock.patch.object(ms, "procesar_salida_de_voz", mock.AsyncMock(return_value=None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._limpiar_estado_global)
+        self._limpiar_estado_global()
+
+    def _limpiar_estado_global(self):
+        ms.historial_chat.clear()
+        ms.historiales_por_origen["pc"].clear()
+        ms.historiales_por_origen["telefono"].clear()
+        ms.acciones_locales_recientes["pc"] = None
+        ms.acciones_locales_recientes["telefono"] = None
+
+    async def test_payload_groq_orden_estricto_cronologico(self):
+        """El array messages enviado a Groq debe ser estrictamente U_ant -> A_ant -> U_act."""
+        with mock.patch.object(ms.client.chat.completions, "create") as mock_create:
+            mock_create.return_value = mock_respuesta_groq("Fue una matemática pionera.")
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿Quién fue Ada Lovelace?"), origen="pc")
+
+            mock_create.return_value = mock_respuesta_groq("Nació en 1815.")
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿En qué año nació?"), origen="pc")
+
+            mensajes = mock_create.call_args[1]["messages"]
+            sin_sistema = [m for m in mensajes if m["role"] != "system"]
+            roles = [m["role"] for m in sin_sistema]
+            contenidos = [m["content"] for m in sin_sistema]
+
+            self.assertEqual(roles, ["user", "assistant", "user"])
+            self.assertEqual(contenidos, ["¿Quién fue Ada Lovelace?", "Fue una matemática pionera.", "¿En qué año nació?"])
+            # El mensaje actual SIEMPRE debe ser el último:
+            self.assertEqual(mensajes[-1]["role"], "user")
+            self.assertEqual(mensajes[-1]["content"], "¿En qué año nació?")
+
+    async def test_aislamiento_historial_pc_y_telefono(self):
+        """Los mensajes de PC y teléfono no deben mezclarse."""
+        with mock.patch.object(ms.client.chat.completions, "create") as mock_create:
+            mock_create.return_value = mock_respuesta_groq("Respuesta PC")
+            await ms.procesar_mensaje(ms.ChatRequest(message="Consulta desde PC"), origen="pc")
+
+            mock_create.return_value = mock_respuesta_groq("Respuesta Teléfono")
+            await ms.procesar_mensaje(ms.ChatRequest(message="Consulta desde Teléfono"), origen="telefono")
+
+            self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+            self.assertEqual(ms.historiales_por_origen["pc"][0].usuario, "Consulta desde PC")
+            self.assertEqual(ms.historiales_por_origen["pc"][0].asistente, "Respuesta PC")
+
+            self.assertEqual(len(ms.historiales_por_origen["telefono"]), 1)
+            self.assertEqual(ms.historiales_por_origen["telefono"][0].usuario, "Consulta desde Teléfono")
+            self.assertEqual(ms.historiales_por_origen["telefono"][0].asistente, "Respuesta Teléfono")
+
+            # historial_chat solo proyecta PC
+            self.assertEqual(len(ms.historial_chat), 2)
+            self.assertEqual(ms.historial_chat[0]["content"], "Consulta desde PC")
+
+    async def test_historial_chat_compat_clear_solo_afecta_pc(self):
+        """clear() en historial_chat debe vaciar PC sin alterar el historial del teléfono."""
+        ms.historiales_por_origen["pc"].append(ms.TurnoConversacion("U_pc", "A_pc", time.time()))
+        ms.historiales_por_origen["telefono"].append(ms.TurnoConversacion("U_tel", "A_tel", time.time()))
+        ms.historial_chat.sincronizar_desde_turnos(ms.historiales_por_origen["pc"])
+
+        self.assertEqual(len(ms.historial_chat), 2)
+        self.assertEqual(len(ms.historiales_por_origen["telefono"]), 1)
+
+        ms.historial_chat.clear()
+
+        self.assertEqual(ms.historial_chat, [])
+        self.assertEqual(ms.historiales_por_origen["pc"], [])
+        self.assertEqual(len(ms.historiales_por_origen["telefono"]), 1)
+        self.assertEqual(ms.historiales_por_origen["telefono"][0].usuario, "U_tel")
+
+    async def test_accion_fallida_sobrescribe_inmediatamente_evidencia_exitosa(self):
+        """Una acción con FAILURE debe sobrescribir una acción previa con SUCCESS."""
+        # Acción 1 exitosa:
+        ms.ejecutar_comandos_locales([("volumen", {"accion": "fijar", "porcentaje": 50})], origen="pc")
+        self.assertIsNotNone(ms.acciones_locales_recientes["pc"])
+        self.assertTrue(ms.acciones_locales_recientes["pc"].resultado.ok)
+
+        # Acción 2 fallida:
+        fallo = Resultado(ok=False, mensaje="No se encontró la aplicación blender", estado=EstadoResultado.FAILURE)
+        with mock.patch.object(ms, "ejecutar_comando_local", return_value=fallo):
+            ms.ejecutar_comandos_locales([("abrir_aplicacion", {"app": "blender"})], origen="pc")
+
+        self.assertIsNotNone(ms.acciones_locales_recientes["pc"])
+        self.assertEqual(ms.acciones_locales_recientes["pc"].comando, "abrir_aplicacion")
+        self.assertEqual(ms.acciones_locales_recientes["pc"].resultado.estado, EstadoResultado.FAILURE)
+
+        ctx = ms.contexto_para_pregunta("¿se abrió?", origen="pc")
+        self.assertIn("FAILURE", ctx)
+        self.assertIn("blender", ctx)
+        self.assertNotIn("volumen", ctx)
+
+    async def test_accion_local_seguimiento_estados_success_pending_failure(self):
+        """Verifica el formato del contexto para cada estado de EstadoResultado."""
+        # SUCCESS
+        res_ok = Resultado(ok=True, mensaje="Volumen fijado al 50%", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"porcentaje": 50}, res_ok, time.time(), "pc")
+        ctx_ok = ms.contexto_para_pregunta("¿qué volumen quedó?", origen="pc")
+        self.assertIn("SUCCESS", ctx_ok)
+        self.assertIn("Volumen fijado al 50%", ctx_ok)
+
+        # PENDING
+        res_pending = Resultado(ok=True, mensaje="Abriendo Spotify", evidencia={"app": "spotify"}, estado=EstadoResultado.PENDING)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("abrir_aplicacion", {"app": "spotify"}, res_pending, time.time(), "pc")
+        ctx_pending = ms.contexto_para_pregunta("¿se abrió la ventana?", origen="pc")
+        self.assertIn("PENDING", ctx_pending)
+        self.assertIn("Abriendo Spotify", ctx_pending)
+
+        # FAILURE
+        res_fail = Resultado(ok=False, mensaje="Comando no reconocido", estado=EstadoResultado.FAILURE)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("desconocido", {}, res_fail, time.time(), "pc")
+        ctx_fail = ms.contexto_para_pregunta("¿funcionó?", origen="pc")
+        self.assertIn("FAILURE", ctx_fail)
+
+    async def test_accion_local_expirada_no_se_inyecta(self):
+        """Acciones de más de 120 segundos no deben inyectar contexto."""
+        res_ok = Resultado(ok=True, mensaje="Volumen al 50%", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente(
+            "volumen", {"porcentaje": 50}, res_ok, time.time() - 150.0, "pc"
+        )
+        ctx = ms.contexto_para_pregunta("¿qué volumen quedó?", origen="pc")
+        self.assertEqual(ctx, "")
+
+    async def test_aislamiento_acciones_locales_pc_y_telefono(self):
+        """Las acciones ejecutadas en PC no deben inyectar contexto al teléfono."""
+        res_ok = Resultado(ok=True, mensaje="Abriendo Steam", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("abrir_aplicacion", {"app": "steam"}, res_ok, time.time(), "pc")
+
+        ctx_tel = ms.contexto_para_pregunta("¿se abrió?", origen="telefono")
+        self.assertEqual(ctx_tel, "")
+
+    async def test_groq_timeout_nativo_libera_lock_y_no_corrompe_historial(self):
+        """Si Groq lanza APITimeoutError, se levanta HTTP 504, el lock se libera y el historial queda limpio."""
+        req_mock = mock.MagicMock()
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=APITimeoutError(request=req_mock)):
+            with self.assertRaises(HTTPException) as ctx:
+                await ms.procesar_mensaje(ms.ChatRequest(message="¿cuál es la masa de Júpiter?"), origen="pc")
+
+            self.assertEqual(ctx.exception.status_code, 504)
+            self.assertIn("Tiempo de espera agotado", ctx.exception.detail)
+
+        # Historial permanece limpio (sin turno incompleto):
+        self.assertEqual(ms.historiales_por_origen["pc"], [])
+        self.assertEqual(ms.historial_chat, [])
+
+        # El lock debe estar liberado:
+        self.assertFalse(ms.obtener_lock_origen("pc").locked())
+
+        # Una petición subsiguiente debe funcionar con normalidad:
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Respuesta OK")):
+            resp = await ms.procesar_mensaje(ms.ChatRequest(message="Hola de nuevo"), origen="pc")
+            self.assertEqual(resp.response, "Respuesta OK")
+            self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+
+    async def test_rollback_atomico_ante_error_500_o_excepcion(self):
+        """Si Groq falla con 500, no se agregan preguntas huérfanas al historial."""
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=Exception("Falla interna Groq 500")):
+            with self.assertRaises(HTTPException) as ctx:
+                await ms.procesar_mensaje(ms.ChatRequest(message="Pregunta fallida"), origen="pc")
+            self.assertEqual(ctx.exception.status_code, 500)
+
+        # No hay preguntas huérfanas en historial
+        self.assertEqual(ms.historiales_por_origen["pc"], [])
+        self.assertEqual(ms.historial_chat, [])
+
+        # Siguiente petición no tiene dos usuarios consecutivos
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Respuesta normal")) as mock_create:
+            await ms.procesar_mensaje(ms.ChatRequest(message="Nueva pregunta"), origen="pc")
+            mensajes = mock_create.call_args[1]["messages"]
+            usuarios = [m["content"] for m in mensajes if m["role"] == "user"]
+            self.assertEqual(usuarios, ["Nueva pregunta"])
+
+    async def test_cancelacion_asyncio_libera_lock_y_no_corrompe(self):
+        """Verifica que si la corrutina recibe CancelledError (simulado con side_effect en el mock),
+        el lock se libera al salir del contexto y no se guarda turno en el historial.
+
+        Nota: Este test evalúa la propagación de CancelledError en asyncio y la liberación del lock;
+        no prueba una cancelación real a nivel de socket HTTP ni la interrupción del hilo en el SO."""
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                await ms.procesar_mensaje(ms.ChatRequest(message="Cancelación"), origen="pc")
+
+        self.assertEqual(ms.historiales_por_origen["pc"], [])
+        self.assertFalse(ms.obtener_lock_origen("pc").locked())
+
+    async def test_concurrencia_serializacion_mismo_origen(self):
+        """Dos solicitudes del mismo origen se serializan ordenadamente bajo el Lock."""
+        orden = []
+
+        def side_effect_lento(*args, **kwargs):
+            orden.append("llamada_groq")
+            return mock_respuesta_groq("Respuesta")
+
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=side_effect_lento):
+            tarea1 = asyncio.create_task(ms.procesar_mensaje(ms.ChatRequest(message="Pregunta 1"), origen="pc"))
+            tarea2 = asyncio.create_task(ms.procesar_mensaje(ms.ChatRequest(message="Pregunta 2"), origen="pc"))
+            await asyncio.gather(tarea1, tarea2)
+
+        self.assertEqual(orden, ["llamada_groq", "llamada_groq"])
+        self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+        # La última pregunta fue la 2 (poda a MAX_TURNOS=1)
+        self.assertEqual(ms.historiales_por_origen["pc"][0].usuario, "Pregunta 2")
+
+    async def test_groq_tools_no_contaminan_acciones_locales_recientes(self):
+        """Las herramientas ejecutadas por Groq no deben alterar acciones_locales_recientes."""
+        # Se establece una acción local previa:
+        res_ok = Resultado(ok=True, mensaje="Volumen al 40%", estado=EstadoResultado.SUCCESS)
+        ms.acciones_locales_recientes["pc"] = ms.AccionLocalReciente("volumen", {"porcentaje": 40}, res_ok, time.time(), "pc")
+
+        # Llamada a Groq con tool call (bypaseando router_local):
+        call_mock = mock.MagicMock()
+        call_mock.function.name = "info_cancion"
+        call_mock.function.arguments = "{}"
+
+        with mock.patch.object(ms, "router_local", return_value=[]), \
+             mock.patch.object(ms.client.chat.completions, "create") as mock_create, \
+             mock.patch.dict(ms.TOOLS_FUNCIONES, {"info_cancion": mock.Mock(return_value="Actualmente está sonando: Bohemian Rhapsody")}):
+            mock_create.return_value = mock_respuesta_groq("", tool_calls=[call_mock])
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿Qué canción está sonando?"), origen="pc")
+
+        # acciones_locales_recientes sigue siendo la acción local original:
+        self.assertEqual(ms.acciones_locales_recientes["pc"].comando, "volumen")
+
+    async def test_cuota_agotada_pc_con_turno_previo_conserva_historial(self):
+        """Si ocurre falta de cuota en PC, el turno anterior completado debe preservarse íntegro en ambos historiales."""
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Fue un filósofo griego.")):
+            await ms.procesar_mensaje(ms.ChatRequest(message="¿Quién fue Pitágoras?"), origen="pc")
+
+        self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+        self.assertEqual(len(ms.historial_chat), 2)
+
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=error_sin_cuota()):
+            resp = await ms.procesar_mensaje(ms.ChatRequest(message="¿Qué es la física cuántica?"), origen="pc")
+
+        self.assertIn("cuota", resp.response)
+        # El turno previo debe seguir intacto en ambos:
+        self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+        self.assertEqual(ms.historiales_por_origen["pc"][0].usuario, "¿Quién fue Pitágoras?")
+        self.assertEqual(ms.historiales_por_origen["pc"][0].asistente, "Fue un filósofo griego.")
+
+        self.assertEqual(len(ms.historial_chat), 2)
+        self.assertEqual(ms.historial_chat[0], {"role": "user", "content": "¿Quién fue Pitágoras?"})
+        self.assertEqual(ms.historial_chat[1], {"role": "assistant", "content": "Fue un filósofo griego."})
+
+    async def test_cuota_agotada_telefono_con_turno_previo_conserva_historial(self):
+        """Si ocurre falta de cuota en teléfono, el turno anterior en el teléfono debe permanecer intacto."""
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Respuesta móvil")):
+            await ms.procesar_mensaje(ms.ChatRequest(message="Consulta móvil"), origen="telefono")
+
+        self.assertEqual(len(ms.historiales_por_origen["telefono"]), 1)
+
+        with mock.patch.object(ms.client.chat.completions, "create", side_effect=error_sin_cuota()):
+            resp = await ms.procesar_mensaje(ms.ChatRequest(message="Otra consulta móvil"), origen="telefono")
+
+        self.assertIn("cuota", resp.response)
+        self.assertEqual(len(ms.historiales_por_origen["telefono"]), 1)
+        self.assertEqual(ms.historiales_por_origen["telefono"][0].usuario, "Consulta móvil")
+        self.assertEqual(ms.historiales_por_origen["telefono"][0].asistente, "Respuesta móvil")
+
+    async def test_cancelacion_durante_salida_voz_mantiene_turno_confirmado(self):
+        """Si la tarea se cancela durante la síntesis/reproducción de voz tras una respuesta exitosa de Groq, el turno permanece confirmado."""
+        with mock.patch.object(ms.client.chat.completions, "create", return_value=mock_respuesta_groq("Respuesta confirmada")), \
+             mock.patch.object(ms, "procesar_salida_de_voz", side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                await ms.procesar_mensaje(ms.ChatRequest(message="Pregunta con cancelación en voz"), origen="pc")
+
+        # El turno fue confirmado antes de procesar_salida_de_voz y permanece guardado:
+        self.assertEqual(len(ms.historiales_por_origen["pc"]), 1)
+        self.assertEqual(ms.historiales_por_origen["pc"][0].usuario, "Pregunta con cancelación en voz")
+        self.assertEqual(ms.historiales_por_origen["pc"][0].asistente, "Respuesta confirmada")
+
+        self.assertEqual(len(ms.historial_chat), 2)
+        self.assertEqual(ms.historial_chat[1]["content"], "Respuesta confirmada")
+
+        # El lock debe liberarse limpiamente:
+        self.assertFalse(ms.obtener_lock_origen("pc").locked())
 
 
 if __name__ == "__main__":

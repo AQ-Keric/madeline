@@ -20,12 +20,13 @@ import base64
 import unicodedata
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 import edge_tts
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from groq import Groq, RateLimitError
+from groq import Groq, RateLimitError, APITimeoutError
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,7 +52,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("Falta GROQ_API_KEY en el archivo .env")
 
-client = Groq(api_key=GROQ_API_KEY)
+TIMEOUT_GROQ = 20.0
+client = Groq(api_key=GROQ_API_KEY, timeout=TIMEOUT_GROQ, max_retries=1)
 
 # Modelo para lo que el router local no resuelve (preguntas libres,
 # comandos ambiguos). Los comandos simples NO llegan a Groq.
@@ -60,11 +62,68 @@ MODEL = "openai/gpt-oss-120b"
 # de junio de 2026). Este es el reemplazo que ellos mismos recomiendan
 # para casos con function calling — sigue soportando tools igual.
 
-# Último turno completo (pregunta + respuesta) más el mensaje actual.
-# Con 2 se perdía la pregunta anterior y Groq veía solo su propia
-# respuesta, así que las preguntas de seguimiento no funcionaban.
-# Los comandos locales no usan esta memoria.
-historial_chat = []
+
+@dataclass
+class TurnoConversacion:
+    usuario: str
+    asistente: str
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class AccionLocalReciente:
+    comando: str
+    args: dict
+    resultado: Any
+    timestamp: float = field(default_factory=time.time)
+    origen: str = "pc"
+
+
+historiales_por_origen = {
+    "pc": [],
+    "telefono": [],
+}
+MAX_TURNOS = 1
+
+acciones_locales_recientes = {
+    "pc": None,
+    "telefono": None,
+}
+
+_LOCKS_ORIGEN = {
+    "pc": asyncio.Lock(),
+    "telefono": asyncio.Lock(),
+}
+
+
+def obtener_lock_origen(origen: str) -> asyncio.Lock:
+    """Devuelve el lock de asyncio para serializar solicitudes del origen dado.
+    Nota de concurrencia: Protege la secuencia de corrutinas en el event loop.
+    Si una solicitud es cancelada, sale de 'async with' y libera este lock,
+    aunque un hilo de trabajo previo (e.g. en to_thread) siga ejecutando."""
+    if origen not in _LOCKS_ORIGEN:
+        _LOCKS_ORIGEN[origen] = asyncio.Lock()
+    return _LOCKS_ORIGEN[origen]
+
+
+class HistorialChatCompat(list):
+    """Proyección de compatibilidad de historiales_por_origen['pc'] en formato lista de dicts.
+    Permite que los tests que llaman a j.historial_chat.clear() o inspeccionan j.historial_chat
+    sigan funcionando sin alteraciones."""
+
+    def clear(self):
+        super().clear()
+        historiales_por_origen["pc"].clear()
+        acciones_locales_recientes["pc"] = None
+
+    def sincronizar_desde_turnos(self, turnos: list):
+        super().clear()
+        for t in turnos:
+            super().append({"role": "user", "content": t.usuario})
+            super().append({"role": "assistant", "content": t.asistente})
+
+
+historial_chat = HistorialChatCompat()
 MAX_HISTORIAL = 3
 
 # Memoria contextual ligera: no se envía a Groq salvo que una pregunta
@@ -3821,7 +3880,7 @@ def respuesta_local(nombre: str, args: dict, resultado) -> str:
     return f"{elegir_variada(MULETILLAS)} {nucleo}."
 
 
-def ejecutar_comandos_locales(comandos):
+def ejecutar_comandos_locales(comandos, origen: str = "pc"):
     """Ejecuta todos los comandos detectados en orden."""
     resultados = []
 
@@ -3838,6 +3897,13 @@ def ejecutar_comandos_locales(comandos):
                 ).strip()
 
         memoria_contexto["ultimo_resultado"] = res_norm
+        acciones_locales_recientes[origen] = AccionLocalReciente(
+            comando=nombre,
+            args=args,
+            resultado=res_norm,
+            timestamp=time.time(),
+            origen=origen,
+        )
 
     return resultados
 
@@ -4078,7 +4144,19 @@ def tools_necesarias(texto: str):
     ]
 
 
-def contexto_para_pregunta(texto: str) -> str:
+PATRON_SEGUIMIENTO_ACCION = re.compile(
+    r"\b(?:"
+    r"abri[oó]|abiert[oa]|abriste|"
+    r"cerr[oó]|cerrad[oa]|cerraste|"
+    r"qued[oó]|pusiste|funcion[oó]|"
+    r"volumen|pantalla|ventana|escritorio|"
+    r"eso|esa|ese|lo anterior|antes|respuesta|estado"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def contexto_para_pregunta(texto: str, origen: str = "pc") -> str:
     """Devuelve solo el contexto mínimo necesario para una pregunta."""
     t = texto.lower()
 
@@ -4095,13 +4173,39 @@ def contexto_para_pregunta(texto: str) -> str:
             f"'{memoria_contexto['cancion']}'."
         )
 
+    accion_reciente = acciones_locales_recientes.get(origen)
+    if accion_reciente and (time.time() - accion_reciente.timestamp <= 120.0):
+        t_sin_tildes = quitar_tildes(texto) if "quitar_tildes" in globals() else texto
+        if PATRON_SEGUIMIENTO_ACCION.search(texto) or PATRON_SEGUIMIENTO_ACCION.search(t_sin_tildes):
+            delta = int(time.time() - accion_reciente.timestamp)
+            estado_val = getattr(accion_reciente.resultado, "estado", None)
+            if hasattr(estado_val, "value"):
+                estado_nombre = estado_val.value.upper()
+            elif estado_val:
+                estado_nombre = str(estado_val).upper()
+            else:
+                estado_nombre = "SUCCESS" if getattr(accion_reciente.resultado, "ok", True) else "FAILURE"
+
+            evid = getattr(accion_reciente.resultado, "evidencia", {}) or {}
+            evid_str = f" Evidencia: {evid}." if evid else ""
+            msg = getattr(accion_reciente.resultado, "mensaje", str(accion_reciente.resultado))
+            return (
+                f"Contexto de acción reciente en el sistema (hace {delta}s):\n"
+                f"- Acción: {accion_reciente.comando} ({accion_reciente.args})\n"
+                f"- Estado: {estado_nombre} ({msg}.{evid_str})"
+            )
+
     if memoria_contexto["ultimo_resultado"] and any(
         palabra in t
         for palabra in ["eso", "esa", "ese", "lo anterior", "antes", "respuesta"]
     ):
+        ultimo_str = str(memoria_contexto["ultimo_resultado"])
+        turnos_origen = historiales_por_origen.get(origen, [])
+        if turnos_origen and ultimo_str in turnos_origen[-1].asistente:
+            return ""
         return (
             "Contexto reciente: la última respuesta fue: "
-            f"{memoria_contexto['ultimo_resultado']}"
+            f"{ultimo_str}"
         )
 
     return ""
@@ -4279,12 +4383,23 @@ async def llamar_groq(parametros: dict):
 
     Si gpt-oss alucina una herramienta inexistente (bug conocido),
     reintenta UNA vez sin herramientas. Si se agotó la cuota,
-    lanza SinCuotaGroq para responder con una frase en vez de un 500."""
+    lanza SinCuotaGroq para responder con una frase en vez de un 500.
+
+    Nota sobre cancelación y concurrencia:
+    Si la corrutina que espera llamar_groq se cancela, sale de 'async with'
+    y libera el asyncio.Lock del origen. Sin embargo, el hilo de trabajo en
+    to_thread puede continuar ejecutando la llamada HTTP síncrona en segundo
+    plano hasta que responda o venza el timeout. Por ende, una nueva solicitud
+    del mismo origen puede comenzar mientras el hilo anterior sigue activo;
+    el lock de asyncio no previene esa concurrencia a nivel de hilos."""
     try:
         return await asyncio.to_thread(client.chat.completions.create, **parametros)
     except RateLimitError as e:
         print(f"[!] Groq sin cuota (429): {e}")
         raise SinCuotaGroq() from e
+    except APITimeoutError as e:
+        print(f"[!] Groq timeout: {e}")
+        raise HTTPException(status_code=504, detail=f"Tiempo de espera agotado al contactar con la IA: {e}")
     except Exception as e:
         error_texto = str(e)
 
@@ -4299,6 +4414,9 @@ async def llamar_groq(parametros: dict):
             return await asyncio.to_thread(client.chat.completions.create, **sin_tools)
         except RateLimitError as e2:
             raise SinCuotaGroq() from e2
+        except APITimeoutError as e2:
+            print(f"[!] Groq timeout en reintento: {e2}")
+            raise HTTPException(status_code=504, detail=f"Tiempo de espera agotado al contactar con la IA: {e2}")
         except Exception as e2:
             print(f"[ERROR GROQ] {e2}")
             raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e2}")
@@ -4341,11 +4459,8 @@ MENSAJE_SIN_CUOTA = (
 
 
 async def responder_sin_cuota(origen: str) -> ChatResponse:
-    # El mensaje del usuario ya quedó en el historial sin respuesta:
-    # se saca, para no mandarlo dos veces en la próxima pregunta.
-    if historial_chat and historial_chat[-1]["role"] == "user":
-        historial_chat.pop()
-
+    # Con commit diferido, el mensaje actual no se incorpora al historial
+    # antes de una respuesta exitosa de Groq, por lo que no requiere pop().
     print(f"[Madeline] {MENSAJE_SIN_CUOTA}")
     audio = await procesar_salida_de_voz(MENSAJE_SIN_CUOTA, origen)
     return ChatResponse(response=MENSAJE_SIN_CUOTA, audio_path=audio)
@@ -4444,77 +4559,255 @@ async def _procesar_mensaje(
             detail="El origen debe ser 'pc' o 'telefono'."
         )
     global historial_chat, ULTIMA_CAPTURA_ANALISIS
-    
-    mensaje_usuario = request.message.strip()
-    if not mensaje_usuario:
-        raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío.")
 
-    print(f"[Usuario] {mensaje_usuario}")
-    
-    image_path_response = None
+    async with obtener_lock_origen(origen):
+        mensaje_usuario = request.message.strip()
+        if not mensaje_usuario:
+            raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío.")
 
-    # 2. ROUTER LOCAL
-    comandos = router_local(mensaje_usuario)
+        print(f"[Usuario] {mensaje_usuario}")
 
-    # Datos que Keric cuenta al pasar ("estoy aprendiendo Flutter"):
-    # se guardan sin interrumpir lo que sea que pidió.
-    if not any(nombre == "memoria_guardar" for nombre, _ in comandos or []):
-        dato = memoria.dato_personal(mensaje_usuario)
-        if dato:
-            print(f"[*] Memoria: dato personal -> {dato}")
-            memoria.guardar_en_segundo_plano(dato)
+        image_path_response = None
 
-    if comandos:
-        print(f"[*] Router local: {comandos}")
-        registro["ruta"] = "router"
-        registro["acciones"] = [[nombre, args] for nombre, args in comandos]
+        # 2. ROUTER LOCAL
+        comandos = router_local(mensaje_usuario)
 
-        resultados = ejecutar_comandos_locales(comandos)
+        # Datos que Keric cuenta al pasar ("estoy aprendiendo Flutter"):
+        # se guardan sin interrumpir lo que sea que pidió.
+        if not any(nombre == "memoria_guardar" for nombre, _ in comandos or []):
+            dato = memoria.dato_personal(mensaje_usuario)
+            if dato:
+                print(f"[*] Memoria: dato personal -> {dato}")
+                memoria.guardar_en_segundo_plano(dato)
 
-        for nombre, args, resultado in resultados:
-            print(
-                f"[*] Resultado local: "
-                f"{nombre} -> {resultado}"
+        if comandos:
+            print(f"[*] Router local: {comandos}")
+            registro["ruta"] = "router"
+            registro["acciones"] = [[nombre, args] for nombre, args in comandos]
+
+            resultados = ejecutar_comandos_locales(comandos, origen=origen)
+
+            for nombre, args, resultado in resultados:
+                print(
+                    f"[*] Resultado local: "
+                    f"{nombre} -> {resultado}"
+                )
+
+            captura_id_local = None
+
+            for nombre, args, resultado in resultados:
+                if nombre == "captura" and resultado.startswith("CAPTURA_LISTA"):
+                    captura_id_local = resultado.split(":", 1)[1]
+                    break
+
+            texto_final = resumir_resultados_locales(
+                resultados
             )
 
-        captura_id_local = None
+            # --------------------------------------------------------
+            # CAPTURA
+            # --------------------------------------------------------
 
-        for nombre, args, resultado in resultados:
-            if nombre == "captura" and resultado.startswith("CAPTURA_LISTA"):
-                captura_id_local = resultado.split(":", 1)[1]
-                break
+            if captura_id_local and ruta_captura_disponible(captura_id_local):
+                image_path_response = f"/captura/{captura_id_local}"
+                # Desde el celular la app ya la recibe en la respuesta; la
+                # pedida desde el PC queda en la bandeja para el celular.
+                if origen == "pc":
+                    enviar_captura_al_telefono(captura_id_local)
 
-        texto_final = resumir_resultados_locales(
-            resultados
-        )
+            # --------------------------------------------------------
+            # ANÁLISIS DE PANTALLA (también devuelve la foto analizada)
+            # --------------------------------------------------------
 
-        # --------------------------------------------------------
-        # CAPTURA
-        # --------------------------------------------------------
+            hubo_analisis_pantalla = any(
+                nombre == "analizar_pantalla" for nombre, args, resultado in resultados
+            )
 
-        if captura_id_local and ruta_captura_disponible(captura_id_local):
-            image_path_response = f"/captura/{captura_id_local}"
-            # Desde el celular la app ya la recibe en la respuesta; la
-            # pedida desde el PC queda en la bandeja para el celular.
-            if origen == "pc":
-                enviar_captura_al_telefono(captura_id_local)
+            if hubo_analisis_pantalla and ULTIMA_CAPTURA_ANALISIS:
+                if ruta_captura_disponible(ULTIMA_CAPTURA_ANALISIS):
+                    image_path_response = f"/captura/{ULTIMA_CAPTURA_ANALISIS}"
+                ULTIMA_CAPTURA_ANALISIS = None
 
-        # --------------------------------------------------------
-        # ANÁLISIS DE PANTALLA (también devuelve la foto analizada)
-        # --------------------------------------------------------
+            # --------------------------------------------------------
+            # VOZ
+            # --------------------------------------------------------
 
-        hubo_analisis_pantalla = any(
-            nombre == "analizar_pantalla" for nombre, args, resultado in resultados
-        )
+            audio_path_response = await procesar_salida_de_voz(
+                texto_final,
+                origen
+            )
 
-        if hubo_analisis_pantalla and ULTIMA_CAPTURA_ANALISIS:
-            if ruta_captura_disponible(ULTIMA_CAPTURA_ANALISIS):
-                image_path_response = f"/captura/{ULTIMA_CAPTURA_ANALISIS}"
-            ULTIMA_CAPTURA_ANALISIS = None
+            return ChatResponse(
+                response=texto_final,
+                image_path=image_path_response,
+                audio_path=audio_path_response
+            )
 
-        # --------------------------------------------------------
-        # VOZ
-        # --------------------------------------------------------
+        # 3. SOLO SI NO ES UN COMANDO LOCAL: usamos Groq con contexto mínimo.
+        mensajes = [{"role": "system", "content": system_prompt_con_fecha(SYSTEM_PROMPT)}]
+
+        contexto = contexto_para_pregunta(mensaje_usuario, origen=origen)
+        if contexto:
+            mensajes.append({"role": "system", "content": contexto})
+
+        # Recuerdos a largo plazo: solo los 2-3 relevantes, o nada.
+        recuerdos = await asyncio.to_thread(memoria.contexto_recuerdos, mensaje_usuario)
+        if recuerdos:
+            print(f"[*] Memoria: {recuerdos}")
+            mensajes.append({"role": "system", "content": recuerdos})
+
+        # Incorporar el turno anterior completo si existe (en orden cronológico: user -> assistant)
+        for t in historiales_por_origen.get(origen, []):
+            mensajes.append({"role": "user", "content": t.usuario})
+            mensajes.append({"role": "assistant", "content": t.asistente})
+
+        # Mensaje actual del usuario SIEMPRE al final:
+        mensajes.append({"role": "user", "content": mensaje_usuario})
+
+        tools_mensaje = tools_necesarias(mensaje_usuario)
+        registro["ruta"] = "groq"
+        registro["tools_enviadas"] = [t["function"]["name"] for t in tools_mensaje]
+
+        parametros = {
+            "model": MODEL,
+            "messages": mensajes,
+            "temperature": 0.2,
+            # gpt-oss espera max_completion_tokens (no max_tokens), y ese
+            # límite incluye los tokens de razonamiento. 350 deja margen
+            # para explicaciones sin ser un cheque en blanco: la regla de
+            # brevedad del prompt hace que casi nunca se use entero.
+            "max_completion_tokens": 350,
+            "reasoning_effort": "low",
+        }
+
+        if tools_mensaje:
+            parametros["tools"] = tools_mensaje
+            parametros["tool_choice"] = "auto"
+
+        try:
+            response = await llamar_groq(parametros)
+        except SinCuotaGroq:
+            registro["ruta"] = "sin_cuota"
+            return await responder_sin_cuota(origen)
+
+        response_message = response.choices[0].message
+        finish_reason = response.choices[0].finish_reason
+
+        # 5. TOOL CALL
+        if response_message.tool_calls:
+            resultados_tool = []
+
+            for tool_call in response_message.tool_calls:
+                fn_name = tool_call.function.name
+                try:
+                    fn_args = json.loads(tool_call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                print(f"[*] Tool call: {fn_name} {fn_args}")
+                registro["acciones"].append([fn_name, fn_args])
+
+                if fn_name == "control_energia":
+                    accion = fn_args.get("accion")
+                    if accion in ("apagar", "reiniciar"):
+                        memoria_contexto["confirmacion_pendiente"] = {"accion": accion}
+                        fn_name = "confirmar_accion"
+                        resultado = ejecutar_comando_local(
+                            "confirmar_accion", {"accion": accion}
+                        )
+                    else:
+                        resultado = "No pude entender la acción de energía."
+                elif fn_name in TOOLS_FUNCIONES:
+                    if es_pregunta_explicativa_o_hipotetica(mensaje_usuario) and fn_name != "buscar_en_web":
+                        print(f"[!] Tool call '{fn_name}' bloqueada: la consulta es explicativa/hipotética.")
+                        resultado = Resultado(
+                            ok=False,
+                            mensaje="No se ejecutó ninguna acción porque tu consulta es una pregunta conceptual o explicativa.",
+                            evidencia={"bloqueada": True, "fn_name": fn_name},
+                            estado=EstadoResultado.FAILURE,
+                        )
+                    else:
+                        extra = {"mensaje": mensaje_usuario} if fn_name in TOOLS_CON_MENSAJE else {}
+                        try:
+                            resultado = TOOLS_FUNCIONES[fn_name](**fn_args, **extra)
+                        except TypeError as e:
+                            resultado = f"Error: argumentos inválidos para {fn_name}: {e}"
+                else:
+                    resultado = "Error: Herramienta no encontrada."
+
+                if fn_name == "info_cancion" and resultado.startswith("Actualmente está sonando:"):
+                    memoria_contexto["cancion"] = resultado.replace(
+                        "Actualmente está sonando:", ""
+                    ).strip()
+
+                if fn_name == "tomar_captura":
+                    captura_id_groq = getattr(resultado, "evidencia", {}).get("captura_id") or (
+                        str(resultado).split(":", 1)[1] if str(resultado).startswith("CAPTURA_LISTA") else None
+                    )
+                    if captura_id_groq and ruta_captura_disponible(captura_id_groq):
+                        image_path_response = f"/captura/{captura_id_groq}"
+                        if origen == "pc":
+                            enviar_captura_al_telefono(captura_id_groq)
+
+                if fn_name == "buscar_en_web" and not str(resultado).startswith(PREFIJOS_ERROR):
+                    resultado = await resumir_busqueda(mensaje_usuario, resultado)
+                    fn_name = "respuesta_busqueda"
+
+                resultados_tool.append((fn_name, fn_args, resultado))
+                memoria_contexto["ultimo_resultado"] = str(resultado)
+
+            partes_texto = []
+            for nombre, args, res in resultados_tool:
+                res_norm = normalizar_resultado(res, nombre)
+                if nombre in ("tomar_captura", "captura"):
+                    if res_norm.ok:
+                        partes_texto.append(respuesta_local("captura", args, res_norm))
+                    else:
+                        partes_texto.append(res_norm.mensaje)
+                else:
+                    partes_texto.append(respuesta_local(nombre, args, res_norm))
+
+            texto_final = " ".join(t for t in partes_texto if t.strip())
+            texto_final = limpiar_texto_para_voz(texto_final)
+
+            if not texto_final:
+                texto_final = "Operación realizada."
+
+            hubo_analisis_pantalla = any(
+                nombre == "analizar_pantalla" for nombre, args, resultado in resultados_tool
+            )
+
+            if hubo_analisis_pantalla and ULTIMA_CAPTURA_ANALISIS:
+                if ruta_captura_disponible(ULTIMA_CAPTURA_ANALISIS):
+                    image_path_response = f"/captura/{ULTIMA_CAPTURA_ANALISIS}"
+                ULTIMA_CAPTURA_ANALISIS = None
+
+        else:
+            texto_final = limpiar_texto_para_voz(
+                response_message.content or "No tengo nada que añadir."
+            )
+
+            if finish_reason == "length":
+                texto_final = recortar_a_oracion_completa(texto_final)
+
+            if es_intencion_de_accion(mensaje_usuario) and afirma_ejecucion_accion(texto_final):
+                texto_final = "No pude realizar esa acción porque no se ejecutó ninguna herramienta en el sistema."
+
+        # 6. MEMORIA / COMMIT ATÓMICO DEL TURNO
+        nuevo_turno = TurnoConversacion(usuario=mensaje_usuario, asistente=texto_final, timestamp=time.time())
+        historiales_por_origen[origen].append(nuevo_turno)
+        if len(historiales_por_origen[origen]) > MAX_TURNOS:
+            historiales_por_origen[origen] = historiales_por_origen[origen][-MAX_TURNOS:]
+
+        if origen == "pc":
+            historial_chat.sincronizar_desde_turnos(historiales_por_origen["pc"])
+
+        if not response_message.tool_calls or any(
+            nombre == "respuesta_busqueda" for nombre, _, _ in resultados_tool
+        ):
+            memoria.guardar_conversacion(mensaje_usuario, texto_final)
+
+        print(f"[Madeline] {texto_final}")
 
         audio_path_response = await procesar_salida_de_voz(
             texto_final,
@@ -4526,202 +4819,6 @@ async def _procesar_mensaje(
             image_path=image_path_response,
             audio_path=audio_path_response
         )
-
-    # 3. SOLO SI NO ES UN COMANDO LOCAL: usamos Groq con contexto mínimo.
-    historial_chat.append({"role": "user", "content": mensaje_usuario})
-
-    if len(historial_chat) > MAX_HISTORIAL:
-        historial_chat = historial_chat[-MAX_HISTORIAL:]
-
-    mensajes = [{"role": "system", "content": system_prompt_con_fecha(SYSTEM_PROMPT)}]
-
-    contexto = contexto_para_pregunta(mensaje_usuario)
-    if contexto:
-        mensajes.append({"role": "system", "content": contexto})
-
-    # Recuerdos a largo plazo: solo los 2-3 relevantes, o nada.
-    recuerdos = await asyncio.to_thread(memoria.contexto_recuerdos, mensaje_usuario)
-    if recuerdos:
-        print(f"[*] Memoria: {recuerdos}")
-        mensajes.append({"role": "system", "content": recuerdos})
-
-    mensajes.extend(historial_chat)
-    tools_mensaje = tools_necesarias(mensaje_usuario)
-    registro["ruta"] = "groq"
-    registro["tools_enviadas"] = [t["function"]["name"] for t in tools_mensaje]
-
-    parametros = {
-        "model": MODEL,
-        "messages": mensajes,
-        "temperature": 0.2,
-        # gpt-oss espera max_completion_tokens (no max_tokens), y ese
-        # límite incluye los tokens de razonamiento. 350 deja margen
-        # para explicaciones sin ser un cheque en blanco: la regla de
-        # brevedad del prompt hace que casi nunca se use entero.
-        "max_completion_tokens": 350,
-        "reasoning_effort": "low",
-    }
-
-    if tools_mensaje:
-        parametros["tools"] = tools_mensaje
-        parametros["tool_choice"] = "auto"
-
-    try:
-        response = await llamar_groq(parametros)
-    except SinCuotaGroq:
-        registro["ruta"] = "sin_cuota"
-        return await responder_sin_cuota(origen)
-
-    response_message = response.choices[0].message
-
-    # Si el modelo se quedó sin tokens antes de terminar la idea,
-    # esto queda en "length" en vez de "stop" — lo usamos más abajo
-    # para recortar prolijo en vez de leer algo cortado a mitad.
-    finish_reason = response.choices[0].finish_reason
-
-    # 5. TOOL CALL
-    if response_message.tool_calls:
-        resultados_tool = []
-
-        for tool_call in response_message.tool_calls:
-            fn_name = tool_call.function.name
-            try:
-                fn_args = json.loads(tool_call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                fn_args = {}
-
-            print(f"[*] Tool call: {fn_name} {fn_args}")
-            registro["acciones"].append([fn_name, fn_args])
-
-            if fn_name == "control_energia":
-                # Igual que en router_local: apagar/reiniciar NUNCA se
-                # ejecuta directo, queda pendiente hasta que el usuario
-                # diga "sí". Antes, una frase que no matcheaba el regex
-                # local ("apaga todo por favor") llegaba acá y apagaba
-                # sin preguntar.
-                accion = fn_args.get("accion")
-                if accion in ("apagar", "reiniciar"):
-                    memoria_contexto["confirmacion_pendiente"] = {"accion": accion}
-                    fn_name = "confirmar_accion"
-                    resultado = ejecutar_comando_local(
-                        "confirmar_accion", {"accion": accion}
-                    )
-                else:
-                    resultado = "No pude entender la acción de energía."
-            elif fn_name in TOOLS_FUNCIONES:
-                if es_pregunta_explicativa_o_hipotetica(mensaje_usuario) and fn_name != "buscar_en_web":
-                    print(f"[!] Tool call '{fn_name}' bloqueada: la consulta es explicativa/hipotética.")
-                    resultado = Resultado(
-                        ok=False,
-                        mensaje="No se ejecutó ninguna acción porque tu consulta es una pregunta conceptual o explicativa.",
-                        evidencia={"bloqueada": True, "fn_name": fn_name},
-                        estado=EstadoResultado.FAILURE,
-                    )
-                else:
-                    extra = {"mensaje": mensaje_usuario} if fn_name in TOOLS_CON_MENSAJE else {}
-                    try:
-                        resultado = TOOLS_FUNCIONES[fn_name](**fn_args, **extra)
-                    except TypeError as e:
-                        # Groq a veces inventa un argumento que la función
-                        # no acepta: mejor un error hablado que un 500.
-                        resultado = f"Error: argumentos inválidos para {fn_name}: {e}"
-            else:
-                resultado = "Error: Herramienta no encontrada."
-
-            if fn_name == "info_cancion" and resultado.startswith("Actualmente está sonando:"):
-                memoria_contexto["cancion"] = resultado.replace(
-                    "Actualmente está sonando:", ""
-                ).strip()
-
-            if fn_name == "tomar_captura":
-                captura_id_groq = getattr(resultado, "evidencia", {}).get("captura_id") or (
-                    str(resultado).split(":", 1)[1] if str(resultado).startswith("CAPTURA_LISTA") else None
-                )
-                if captura_id_groq and ruta_captura_disponible(captura_id_groq):
-                    image_path_response = f"/captura/{captura_id_groq}"
-                    if origen == "pc":
-                        enviar_captura_al_telefono(captura_id_groq)
-
-            if fn_name == "buscar_en_web" and not str(resultado).startswith(PREFIJOS_ERROR):
-                # Antes los snippets se leían en bruto ("Resultados web
-                # para X: 1. ... 2. ..."). Ahora una segunda llamada,
-                # mínima, los convierte en una respuesta de verdad.
-                resultado = await resumir_busqueda(mensaje_usuario, resultado)
-                fn_name = "respuesta_busqueda"
-
-            resultados_tool.append((fn_name, fn_args, resultado))
-            memoria_contexto["ultimo_resultado"] = str(resultado)
-
-        partes_texto = []
-        for nombre, args, res in resultados_tool:
-            res_norm = normalizar_resultado(res, nombre)
-            if nombre in ("tomar_captura", "captura"):
-                if res_norm.ok:
-                    partes_texto.append(respuesta_local("captura", args, res_norm))
-                else:
-                    partes_texto.append(res_norm.mensaje)
-            else:
-                partes_texto.append(respuesta_local(nombre, args, res_norm))
-
-        texto_final = " ".join(t for t in partes_texto if t.strip())
-        texto_final = limpiar_texto_para_voz(texto_final)
-
-        if not texto_final:
-            texto_final = "Operación realizada."
-
-        # Mismo mecanismo que en la rama del router local: si Groq
-        # decidió llamar a analizar_pantalla por su cuenta (frase
-        # libre, no el patrón fijo), también devolvemos la foto
-        # analizada junto con la respuesta hablada.
-        hubo_analisis_pantalla = any(
-            nombre == "analizar_pantalla" for nombre, args, resultado in resultados_tool
-        )
-
-        if hubo_analisis_pantalla and ULTIMA_CAPTURA_ANALISIS:
-            if ruta_captura_disponible(ULTIMA_CAPTURA_ANALISIS):
-                image_path_response = f"/captura/{ULTIMA_CAPTURA_ANALISIS}"
-            ULTIMA_CAPTURA_ANALISIS = None
-
-    else:
-        # Respuesta normal sin herramienta — acá es exactamente donde
-        # aparecía la tabla markdown, así que pasa por la limpieza.
-        texto_final = limpiar_texto_para_voz(
-            response_message.content or "No tengo nada que añadir."
-        )
-
-        if finish_reason == "length":
-            texto_final = recortar_a_oracion_completa(texto_final)
-
-        # Protección contra confirmaciones falsas:
-        # Si el usuario solicitó una acción en el sistema y Groq no ejecutó herramientas,
-        # pero afirma haberla completado, interceptamos la respuesta alucinada.
-        if es_intencion_de_accion(mensaje_usuario) and afirma_ejecucion_accion(texto_final):
-            texto_final = "No pude realizar esa acción porque no se ejecutó ninguna herramienta en el sistema."
-
-    # 6. MEMORIA
-    historial_chat.append({"role": "assistant", "content": texto_final})
-
-    # Se guardan las charlas y búsquedas, no las órdenes ("abre
-    # Firefox" por Groq no es algo que valga la pena recordar).
-    if not response_message.tool_calls or any(
-        nombre == "respuesta_busqueda" for nombre, _, _ in resultados_tool
-    ):
-        memoria.guardar_conversacion(mensaje_usuario, texto_final)
-    if len(historial_chat) > MAX_HISTORIAL:
-        historial_chat = historial_chat[-MAX_HISTORIAL:]
-
-    print(f"[Madeline] {texto_final}")
-
-    audio_path_response = await procesar_salida_de_voz(
-        texto_final,
-        origen
-    )
-
-    return ChatResponse(
-        response=texto_final,
-        image_path=image_path_response,
-        audio_path=audio_path_response
-    )
 
 # Proceso de mpv reproduciendo la voz de Madeline en el PC ahora mismo,
 # o None si no está hablando. Se usa para poder interrumpirlo cuando
