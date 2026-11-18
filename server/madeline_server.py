@@ -2199,11 +2199,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "ajustar_volumen",
-            "description": (
-                "Controla el volumen de CachyOS. Usa 'setear' para un "
-                "volumen exacto, 'subir' o 'bajar' para cambios relativos, "
-                "y 'mutear' para silenciar o desmutear."
-            ),
+            "description": "Ajusta el volumen del sistema o aplicación (subir, bajar, setear, mutear).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2213,7 +2209,7 @@ tools = [
                     },
                     "porcentaje": {
                         "type": "integer",
-                        "description": "Nivel o cantidad de volumen. Por defecto 10.",
+                        "description": "Nivel o incremento de volumen. Por defecto 10.",
                     },
                     "aplicacion": {
                         "type": "string",
@@ -2245,10 +2241,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "control_multimedia",
-            "description": (
-                "Controla la reproducción multimedia. 'reiniciar' vuelve "
-                "a empezar la canción actual (repetirla)."
-            ),
+            "description": "Controla la reproducción multimedia (pausar, reproducir, siguiente, anterior, reiniciar).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2271,10 +2264,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "info_cancion",
-            "description": (
-                "Dice qué canción y artista están sonando ahora en el PC: "
-                "'¿qué suena?', '¿quién canta esto?', '¿cómo se llama esta canción?'."
-            ),
+            "description": "Informa el título y artista de la canción que suena en el PC.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -2285,7 +2275,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "control_energia",
-            "description": "Apaga o reinicia la computadora (no el servidor de Madeline).",
+            "description": "Apaga o reinicia el equipo.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2302,7 +2292,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "reiniciar_servidor",
-            "description": "Reinicia el servidor de Madeline (no la PC), para aplicar cambios.",
+            "description": "Reinicia el servidor de Madeline para aplicar cambios.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -2310,7 +2300,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "cerrar_todo",
-            "description": "Cierra las aplicaciones comunes de golpe.",
+            "description": "Cierra las aplicaciones de usuario abiertas.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -2321,7 +2311,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "reporte_clima",
-            "description": "Clima actual o pronóstico (hasta pasado mañana) de Villa Alegre.",
+            "description": "Reporte o pronóstico del clima en Villa Alegre.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2348,7 +2338,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "tomar_captura",
-            "description": "Toma una captura de pantalla.",
+            "description": "Toma una captura de la pantalla.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -2359,9 +2349,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "buscar_en_web",
-            "description": (
-                "Busca información reciente en internet cuando sea necesario."
-            ),
+            "description": "Busca información reciente en internet.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2399,10 +2387,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "mover_ventana",
-            "description": (
-                "Mueve la ventana de una app nombrada a otro escritorio. "
-                "Si no nombra una app, usa cambiar_escritorio."
-            ),
+            "description": "Mueve la ventana de una app a otro escritorio.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2423,10 +2408,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "cambiar_escritorio",
-            "description": (
-                "Cambia la vista a otro escritorio: ve, cambia, muévete "
-                "o muéstrame el escritorio N."
-            ),
+            "description": "Cambia la vista activa a otro escritorio.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2460,18 +2442,13 @@ tools = [
         "type": "function",
         "function": {
             "name": "conectar_bluetooth",
-            "description": (
-                "Conecta el PC a un dispositivo Bluetooth ya emparejado "
-                "previamente (auriculares, parlante, un Amazon Echo/Alexa "
-                "usado como parlante Bluetooth, etc.)."
-            ),
+            "description": "Conecta el PC a un dispositivo Bluetooth emparejado.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "dispositivo": {
                         "type": "string",
                         "description": "Nombre del dispositivo a conectar.",
-                        # Con la lista, Groq no pregunta "¿cuáles audífonos?".
                         "enum": list(DISPOSITIVOS_BLUETOOTH),
                     }
                 },
@@ -2483,7 +2460,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "desconectar_bluetooth",
-            "description": "Desconecta un dispositivo Bluetooth ya conectado.",
+            "description": "Desconecta un dispositivo Bluetooth conectado.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2501,12 +2478,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "actualizar_sistema",
-            "description": (
-                "Inicia la actualización completa de paquetes del "
-                "sistema (equivalente al botón de actualizar de "
-                "CachyOS), usando paru/yay/pacman en una terminal "
-                "aparte."
-            ),
+            "description": "Inicia la actualización de paquetes del sistema en una terminal.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -2514,11 +2486,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "verificar_actualizaciones",
-            "description": (
-                "Cuenta cuántos paquetes tienen actualización pendiente "
-                "SIN aplicarlas todavía. Usar cuando preguntan si hay "
-                "actualizaciones, no cuando piden actualizar ya."
-            ),
+            "description": "Verifica cuántas actualizaciones de paquetes hay pendientes.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -2526,13 +2494,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "abrir_radio_musica",
-            "description": (
-                "Abre la radio/playlist fija de YouTube Music en una "
-                "pestaña del navegador. Usar para pedidos VAGOS de "
-                "música ('pon música', 'quiero escuchar algo'), no "
-                "para pausar/reanudar/saltar lo que ya está sonando "
-                "(eso es control_multimedia)."
-            ),
+            "description": "Abre la radio de YouTube Music en el navegador.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -2540,18 +2502,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "abrir_pestanas_busqueda",
-            "description": (
-                "Busca algo en internet y ABRE varias pestañas del "
-                "navegador con los resultados, en vez de solo responder "
-                "hablado. Usar cuando el usuario claramente quiere "
-                "investigar, comparar varias fuentes, o ver resultados "
-                "por su cuenta — por ejemplo pedidos de estudio o "
-                "universidad ('buscame papers sobre X', 'ábreme fuentes "
-                "sobre Y', 'quiero ver imágenes de Z') o cuando pide "
-                "una página o sitio ('búscame la página de X'). NO usar para "
-                "preguntas que se responden bien con una frase corta "
-                "(para eso está buscar_en_web, que no abre nada)."
-            ),
+            "description": "Abre pestañas en el navegador con resultados, imágenes o papers.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2563,8 +2514,7 @@ tools = [
                         "type": "string",
                         "enum": ["general", "papers", "imagenes"],
                         "description": (
-                            "'papers' busca en arXiv, 'imagenes' abre "
-                            "Google Imágenes, 'general' es para lo demás."
+                            "'papers' (arXiv), 'imagenes' (Google Imágenes) o 'general'."
                         ),
                     },
                 },
@@ -2576,20 +2526,13 @@ tools = [
         "type": "function",
         "function": {
             "name": "analizar_pantalla",
-            "description": (
-                "Toma una captura de la pantalla del PC y la analiza con "
-                "un modelo de visión para responder preguntas sobre lo "
-                "que se ve — errores en pantalla, qué aplicación está "
-                "abierta, leer texto de una imagen, describir un diseño, "
-                "etc. Usar cuando el usuario pide explícitamente mirar o "
-                "analizar la pantalla."
-            ),
+            "description": "Captura y analiza la pantalla con visión artificial.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pregunta": {
                         "type": "string",
-                        "description": "Qué preguntar sobre lo que se ve en pantalla.",
+                        "description": "Pregunta sobre lo que se ve en pantalla.",
                     }
                 },
                 "required": ["pregunta"],
@@ -2600,14 +2543,11 @@ tools = [
         "type": "function",
         "function": {
             "name": "agregar_recado",
-            "description": (
-                "Anota un recado sin hora: algo que Keric no quiere olvidar "
-                "(recuérdame que debo X, tengo que X)."
-            ),
+            "description": "Anota un recado o recordatorio pendiente.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "texto": {"type": "string", "description": "El recado, corto (ej: Pagar la luz)."},
+                    "texto": {"type": "string", "description": "Texto breve del recado."},
                 },
                 "required": ["texto"],
             },
@@ -2625,11 +2565,11 @@ tools = [
         "type": "function",
         "function": {
             "name": "borrar_recado",
-            "description": "Borra un recado ya hecho (ya pagué la luz, borra el recado del pan).",
+            "description": "Borra un recado completado por su tema o 'todos'.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cual": {"type": "string", "description": "De qué trata, o 'todos'."},
+                    "cual": {"type": "string", "description": "Texto del recado a borrar, o 'todos'."},
                 },
                 "required": ["cual"],
             },
@@ -2639,12 +2579,12 @@ tools = [
         "type": "function",
         "function": {
             "name": "ver_agenda",
-            "description": "Lee los eventos del calendario de Google desde una fecha.",
+            "description": "Lee los eventos del calendario desde una fecha.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "fecha": {"type": "string", "description": "AAAA-MM-DD"},
-                    "dias": {"type": "integer", "description": "Cuántos días mirar (1 un día, 7 una semana)."},
+                    "fecha": {"type": "string", "description": "Fecha de inicio en formato AAAA-MM-DD."},
+                    "dias": {"type": "integer", "description": "Cantidad de días a consultar."},
                 },
                 "required": ["fecha"],
             },
@@ -2654,15 +2594,15 @@ tools = [
         "type": "function",
         "function": {
             "name": "crear_evento",
-            "description": "Agrega un evento con fecha al calendario de Google (agéndame, tengo dentista el jueves). Llámala directo, sin preguntar ni corregir el día de la semana: la fecha se revisa aquí.",
+            "description": "Crea un evento en el calendario de Google.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "titulo": {"type": "string", "description": "Qué es, corto, sin la fecha ni la palabra agenda."},
-                    "fecha": {"type": "string", "description": "AAAA-MM-DD"},
+                    "titulo": {"type": "string", "description": "Título breve del evento."},
+                    "fecha": {"type": "string", "description": "Fecha en formato AAAA-MM-DD."},
                     "hora": {
                         "type": "string",
-                        "description": "H:MM tal como la dijo, sin convertir («a las 4» -> 4:00). Omitir si no dijo hora.",
+                        "description": "Hora en formato H:MM si se especificó.",
                     },
                     "duracion_minutos": {"type": "integer"},
                 },
@@ -2674,7 +2614,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "mostrar_avatar",
-            "description": "Muestra o esconde a Madeline (tú) paseando como monita por la pantalla.",
+            "description": "Muestra o esconde el avatar de Madeline en pantalla.",
             "parameters": {
                 "type": "object",
                 "properties": {"accion": {"type": "string", "enum": ["mostrar", "esconder"]}},
@@ -4061,6 +4001,36 @@ def registrar_frase_sin_tema(texto: str):
         print(f"[!] No pude registrar la frase sin tema: {e}")
 
 
+PATRON_ABRIR_APP_FALLBACK = re.compile(
+    r"\b(?:"
+    r"inicia|iniciar|arranca|arrancar|levanta|levantar|"
+    r"ejecuta|ejecutar|lanza|lanzar|despacha|despachar|"
+    r"abre|abrir|abr[oa]|pon\s+en\s+marcha"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PATRON_CERRAR_APP_FALLBACK = re.compile(
+    r"\b(?:"
+    r"cierra|cerrar|cerra|mata|matar|termina|terminar|det[eé]n|detener"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PATRON_BUSQUEDA_FALLBACK = re.compile(
+    r"\b(?:"
+    r"averigua|averiguar|indaga|indagar|rastrea|rastrear|"
+    r"precio\s+de|precios\b|cotizaci[oó]n|qui[eé]n\s+gan[oó]|resultado\s+de|"
+    r"a\s+qu[eé]\s+hora\s+juega|en\s+qu[eé]\s+canal|cu[aá]ndo\s+juega|"
+    r"noticias?\b|clima\s+en|tiempo\s+en|"
+    r"actual(?:mente)?|[uú]ltim[oa]s?|reciente(?:mente)?|en\s+este\s+momento|en\s+vivo|tiempo\s+real|"
+    r"(?:qui[eé]n|cu[aá]ndo|cu[aá]nto|d[oó]nde|cu[aá]l|qu[eé]\s+(?:pas[oó]|sucedi[oó]|ocurri[oó]|hora|partido|juego))\b.*\bhoy\b|"
+    r"\bhoy\b.*\b(?:qui[eé]n|cu[aá]ndo|cu[aá]nto|d[oó]nde|cu[aá]l|qu[eé]\s+(?:pas[oó]|sucedi[oó]|ocurri[oó]|hora|partido|juego))\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def tools_necesarias(texto: str):
     """Envía a Groq solo los schemas de los temas que aparecen en el texto."""
     if es_pregunta_explicativa_o_hipotetica(texto):
@@ -4076,20 +4046,31 @@ def tools_necesarias(texto: str):
     for tema in temas:
         nombres.update(TEMAS_TOOLS[tema][1])
 
+    t_clean = quitar_tildes(texto.lower().strip()) if "quitar_tildes" in globals() else texto.lower().strip()
+    m_abrir = bool(PATRON_ABRIR_APP_FALLBACK.search(texto) or PATRON_ABRIR_APP_FALLBACK.search(t_clean))
+    m_cerrar = bool(PATRON_CERRAR_APP_FALLBACK.search(texto) or PATRON_CERRAR_APP_FALLBACK.search(t_clean))
+
     if not temas:
         registrar_frase_sin_tema(texto)
-        # Sin esto, si ningún tema matchea, la solicitud se manda a
-        # Groq sin NINGUNA herramienta. openai/gpt-oss-120b, al no
-        # tener herramientas pero sentir que la pregunta necesita info
-        # actual (como "¿a qué hora lloverá?"), a veces ALUCINA un tool
-        # interno de OpenAI (web.run) que no existe en esta API — Groq
-        # lo rechaza con 400 (bug conocido de los modelos gpt-oss
-        # cuando se quedan sin herramientas). Dándole siempre al menos
-        # buscar_en_web como opción real, tiene algo concreto para
-        # usar en vez de inventar algo que no existe. Abrir apps y
-        # páginas también van: Whisper a veces deforma el verbo y,
-        # sin esas tools, Groq decía "listo" sin hacer nada.
-        nombres.update(("buscar_en_web", "abrir_aplicacion", "abrir_pestanas_busqueda"))
+        # Diferenciación inteligente: solo enviar herramientas si existe intención real de acción o búsqueda.
+        # Las consultas puramente conversacionales, reflexivas o de conocimiento general se envían
+        # a Groq sin herramientas (0 esquemas y sin tool_choice="auto"), ahorrando cientos de tokens.
+        if m_abrir and not m_cerrar:
+            nombres.add("abrir_aplicacion")
+        elif m_cerrar and not m_abrir:
+            nombres.add("cerrar_aplicacion")
+        elif m_abrir and m_cerrar:
+            nombres.update(("abrir_aplicacion", "cerrar_aplicacion"))
+        elif PATRON_BUSQUEDA_FALLBACK.search(texto) or PATRON_BUSQUEDA_FALLBACK.search(t_clean):
+            nombres.add("buscar_en_web")
+    else:
+        # Si se seleccionaron herramientas de apps, discriminar apertura vs cierre de forma inequívoca:
+        # una orden de apertura nunca incluye cerrar_aplicacion, ni viceversa.
+        if "abrir_aplicacion" in nombres or "cerrar_aplicacion" in nombres:
+            if m_abrir and not m_cerrar:
+                nombres.discard("cerrar_aplicacion")
+            elif m_cerrar and not m_abrir:
+                nombres.discard("abrir_aplicacion")
 
     return [
         tool for tool in tools

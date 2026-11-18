@@ -532,7 +532,7 @@ class TestGroq(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(groq["origen"], "telefono")
         self.assertEqual(groq["mensaje"], "¿qué es el sol?")
         self.assertEqual(groq["respuesta"], "Es una estrella.")
-        self.assertIn("buscar_en_web", groq["tools_enviadas"])
+        self.assertEqual(groq["tools_enviadas"], [])
         self.assertEqual(router["ruta"], "router")
         self.assertEqual(router["acciones"], [["multimedia", {"accion": "pausar"}]])
 

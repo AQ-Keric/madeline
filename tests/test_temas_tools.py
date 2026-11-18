@@ -30,7 +30,7 @@ class TestTemasTools(unittest.TestCase):
         casos = {
             "silencio por favor": {"ajustar_volumen"},
             "está muy fuerte, bájale un poco": {"ajustar_volumen"},
-            "cierra eso": {"abrir_aplicacion", "cerrar_aplicacion"},
+            "cierra eso": {"cerrar_aplicacion"},
             "muéstrame el escritorio 1": {"cambiar_escritorio"},
             "¿va a llover mañana?": {"reporte_clima"},
             "cuánta RAM estoy usando": {"estado_sistema"},
@@ -64,7 +64,7 @@ class TestTemasTools(unittest.TestCase):
             os.remove(j.LOG_SIN_TEMA)
         self.assertEqual(
             nombres("cuéntame un chiste"),
-            {"buscar_en_web", "abrir_aplicacion", "abrir_pestanas_busqueda"},
+            set(),
         )
         with open(j.LOG_SIN_TEMA, encoding="utf-8") as f:
             self.assertTrue(f.read().rstrip().endswith("\tcuéntame un chiste"))
