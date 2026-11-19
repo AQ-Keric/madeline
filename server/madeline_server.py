@@ -135,6 +135,7 @@ async def verificar_token(request: Request, call_next):
 
 import services.audio as _audio
 import services.system as _system
+import services.screen as _screen
 
 ajustar_volumen = _audio.ajustar_volumen
 hay_reproductor = _audio.hay_reproductor
@@ -144,6 +145,28 @@ _leer_proc_stat = _system._leer_proc_stat
 uso_cpu = _system.uso_cpu
 leer_sensores = _system.leer_sensores
 control_energia = _system.control_energia
+
+CARPETA_BANDEJA = _screen.CARPETA_BANDEJA
+HORAS_VIDA_BANDEJA = _screen.HORAS_VIDA_BANDEJA
+PATRON_ID_CAPTURA = _screen.PATRON_ID_CAPTURA
+ruta_captura_disponible = _screen.ruta_captura_disponible
+capturas_en_bandeja = _screen.capturas_en_bandeja
+
+
+def tomar_captura(ancho_max: int = 1920) -> Resultado:
+    """Fachada de compatibilidad para services.screen.tomar_captura."""
+    resolver = ruta_captura_disponible if callable(ruta_captura_disponible) else _screen.ruta_captura_disponible
+    return _screen.tomar_captura(
+        ancho_max=ancho_max,
+        _subprocess=subprocess,
+        _resolver=resolver,
+    )
+
+
+def enviar_captura_al_telefono(captura_id: str):
+    """Fachada de compatibilidad para services.screen.enviar_captura_al_telefono."""
+    resolver = ruta_captura_disponible if callable(ruta_captura_disponible) else _screen.ruta_captura_disponible
+    return _screen.enviar_captura_al_telefono(captura_id, _resolver=resolver)
 
 
 PROCESOS_PROTEGIDOS = {
@@ -509,94 +532,6 @@ def estado_sistema() -> str:
         return f"No pude leer los sensores: {e}"
 
 
-def tomar_captura(ancho_max: int = 1920) -> Resultado:
-    """Saca la captura usando grim en Hyprland y la comprime a JPEG.
-
-    Cada captura se guarda con un ID único (uuid) en vez de un nombre
-    fijo, para que dos solicitudes simultáneas (PC + teléfono al
-    mismo tiempo) no se pisen la captura una a la otra. El ID viaja
-    codificado en el resultado como "CAPTURA_LISTA:<id>"."""
-    captura_id = uuid.uuid4().hex[:12]
-    ruta_png = f"/tmp/captura_madeline_{captura_id}.png"
-
-    try:
-        subprocess.run(
-            ["grim", ruta_png],
-            check=True,
-            timeout=10,
-        )
-
-        try:
-            from PIL import Image
-
-            ruta_jpg = f"/tmp/captura_madeline_{captura_id}.jpg"
-
-            with Image.open(ruta_png) as img:
-                img = img.convert("RGB")
-
-                if img.width > ancho_max:
-                    ratio = ancho_max / img.width
-                    img = img.resize(
-                        (ancho_max, int(img.height * ratio))
-                    )
-
-                img.save(
-                    ruta_jpg,
-                    "JPEG",
-                    quality=85,
-                    optimize=True,
-                )
-
-            os.remove(ruta_png)
-
-        except Exception as e:
-            print(
-                f"[!] No se pudo comprimir la captura, "
-                f"se enviará el PNG original: {e}"
-            )
-
-        ruta_final = ruta_captura_disponible(captura_id)
-        if not ruta_final or not os.path.exists(ruta_final) or os.path.getsize(ruta_final) == 0:
-            return Resultado(
-                ok=False,
-                mensaje="Falló el módulo de captura de pantalla: el archivo no se generó o quedó vacío.",
-                evidencia={"captura_id": captura_id, "verificado": False},
-                estado=EstadoResultado.FAILURE,
-            )
-
-        return Resultado(
-            ok=True,
-            mensaje=f"CAPTURA_LISTA:{captura_id}",
-            evidencia={
-                "captura_id": captura_id,
-                "ruta": ruta_final,
-                "tamano_bytes": os.path.getsize(ruta_final),
-                "verificado": True,
-            },
-            estado=EstadoResultado.SUCCESS,
-        )
-
-    except Exception as e:
-        return Resultado(
-            ok=False,
-            mensaje=f"Falló el módulo de captura de pantalla: {e}",
-            evidencia={"error": str(e), "verificado": False},
-            estado=EstadoResultado.FAILURE,
-        )
-
-
-def ruta_captura_disponible(captura_id: str) -> str | None:
-    """Devuelve la ruta de la captura con ese ID, priorizando el JPEG."""
-    ruta_jpg = f"/tmp/captura_madeline_{captura_id}.jpg"
-    ruta_png = f"/tmp/captura_madeline_{captura_id}.png"
-
-    if os.path.exists(ruta_jpg):
-        return ruta_jpg
-    if os.path.exists(ruta_png):
-        return ruta_png
-    return None
-
-
 # Modelo con visión de Groq (actual al momento de escribir esto —
 # ver https://console.groq.com/docs/vision si cambia). Es una
 # llamada APARTE del modelo de texto normal (MODEL): manda una
@@ -796,34 +731,6 @@ def analizar_pantalla(pregunta: str) -> str:
         if os.path.exists(ruta):
             os.remove(ruta)
         return f"No pude analizar la pantalla: {e}"
-
-
-# Capturas pedidas desde el PC (voz o Super+J): quedan en esta bandeja
-# hasta que la app del celular las descarga. Reemplaza a Telegram.
-CARPETA_BANDEJA = "/tmp/madeline_bandeja"
-os.makedirs(CARPETA_BANDEJA, exist_ok=True)
-HORAS_VIDA_BANDEJA = 24
-PATRON_ID_CAPTURA = re.compile(r"^[0-9a-f]{12}$")
-
-
-def enviar_captura_al_telefono(captura_id: str):
-    """Deja la captura en la bandeja para que la app la descargue."""
-    ruta = ruta_captura_disponible(captura_id)
-    if not ruta:
-        return
-    destino = os.path.join(CARPETA_BANDEJA, captura_id + os.path.splitext(ruta)[1])
-    os.replace(ruta, destino)
-    print(f"[*] Captura {captura_id} en la bandeja del celular.")
-
-
-def capturas_en_bandeja() -> list:
-    archivos = []
-    for nombre in os.listdir(CARPETA_BANDEJA):
-        captura_id, _ = os.path.splitext(nombre)
-        if PATRON_ID_CAPTURA.match(captura_id):
-            ruta = os.path.join(CARPETA_BANDEJA, nombre)
-            archivos.append({"id": captura_id, "creada": os.path.getmtime(ruta), "ruta": ruta})
-    return sorted(archivos, key=lambda a: a["creada"])
 
 
 HEADERS_BUSQUEDA = {

@@ -9,7 +9,7 @@ router = APIRouter(prefix="/deck", tags=["deck"])
 
 import deck
 import teclado_control
-from services import hyprland
+from services import hyprland, screen, system
 import madeline_server as server
 
 
@@ -66,7 +66,7 @@ def deck_accion_endpoint(accion: AccionDeck):
             ok, msg = teclado_control.apagar_luces()
             resultado = msg
         elif accion.tool == "control_energia":
-            resultado = server.control_energia(**accion.args)
+            resultado = system.control_energia(**accion.args)
         else:
             funcion = server.TOOLS_FUNCIONES[accion.tool]
             resultado = funcion(**accion.args)
@@ -76,7 +76,7 @@ def deck_accion_endpoint(accion: AccionDeck):
     image_path = None
     if str(resultado).startswith("CAPTURA_LISTA"):
         captura_id = getattr(resultado, "evidencia", {}).get("captura_id") or str(resultado).split(":", 1)[1]
-        if server.ruta_captura_disponible(captura_id):
+        if screen.ruta_captura_disponible(captura_id):
             image_path = f"/captura/{captura_id}"
         resultado = "Captura lista."
     return {"response": str(resultado), "image_path": image_path}

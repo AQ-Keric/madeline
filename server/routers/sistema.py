@@ -4,7 +4,8 @@ import os
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
 
-import madeline_server as server
+from services import screen
+from services import system
 
 router = APIRouter(tags=["sistema"])
 
@@ -12,7 +13,7 @@ router = APIRouter(tags=["sistema"])
 @router.get("/captura/{captura_id}")
 async def obtener_captura(captura_id: str, background_tasks: BackgroundTasks):
     """Sirve la captura con ese ID específico."""
-    ruta = server.ruta_captura_disponible(captura_id)
+    ruta = screen.ruta_captura_disponible(captura_id)
     if not ruta:
         raise HTTPException(
             status_code=404,
@@ -27,13 +28,13 @@ async def obtener_captura(captura_id: str, background_tasks: BackgroundTasks):
 @router.get("/bandeja")
 def bandeja_endpoint():
     """Capturas pedidas desde el PC que el celular todavía no bajó."""
-    return {"capturas": [{"id": c["id"], "creada": c["creada"]} for c in server.capturas_en_bandeja()]}
+    return {"capturas": [{"id": c["id"], "creada": c["creada"]} for c in screen.capturas_en_bandeja()]}
 
 
 @router.get("/bandeja/{captura_id}")
 def bandeja_captura_endpoint(captura_id: str, background_tasks: BackgroundTasks):
     """Entrega una captura de la bandeja y la borra (se baja una vez)."""
-    captura = next((c for c in server.capturas_en_bandeja() if c["id"] == captura_id), None)
+    captura = next((c for c in screen.capturas_en_bandeja() if c["id"] == captura_id), None)
     if not captura:
         raise HTTPException(status_code=404, detail="Esa captura ya no está en la bandeja.")
     background_tasks.add_task(os.remove, captura["ruta"])
@@ -45,7 +46,7 @@ def bandeja_captura_endpoint(captura_id: str, background_tasks: BackgroundTasks)
 def sensores_endpoint():
     """Estado de hardware en tiempo real para el panel del celular."""
     try:
-        s = server.leer_sensores()
+        s = system.leer_sensores()
         return {
             "ram_usada": str(s["ram_usada"]),
             "ram_total": str(s["ram_total"]),
