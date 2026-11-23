@@ -46,6 +46,7 @@ import agenda  # noqa: E402
 import recados  # noqa: E402
 import teclado_control  # noqa: E402
 from services import hyprland  # noqa: E402
+from services import tts as _tts  # noqa: E402
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -90,8 +91,7 @@ app = FastAPI(title="Madeline API", description="API para la asistente Madeline 
 # Antes esto montaba /tmp completo — cualquiera que llegara al server
 # podía pedir cualquier archivo temporal del sistema, no solo los
 # audios de Madeline, con solo adivinar el nombre.
-CARPETA_AUDIOS = "/tmp/madeline_audios"
-os.makedirs(CARPETA_AUDIOS, exist_ok=True)
+CARPETA_AUDIOS = _tts.asegurar_carpeta_audios()
 app.mount("/audios", StaticFiles(directory=CARPETA_AUDIOS), name="audios")
 
 # ------------------------------------------------------------
@@ -136,6 +136,7 @@ async def verificar_token(request: Request, call_next):
 import services.audio as _audio
 import services.system as _system
 import services.screen as _screen
+import services.tts as _tts
 
 ajustar_volumen = _audio.ajustar_volumen
 hay_reproductor = _audio.hay_reproductor
@@ -4803,209 +4804,77 @@ async def _procesar_mensaje(
             audio_path=audio_path_response
         )
 
-# Proceso de mpv reproduciendo la voz de Madeline en el PC ahora mismo,
-# o None si no está hablando. Se usa para poder interrumpirlo cuando
-# arranca una grabación nueva (ver interrumpir_voz_pc()).
-PROCESO_VOZ_PC = None
+# ============================================================
+# SUBSISTEMA DE TEXT-TO-SPEECH (TTS) - FACHADAS DE COMPATIBILIDAD
+# ============================================================
+
+VOZ_EDGE = _tts.VOZ_EDGE_DEFAULT
+FILTROS_VOZ = dict(_tts.FILTROS_VOZ_DEFAULT)
+EFECTO_VOZ = _tts.EFECTO_VOZ_DEFAULT
+PIPER_MODELO = _tts.PIPER_MODELO_DEFAULT
+MINUTOS_VIDA_ARCHIVOS = _tts.MINUTOS_VIDA_ARCHIVOS
 
 
-# Voz femenina mexicana (la más natural en las pruebas); se puede cambiar con MADELINE_VOZ en el .env
-# (edge-tts --list-voices | grep es-).
-VOZ_EDGE = os.getenv("MADELINE_VOZ", "es-MX-DaliaNeural").strip()
-
-# Efecto de "asistente digital" sobre la voz: eco corto de
-# sala y brillo en los agudos (sin bajarle el tono, para que siga
-# sonando como ella). No clona ninguna
-# voz real, solo procesa la de edge-tts. Se elige en el .env con
-# MADELINE_EFECTO_VOZ=sutil | holografico | ninguno. Cuesta ~0.25 s.
-FILTROS_VOZ = {
-    "sutil": (
-        "highpass=f=90,equalizer=f=250:t=q:w=1:g=2,"
-        "equalizer=f=3500:t=q:w=1.2:g=2.5,"
-        "aecho=0.8:0.6:28|47:0.16|0.09,volume=1.4,alimiter=limit=0.9"
-    ),
-    "holografico": (
-        "highpass=f=110,equalizer=f=3000:t=q:w=1:g=3,"
-        "chorus=0.7:0.9:20|32:0.25|0.18:0.3|0.25:2|2.3,"
-        "aecho=0.8:0.7:35|60:0.22|0.12,volume=1.3,alimiter=limit=0.9"
-    ),
-}
-EFECTO_VOZ = os.getenv("MADELINE_EFECTO_VOZ", "ninguno").strip().lower()
-
-
-# Voz de respaldo para cuando edge-tts falla (sin internet, o Microsoft
-# cambia algo como en octubre de 2026 y Madeline quedó muda). Usa Piper si
-# está instalado (piper-tts-bin del AUR + un modelo .onnx en
-# MADELINE_PIPER_MODELO) y si no espeak-ng. Es binario "piper-tts" y no
-# "piper": en Arch "piper" es el configurador de ratones gamer.
-PIPER_MODELO = os.getenv("MADELINE_PIPER_MODELO", "").strip()
+def __getattr__(name: str):
+    """Resuelve dinámicamente PROCESO_VOZ_PC para mantener compatibilidad con inspección externa."""
+    if name == "PROCESO_VOZ_PC":
+        return _tts._PROCESO_VOZ_PC
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 async def generar_voz_local(texto: str, ruta_salida: str) -> bool:
-    """Genera la voz con un motor local en ruta_salida. Devuelve False
-    si no hay ningún motor instalado o si falló."""
-    ruta_wav = f"{ruta_salida}.local.wav"
-
-    if PIPER_MODELO and shutil.which("piper-tts"):
-        comando = ["piper-tts", "--model", PIPER_MODELO, "--output_file", ruta_wav]
-        entrada = texto.encode()
-    elif shutil.which("espeak-ng"):
-        comando = ["espeak-ng", "-v", "es-419+f3", "-s", "165", "-w", ruta_wav, texto]
-        entrada = None
-    else:
-        print("[!] No hay voz local de respaldo: instala espeak-ng o piper-tts.")
-        return False
-
-    try:
-        proceso = await asyncio.create_subprocess_exec(
-            *comando,
-            stdin=subprocess.PIPE if entrada else subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        await proceso.communicate(entrada)
-
-        if proceso.returncode != 0 or not os.path.exists(ruta_wav):
-            return False
-
-        # Se pasa a MP3 porque el archivo se llama .mp3 y el teléfono lo
-        # pide así. Sin ffmpeg queda el WAV: mpv lo reproduce igual.
-        if not shutil.which("ffmpeg"):
-            os.replace(ruta_wav, ruta_salida)
-            return True
-
-        proceso = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", ruta_wav, "-c:a", "libmp3lame", "-q:a", "3", ruta_salida,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        await proceso.communicate()
-        return proceso.returncode == 0
-
-    finally:
-        if os.path.exists(ruta_wav):
-            os.remove(ruta_wav)
-
-
-async def generar_voz(texto: str, ruta_salida: str):
-    """Genera la voz de Madeline en ruta_salida con edge-tts y, si falla,
-    con la voz local de respaldo. Solo lanza la excepción de edge-tts
-    si tampoco hay voz local."""
-    try:
-        await generar_voz_edge(texto, ruta_salida)
-    except Exception as e:
-        print(f"[!] edge-tts falló, uso la voz local de respaldo: {e}")
-        if not await generar_voz_local(texto, ruta_salida):
-            raise
+    """Fachada de compatibilidad para services.tts.generar_voz_local."""
+    return await _tts.generar_voz_local(texto, ruta_salida, piper_modelo=PIPER_MODELO)
 
 
 async def generar_voz_edge(texto: str, ruta_salida: str):
-    """Genera la voz de Madeline en ruta_salida (MP3), con el efecto de
-    EFECTO_VOZ si hay ffmpeg. Si el efecto falla, queda la voz limpia:
-    nunca te quedas sin respuesta por culpa del filtro."""
-    voz = edge_tts.Communicate(texto, voice=VOZ_EDGE)
-    filtro = FILTROS_VOZ.get(EFECTO_VOZ)
+    """Fachada de compatibilidad para services.tts.generar_voz_edge."""
+    await _tts.generar_voz_edge(
+        texto,
+        ruta_salida,
+        voz_edge=VOZ_EDGE,
+        efecto=EFECTO_VOZ,
+        filtros=FILTROS_VOZ,
+    )
 
-    if not filtro or not shutil.which("ffmpeg"):
-        await voz.save(ruta_salida)
-        return
 
-    ruta_cruda = f"{ruta_salida}.crudo.mp3"
-
-    try:
-        await voz.save(ruta_cruda)
-
-        proceso = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", ruta_cruda, "-af", filtro,
-            "-c:a", "libmp3lame", "-q:a", "3", ruta_salida,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
-        _, error = await proceso.communicate()
-
-        if proceso.returncode != 0:
-            print(f"[!] Falló el efecto de voz, uso la voz limpia: {error.decode()[:200]}")
-            os.replace(ruta_cruda, ruta_salida)
-
-    finally:
-        if os.path.exists(ruta_cruda):
-            os.remove(ruta_cruda)
+async def generar_voz(texto: str, ruta_salida: str):
+    """Fachada de compatibilidad para services.tts.generar_voz."""
+    await _tts.generar_voz(
+        texto,
+        ruta_salida,
+        efecto=EFECTO_VOZ,
+        filtros=FILTROS_VOZ,
+        voz_edge=VOZ_EDGE,
+        piper_modelo=PIPER_MODELO,
+    )
 
 
 def interrumpir_voz_pc():
-    """Corta lo que Madeline esté diciendo en el PC ahora mismo, si hay
-    algo sonando. Se llama apenas arranca una grabación nueva, para
-    que la voz de Madeline no se solape con lo que estés por decir."""
-    global PROCESO_VOZ_PC
-
-    if PROCESO_VOZ_PC is not None and PROCESO_VOZ_PC.poll() is None:
-        try:
-            PROCESO_VOZ_PC.terminate()
-        except Exception as e:
-            print(f"[!] No se pudo interrumpir la voz: {e}")
-
-    PROCESO_VOZ_PC = None
+    """Fachada de compatibilidad para services.tts.interrumpir_voz_pc."""
+    _tts.interrumpir_voz_pc()
 
 
 async def hablar_por_parlantes(texto: str):
-    """
-    Genera la voz de Madeline y la reproduce SOLO en los parlantes del PC.
-    """
-    global PROCESO_VOZ_PC
-
-    if not texto:
-        return
-
-    # Nombre único: si un recordatorio sonaba mientras Madeline hablaba,
-    # los dos escribían (y borraban) el mismo archivo.
-    ruta_respuesta = f"/tmp/respuesta_madeline_pc_{uuid.uuid4().hex[:12]}.mp3"
-    proceso = None
-
-    try:
-        await generar_voz(texto, ruta_respuesta)
-
-        # Popen (no subprocess.run) + espera con asyncio.sleep: así NO
-        # se bloquea el event loop mientras habla, y el servidor puede
-        # seguir atendiendo otras solicitudes en paralelo — sin esto,
-        # una grabación nueva ni siquiera podría LLEGAR a interrumpir
-        # nada, porque el servidor entero estaría trabado esperando a
-        # que termine de hablar.
-        proceso = subprocess.Popen(
-            ["mpv", "--no-video", ruta_respuesta],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        PROCESO_VOZ_PC = proceso
-        poner_estado_avatar("hablando")
-
-        while proceso.poll() is None:
-            await asyncio.sleep(0.1)
-
-    except Exception as e:
-        print(f"[!] Falló la voz local del PC: {e}")
-
-    finally:
-        if proceso is not None and PROCESO_VOZ_PC is proceso:
-            PROCESO_VOZ_PC = None
-            poner_estado_avatar("quieta")
-        if os.path.exists(ruta_respuesta):
-            try:
-                os.remove(ruta_respuesta)
-            except Exception:
-                pass
-
-
-MINUTOS_VIDA_ARCHIVOS = 10
+    """Fachada de compatibilidad para services.tts.hablar_por_parlantes."""
+    await _tts.hablar_por_parlantes(
+        texto,
+        callback_avatar=poner_estado_avatar,
+        efecto=EFECTO_VOZ,
+        filtros=FILTROS_VOZ,
+        voz_edge=VOZ_EDGE,
+        piper_modelo=PIPER_MODELO,
+    )
 
 
 def limpiar_archivos_viejos():
-    """Borra audios para el teléfono y capturas con más de 10 minutos.
-    Antes los audios se acumulaban para siempre en /tmp/madeline_audios,
-    y las capturas pedidas desde el PC (que nadie descarga por
-    /captura/{id}) también quedaban en /tmp."""
-    limite = time.time() - MINUTOS_VIDA_ARCHIVOS * 60
-    candidatos = [os.path.join(CARPETA_AUDIOS, n) for n in os.listdir(CARPETA_AUDIOS)]
-    candidatos += [
-        os.path.join("/tmp", n) for n in os.listdir("/tmp")
+    """Borra audios para el teléfono y capturas con más de 10 minutos."""
+    _tts.limpiar_audios_viejos(CARPETA_AUDIOS, minutos=MINUTOS_VIDA_ARCHIVOS)
+
+    limite = time.time() - (MINUTOS_VIDA_ARCHIVOS * 60)
+    candidatos = [
+        os.path.join("/tmp", n)
+        for n in os.listdir("/tmp")
         if n.startswith("captura_madeline_")
     ]
 
@@ -5016,7 +4885,7 @@ def limpiar_archivos_viejos():
         except OSError:
             pass
 
-    limite_bandeja = time.time() - HORAS_VIDA_BANDEJA * 3600
+    limite_bandeja = time.time() - (HORAS_VIDA_BANDEJA * 3600)
     for captura in capturas_en_bandeja():
         if captura["creada"] < limite_bandeja:
             try:
@@ -5026,74 +4895,32 @@ def limpiar_archivos_viejos():
 
 
 async def generar_audio_para_telefono(texto: str) -> str | None:
-    """
-    Genera la voz de Madeline para el teléfono.
-
-    NO reproduce el audio en el PC.
-    Simplemente genera el archivo y devuelve su ruta HTTP.
-    """
-
-    if not texto:
-        return None
-
+    """Fachada de compatibilidad para services.tts.generar_audio_para_telefono."""
     limpiar_archivos_viejos()
-
-    nombre_archivo = f"respuesta_madeline_{uuid.uuid4().hex[:12]}.mp3"
-
-    ruta_archivo = os.path.join(
-        CARPETA_AUDIOS,
-        nombre_archivo
+    return await _tts.generar_audio_para_telefono(
+        texto,
+        carpeta=CARPETA_AUDIOS,
+        efecto=EFECTO_VOZ,
+        filtros=FILTROS_VOZ,
+        voz_edge=VOZ_EDGE,
+        piper_modelo=PIPER_MODELO,
     )
 
-    try:
-        await generar_voz(texto, ruta_archivo)
-
-        print(
-            f"[*] Audio para teléfono generado: "
-            f"{ruta_archivo}"
-        )
-
-        # CARPETA_AUDIOS está montada como /audios
-        return f"/audios/{nombre_archivo}"
-
-    except Exception as e:
-        print(
-            f"[!] Falló la generación de voz "
-            f"para teléfono: {e}"
-        )
-
-        if os.path.exists(ruta_archivo):
-            try:
-                os.remove(ruta_archivo)
-            except Exception:
-                pass
-
-        return None
 
 async def procesar_salida_de_voz(
     texto: str,
     origen: str
 ) -> str | None:
-    """
-    Decide dónde debe salir la voz de Madeline.
-
-    PC:
-        reproduce localmente y devuelve None.
-
-    TELEFONO:
-        genera un archivo para que Flutter lo reproduzca.
-    """
-
-    origen = origen.lower().strip()
-
-    if origen == "telefono":
-        return await generar_audio_para_telefono(texto)
-
-    # Por defecto todo lo que no sea teléfono
-    # se considera PC.
-    await hablar_por_parlantes(texto)
-
-    return None
+    """Fachada de compatibilidad para services.tts.procesar_salida_de_voz."""
+    return await _tts.procesar_salida_de_voz(
+        texto,
+        origen,
+        callback_avatar=poner_estado_avatar,
+        efecto=EFECTO_VOZ,
+        filtros=FILTROS_VOZ,
+        voz_edge=VOZ_EDGE,
+        piper_modelo=PIPER_MODELO,
+    )
 
 PISTA_VOCABULARIO = (
     "Uso a Madeline para controlar mi computadora: "
