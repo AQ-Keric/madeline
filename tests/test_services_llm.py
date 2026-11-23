@@ -2,13 +2,13 @@
 
 Cubre:
 1. Contratos neutrales y tipado (LLMRole, LLMMessage, LLMToolDefinition, LLMToolChoice,
-   LLMRequest, LLMResponse, LLMToolCall, validación estricta y ausencia de dependencias Groq).
+   LLMRequest, LLMResponse, LLMToolCall, validaciones estrictas y ausencia de dependencias Groq).
 2. Configuración histórica del adaptador Groq (modelo por defecto 'openai/gpt-oss-120b',
    visión 'qwen/qwen3.6-27b', timeout 20s, max_retries 1, inicialización perezosa).
 3. Conversión de estructuras neutrales a payload Groq y generación de texto.
 4. Soporte y mapeo de tool calls (un tool call, múltiples, argumentos inválidos).
-5. Análisis multimodal de visión (validación estricta de PNG/JPG/JPEG, normalización MIME,
-   rechazo de extensiones no admitidas, parámetros históricos, limpieza de <think>).
+5. Análisis multimodal de visión (validación estricta de PNG/JPG/JPEG antes de cliente,
+   normalización MIME, rechazo de extensiones no admitidas, parámetros históricos, limpieza de <think>).
 6. Concurrencia y cancelación (ejecución no bloqueante en to_thread, semántica de cancelación).
 7. Mapeo exhaustivo de excepciones y preservación estricta de causalidad (__cause__).
 """
@@ -16,7 +16,6 @@ Cubre:
 import asyncio
 import base64
 import os
-import sys
 import threading
 import time
 import unittest
@@ -85,7 +84,7 @@ class MockChatCompletion:
 
 
 class TestLLMContracts(unittest.TestCase):
-    """1. Pruebas de contratos de datos neutrales y validación de tipos."""
+    """1. Pruebas de contratos de datos neutrales y validación estricta de tipos."""
 
     def test_roles_enum_y_valores(self):
         self.assertEqual(LLMRole.SYSTEM.value, "system")
@@ -119,111 +118,93 @@ class TestLLMContracts(unittest.TestCase):
             LLMMessage(rol="rol_inexistente", contenido="hola")
         self.assertIn("no reconocido", str(ctx.exception))
 
-    def test_message_validacion_contenido_none_sin_tools(self):
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=123, contenido="hola")
+        self.assertIn("Tipo inesperado", str(ctx.exception))
+
+    def test_message_system_user_contenido_invalido(self):
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=LLMRole.SYSTEM, contenido=None)
+        self.assertIn("deben tener contenido de texto", str(ctx.exception))
+
         with self.assertRaises(LLMValidationError) as ctx:
             LLMMessage(rol=LLMRole.USER, contenido=None)
-        self.assertIn("no puede tener contenido None sin tool_calls", str(ctx.exception))
+        self.assertIn("deben tener contenido de texto", str(ctx.exception))
 
-    def test_message_validacion_contenido_tipo_invalido(self):
         with self.assertRaises(LLMValidationError) as ctx:
             LLMMessage(rol=LLMRole.USER, contenido=12345)
-        self.assertIn("debe ser str o None", str(ctx.exception))
+        self.assertIn("deben tener contenido de texto", str(ctx.exception))
 
-    def test_tool_definition_valida(self):
-        td = LLMToolDefinition(
-            nombre="obtener_clima",
-            descripcion="Devuelve el clima de una ciudad",
-            parametros={"type": "object", "properties": {"ciudad": {"type": "string"}}},
-        )
-        self.assertEqual(td.nombre, "obtener_clima")
-        self.assertEqual(td.descripcion, "Devuelve el clima de una ciudad")
-        self.assertEqual(td.parametros["type"], "object")
-
-    def test_tool_definition_nombre_vacio_lanza_error(self):
+    def test_message_assistant_contenido_none_sin_tools_falla(self):
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMToolDefinition(nombre="", descripcion="desc")
-        self.assertIn("no vacía", str(ctx.exception))
+            LLMMessage(rol=LLMRole.ASSISTANT, contenido=None, tool_calls=[])
+        self.assertIn("no puede tener contenido None sin tool_calls", str(ctx.exception))
 
-    def test_tool_definition_parametros_no_dict_lanza_error(self):
+    def test_message_tool_calls_no_es_lista(self):
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMToolDefinition(nombre="f", descripcion="d", parametros="no_dict")
-        self.assertIn("deben ser un diccionario", str(ctx.exception))
+            LLMMessage(rol=LLMRole.ASSISTANT, contenido="ok", tool_calls="no_lista")
+        self.assertIn("debe ser una lista", str(ctx.exception))
 
-    def test_tool_choice_modos(self):
-        c_auto = LLMToolChoice.auto()
-        self.assertEqual(c_auto.modo, LLMToolChoiceMode.AUTO)
-
-        c_none = LLMToolChoice.none()
-        self.assertEqual(c_none.modo, LLMToolChoiceMode.NONE)
-
-        c_req = LLMToolChoice.required()
-        self.assertEqual(c_req.modo, LLMToolChoiceMode.REQUIRED)
-
-        c_spec = LLMToolChoice.specific("mi_tool")
-        self.assertEqual(c_spec.modo, LLMToolChoiceMode.SPECIFIC)
-        self.assertEqual(c_spec.nombre_herramienta, "mi_tool")
-
-    def test_tool_choice_specific_sin_nombre_lanza_error(self):
+    def test_message_tool_calls_elementos_invalidos(self):
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMToolChoice(modo=LLMToolChoiceMode.SPECIFIC, nombre_herramienta=None)
-        self.assertIn("requiere especificar nombre_herramienta", str(ctx.exception))
+            LLMMessage(rol=LLMRole.ASSISTANT, contenido="ok", tool_calls=["string_no_call"])
+        self.assertIn("debe ser una instancia de LLMToolCall", str(ctx.exception))
 
-    def test_tool_choice_modo_invalido_lanza_error(self):
+    def test_message_no_assistant_con_tool_calls_falla(self):
+        tc = LLMToolCall(id="c1", nombre="f", argumentos={})
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMToolChoice(modo="modo_inventado")
-        self.assertIn("no reconocido", str(ctx.exception))
+            LLMMessage(rol=LLMRole.USER, contenido="hola", tool_calls=[tc])
+        self.assertIn("Solo los mensajes con rol ASSISTANT pueden contener tool_calls", str(ctx.exception))
 
-    def test_request_valida_con_y_sin_tools(self):
-        req_sin_tools = LLMRequest(mensajes=[LLMMessage.user("hola")])
-        self.assertEqual(len(req_sin_tools.mensajes), 1)
-        self.assertIsNone(req_sin_tools.tools)
-
-        req_con_tools = LLMRequest(
-            mensajes=[LLMMessage.user("busca")],
-            tools=[LLMToolDefinition(nombre="t", descripcion="d")],
-            tool_choice=LLMToolChoice.auto(),
-        )
-        self.assertEqual(len(req_con_tools.tools), 1)
-        self.assertEqual(req_con_tools.tool_choice.modo, LLMToolChoiceMode.AUTO)
-
-    def test_request_mensajes_vacio_lanza_error(self):
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMRequest(mensajes=[])
-        self.assertIn("lista no vacía", str(ctx.exception))
+            LLMMessage(rol=LLMRole.SYSTEM, contenido="sys", tool_calls=[tc])
+        self.assertIn("Solo los mensajes con rol ASSISTANT pueden contener tool_calls", str(ctx.exception))
 
-    def test_request_elemento_no_llmmessage_lanza_error(self):
+    def test_message_tool_sin_tool_call_id_falla(self):
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMRequest(mensajes=["no_es_llmmessage"])
-        self.assertIn("debe ser una instancia de LLMMessage", str(ctx.exception))
+            LLMMessage(rol=LLMRole.TOOL, contenido="res", tool_call_id=None)
+        self.assertIn("requieren un 'tool_call_id' no vacío", str(ctx.exception))
 
-    def test_request_tool_no_llmtooldefinition_lanza_error(self):
         with self.assertRaises(LLMValidationError) as ctx:
-            LLMRequest(mensajes=[LLMMessage.user("a")], tools=["no_es_tool_def"])
-        self.assertIn("debe ser una instancia de LLMToolDefinition", str(ctx.exception))
+            LLMMessage(rol=LLMRole.TOOL, contenido="res", tool_call_id="")
+        self.assertIn("requieren un 'tool_call_id' no vacío", str(ctx.exception))
 
-    def test_response_normal_text_sin_tools(self):
-        resp = LLMResponse(texto="Respuesta simple", modelo="modelo-a", proveedor="groq")
-        self.assertEqual(resp.texto, "Respuesta simple")
-        self.assertEqual(resp.tool_calls, [])
-        self.assertIsNone(resp.finish_reason)
-        self.assertEqual(resp.modelo, "modelo-a")
-        self.assertEqual(resp.proveedor, "groq")
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=LLMRole.TOOL, contenido="res", tool_call_id="   ")
+        self.assertIn("requieren un 'tool_call_id' no vacío", str(ctx.exception))
 
-    def test_response_multiple_tool_calls_texto_none(self):
-        tc1 = LLMToolCall(id="c1", nombre="fn1", argumentos={"x": 1})
-        tc2 = LLMToolCall(id="c2", nombre="fn2", argumentos={"y": 2})
-        resp = LLMResponse(
-            texto=None,
-            tool_calls=[tc1, tc2],
-            finish_reason="tool_calls",
-            modelo="modelo-b",
-            proveedor="groq",
-        )
-        self.assertIsNone(resp.texto)
-        self.assertEqual(len(resp.tool_calls), 2)
-        self.assertEqual(resp.tool_calls[0].nombre, "fn1")
-        self.assertEqual(resp.tool_calls[1].nombre, "fn2")
-        self.assertEqual(resp.finish_reason, "tool_calls")
+    def test_message_no_tool_con_tool_call_id_falla(self):
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=LLMRole.USER, contenido="hola", tool_call_id="c1")
+        self.assertIn("Solo los mensajes con rol TOOL pueden tener 'tool_call_id'", str(ctx.exception))
+
+    def test_tool_call_id_y_nombre_vacios_lanzan_error(self):
+        # ID vacío
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="", nombre="calc", argumentos={})
+        self.assertIn("id", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="   ", nombre="calc", argumentos={})
+        self.assertIn("id", str(ctx.exception))
+
+        # Nombre vacío
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="c1", nombre="", argumentos={})
+        self.assertIn("nombre", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="c1", nombre="  ", argumentos={})
+        self.assertIn("nombre", str(ctx.exception))
+
+        # from_raw con ID o nombre vacío
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall.from_raw("", "calc", "{}")
+        self.assertIn("id", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall.from_raw("c1", "", "{}")
+        self.assertIn("nombre", str(ctx.exception))
 
     def test_tool_call_from_raw_json_string(self):
         tc = LLMToolCall.from_raw("c1", "calcular", '{"a": 10, "b": "suma"}')
@@ -253,6 +234,366 @@ class TestLLMContracts(unittest.TestCase):
         with self.assertRaises(LLMValidationError) as ctx:
             LLMToolCall.from_raw("c1", "test", "[1, 2, 3]")
         self.assertIn("deben ser un objeto JSON (dict)", str(ctx.exception))
+
+    def test_tool_definition_valida(self):
+        td = LLMToolDefinition(
+            nombre="obtener_clima",
+            descripcion="Devuelve el clima de una ciudad",
+            parametros={"type": "object", "properties": {"ciudad": {"type": "string"}}},
+        )
+        self.assertEqual(td.nombre, "obtener_clima")
+        self.assertEqual(td.descripcion, "Devuelve el clima de una ciudad")
+        self.assertEqual(td.parametros["type"], "object")
+
+    def test_tool_definition_nombre_vacio_lanza_error(self):
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolDefinition(nombre="", descripcion="desc")
+        self.assertIn("no vacía", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolDefinition(nombre="   ", descripcion="desc")
+        self.assertIn("no vacía", str(ctx.exception))
+
+    def test_tool_definition_parametros_no_dict_lanza_error(self):
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolDefinition(nombre="f", descripcion="d", parametros="no_dict")
+        self.assertIn("deben ser un diccionario", str(ctx.exception))
+
+    def test_tool_choice_modos_y_validaciones(self):
+        c_auto = LLMToolChoice.auto()
+        self.assertEqual(c_auto.modo, LLMToolChoiceMode.AUTO)
+
+        c_none = LLMToolChoice.none()
+        self.assertEqual(c_none.modo, LLMToolChoiceMode.NONE)
+
+        c_req = LLMToolChoice.required()
+        self.assertEqual(c_req.modo, LLMToolChoiceMode.REQUIRED)
+
+        c_spec = LLMToolChoice.specific("mi_tool")
+        self.assertEqual(c_spec.modo, LLMToolChoiceMode.SPECIFIC)
+        self.assertEqual(c_spec.nombre_herramienta, "mi_tool")
+
+        # Modo incorrecto tipo primitivo
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolChoice(modo=123)
+        self.assertIn("Tipo inesperado para 'modo'", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolChoice(modo=["auto"])
+        self.assertIn("Tipo inesperado para 'modo'", str(ctx.exception))
+
+        # Modo string inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolChoice(modo="modo_inventado")
+        self.assertIn("no reconocido", str(ctx.exception))
+
+        # Modo specific con nombre vacío
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolChoice(modo=LLMToolChoiceMode.SPECIFIC, nombre_herramienta=None)
+        self.assertIn("requiere especificar un 'nombre_herramienta' no vacío", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolChoice(modo=LLMToolChoiceMode.SPECIFIC, nombre_herramienta="   ")
+        self.assertIn("requiere especificar un 'nombre_herramienta' no vacío", str(ctx.exception))
+
+    def test_request_valida_con_y_sin_tools(self):
+        req_sin_tools = LLMRequest(mensajes=[LLMMessage.user("hola")])
+        self.assertEqual(len(req_sin_tools.mensajes), 1)
+        self.assertIsNone(req_sin_tools.tools)
+
+        req_con_tools = LLMRequest(
+            mensajes=[LLMMessage.user("busca")],
+            tools=[LLMToolDefinition(nombre="t", descripcion="d")],
+            tool_choice=LLMToolChoice.auto(),
+            temperature=0.5,
+            max_tokens=100,
+            timeout=10.0,
+            model="custom-model",
+            reasoning_effort="low",
+        )
+        self.assertEqual(len(req_con_tools.tools), 1)
+        self.assertEqual(req_con_tools.tool_choice.modo, LLMToolChoiceMode.AUTO)
+
+    def test_request_validaciones_estrictas(self):
+        # Mensajes vacíos
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[])
+        self.assertIn("lista no vacía", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=["no_es_llmmessage"])
+        self.assertIn("debe ser una instancia de LLMMessage", str(ctx.exception))
+
+        # Tools no lista o elementos inválidos
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], tools="no_lista")
+        self.assertIn("debe ser una lista", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], tools=["no_tool_def"])
+        self.assertIn("debe ser una instancia de LLMToolDefinition", str(ctx.exception))
+
+        # Tool choice tipo incorrecto
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], tool_choice=123)
+        self.assertIn("tool_choice debe ser LLMToolChoice, str o None", str(ctx.exception))
+
+        # Temperature inválida
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], temperature=-1.0)
+        self.assertIn("temperature debe ser un número finito no negativo", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], temperature="caliente")
+        self.assertIn("temperature debe ser un número finito no negativo", str(ctx.exception))
+
+        # Max tokens inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], max_tokens=0)
+        self.assertIn("max_tokens debe ser un entero positivo", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], max_tokens=-50)
+        self.assertIn("max_tokens debe ser un entero positivo", str(ctx.exception))
+
+        # Timeout inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], timeout=0)
+        self.assertIn("timeout debe ser un número finito positivo", str(ctx.exception))
+
+        # Model vacío o con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], model="   ")
+        self.assertIn("model debe ser una cadena no vacía", str(ctx.exception))
+
+        # Reasoning effort inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], reasoning_effort="   ")
+        self.assertIn("reasoning_effort debe ser una cadena no vacía", str(ctx.exception))
+
+    def test_request_tool_choice_specific_consistencia_escenarios(self):
+        """1. Consistencia de LLMToolChoice.SPECIFIC respecto de tools declaradas."""
+        tool_calc = LLMToolDefinition(nombre="calcular", descripcion="Calcula algo")
+        tool_hora = LLMToolDefinition(nombre="hora_actual", descripcion="Hora actual")
+
+        # Escenario 1: SPECIFIC sin tools declaradas (tools=None)
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(
+                mensajes=[LLMMessage.user("hola")],
+                tools=None,
+                tool_choice=LLMToolChoice.specific("calcular"),
+            )
+        self.assertIn("requiere que 'tools' contenga al menos una herramienta declarada", str(ctx.exception))
+
+        # Escenario 1b: SPECIFIC con lista de tools vacía
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(
+                mensajes=[LLMMessage.user("hola")],
+                tools=[],
+                tool_choice=LLMToolChoice.specific("calcular"),
+            )
+        self.assertIn("requiere que 'tools' contenga al menos una herramienta declarada", str(ctx.exception))
+
+        # Escenario 2: SPECIFIC con nombre que no existe en tools declaradas
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(
+                mensajes=[LLMMessage.user("hola")],
+                tools=[tool_hora],
+                tool_choice=LLMToolChoice.specific("calcular"),
+            )
+        self.assertIn("no existe entre las herramientas declaradas", str(ctx.exception))
+
+        # Escenario 3: SPECIFIC con herramienta existente y nombres únicos -> éxito
+        req_valido = LLMRequest(
+            mensajes=[LLMMessage.user("hola")],
+            tools=[tool_hora, tool_calc],
+            tool_choice=LLMToolChoice.specific("calcular"),
+        )
+        self.assertEqual(req_valido.tool_choice.modo, LLMToolChoiceMode.SPECIFIC)
+        self.assertEqual(req_valido.tool_choice.nombre_herramienta, "calcular")
+
+    def test_request_unicidad_nombres_herramientas(self):
+        """Comprueba que no se permitan nombres duplicados en 'tools' y no se altere la lista original."""
+        tool_a1 = LLMToolDefinition(nombre="buscar", descripcion="Primera versión")
+        tool_a2 = LLMToolDefinition(nombre="buscar", descripcion="Segunda versión con mismo nombre")
+        tool_b = LLMToolDefinition(nombre="calcular", descripcion="Otra herramienta")
+        tool_c = LLMToolDefinition(nombre="hora", descripcion="Tercera herramienta")
+
+        # 1. Dos herramientas con el mismo nombre
+        lista_tools_original = [tool_a1, tool_a2]
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("hola")], tools=lista_tools_original)
+        self.assertIn("duplicados", str(ctx.exception).lower())
+        self.assertIn("buscar", str(ctx.exception))
+        # Verificar que no modificó ni deduplicó la lista original
+        self.assertEqual(len(lista_tools_original), 2)
+        self.assertEqual(lista_tools_original[0], tool_a1)
+        self.assertEqual(lista_tools_original[1], tool_a2)
+
+        # 2. Múltiples herramientas con duplicados
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(
+                mensajes=[LLMMessage.user("hola")],
+                tools=[tool_a1, tool_b, tool_a2, tool_b],
+            )
+        self.assertIn("buscar", str(ctx.exception))
+        self.assertIn("calcular", str(ctx.exception))
+
+        # 3. Varias herramientas con nombres distintos
+        req_distintas = LLMRequest(
+            mensajes=[LLMMessage.user("hola")],
+            tools=[tool_a1, tool_b, tool_c],
+        )
+        self.assertEqual(len(req_distintas.tools), 3)
+
+        # 4. SPECIFIC con herramienta válida y nombres únicos
+        req_spec = LLMRequest(
+            mensajes=[LLMMessage.user("hola")],
+            tools=[tool_a1, tool_b],
+            tool_choice=LLMToolChoice.specific("buscar"),
+        )
+        self.assertEqual(req_spec.tool_choice.nombre_herramienta, "buscar")
+
+    def test_request_validacion_numerica_nan_e_infinito(self):
+        """2. Validación numérica: rechazo de NaN, infinitos, booleanos y manejo sin OverflowError de enteros grandes."""
+        msg = [LLMMessage.user("hola")]
+
+        # Temperature: NaN, +inf, -inf
+        for val in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(temperature=val):
+                with self.assertRaises(LLMValidationError) as ctx:
+                    LLMRequest(mensajes=msg, temperature=val)
+                self.assertIn("finito no negativo", str(ctx.exception))
+
+        # Timeout: NaN, +inf, -inf
+        for val in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(timeout=val):
+                with self.assertRaises(LLMValidationError) as ctx:
+                    LLMRequest(mensajes=msg, timeout=val)
+                self.assertIn("finito positivo", str(ctx.exception))
+
+        # Booleanos explícitamente rechazados
+        for bool_val in (True, False):
+            with self.subTest(bool_temp=bool_val):
+                with self.assertRaises(LLMValidationError) as ctx:
+                    LLMRequest(mensajes=msg, temperature=bool_val)
+                self.assertIn("finito no negativo", str(ctx.exception))
+
+            with self.subTest(bool_timeout=bool_val):
+                with self.assertRaises(LLMValidationError) as ctx:
+                    LLMRequest(mensajes=msg, timeout=bool_val)
+                self.assertIn("finito positivo", str(ctx.exception))
+
+        # Enteros extremadamente grandes (ej. 10**1000) no deben producir OverflowError
+        gran_entero_positivo = 10**1000
+        gran_entero_negativo = -(10**1000)
+
+        # Positivos válidos
+        req_gran_num = LLMRequest(
+            mensajes=msg,
+            temperature=gran_entero_positivo,
+            timeout=gran_entero_positivo,
+        )
+        self.assertEqual(req_gran_num.temperature, gran_entero_positivo)
+        self.assertEqual(req_gran_num.timeout, gran_entero_positivo)
+
+        # Negativos gigantes deben lanzar LLMValidationError (NO OverflowError)
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=msg, temperature=gran_entero_negativo)
+        self.assertIn("finito no negativo", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=msg, timeout=gran_entero_negativo)
+        self.assertIn("finito positivo", str(ctx.exception))
+
+    def test_identificadores_con_espacios_exteriores_rechazados(self):
+        """3. Normalización/validación de identificadores: rechazo estricto de espacios exteriores."""
+        # LLMToolCall: id y nombre con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id=" call_1", nombre="calc", argumentos={})
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="call_1 ", nombre="calc", argumentos={})
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="call_1", nombre=" calc", argumentos={})
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall(id="call_1", nombre="calc ", argumentos={})
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        # from_raw con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall.from_raw(" call_1", "calc", "{}")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolCall.from_raw("call_1", " calc", "{}")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        # LLMToolDefinition con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolDefinition(nombre=" calc", descripcion="d")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolDefinition(nombre="calc ", descripcion="d")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        # LLMMessage tool_call_id con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=LLMRole.TOOL, contenido="ok", tool_call_id=" call_1")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=LLMRole.TOOL, contenido="ok", tool_call_id="call_1 ")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        # LLMMessage nombre con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMMessage(rol=LLMRole.TOOL, contenido="ok", tool_call_id="call_1", nombre=" hora ")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        # LLMToolChoice specific con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMToolChoice.specific(" calc ")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        # LLMRequest model y reasoning_effort con espacios exteriores
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], model=" gpt-model ")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMRequest(mensajes=[LLMMessage.user("a")], reasoning_effort=" low ")
+        self.assertIn("no debe contener espacios al inicio o al final", str(ctx.exception))
+
+    def test_response_normal_text_sin_tools(self):
+        resp = LLMResponse(texto="Respuesta simple", modelo="modelo-a", proveedor="groq")
+        self.assertEqual(resp.texto, "Respuesta simple")
+        self.assertEqual(resp.tool_calls, [])
+        self.assertIsNone(resp.finish_reason)
+        self.assertEqual(resp.modelo, "modelo-a")
+        self.assertEqual(resp.proveedor, "groq")
+
+    def test_response_multiple_tool_calls_texto_none(self):
+        tc1 = LLMToolCall(id="c1", nombre="fn1", argumentos={"x": 1})
+        tc2 = LLMToolCall(id="c2", nombre="fn2", argumentos={"y": 2})
+        resp = LLMResponse(
+            texto=None,
+            tool_calls=[tc1, tc2],
+            finish_reason="tool_calls",
+            modelo="modelo-b",
+            proveedor="groq",
+        )
+        self.assertIsNone(resp.texto)
+        self.assertEqual(len(resp.tool_calls), 2)
+        self.assertEqual(resp.tool_calls[0].nombre, "fn1")
+        self.assertEqual(resp.tool_calls[1].nombre, "fn2")
+        self.assertEqual(resp.finish_reason, "tool_calls")
 
     def test_contratos_sin_dependencias_groq(self):
         import server.services.llm.base as base_mod
@@ -510,7 +851,7 @@ class TestGroqProviderToolCalls(unittest.IsolatedAsyncioTestCase):
 
 
 class TestGroqProviderVision(unittest.IsolatedAsyncioTestCase):
-    """5. Pruebas de análisis multimodal de visión y validación de imágenes."""
+    """5. Pruebas de análisis multimodal de visión y validación estricta de imágenes."""
 
     async def test_analizar_vision_png(self):
         mock_client = mock.MagicMock()
@@ -571,13 +912,43 @@ class TestGroqProviderVision(unittest.IsolatedAsyncioTestCase):
         mock_client = mock.MagicMock()
         provider = GroqProvider(api_key="gsk_test", client=mock_client)
 
-        formatos_invalidos = ["gif", "bmp", "webp", "tiff", "svg", "exe", ""]
+        formatos_invalidos = ["gif", "bmp", "webp", "tiff", "svg", "exe"]
         for ext in formatos_invalidos:
             with self.subTest(ext=ext):
                 with self.assertRaises(LLMValidationError) as ctx:
                     await provider.analizar_vision(b"bytes", ext, "¿qué es?")
                 self.assertIn("no admitida", str(ctx.exception))
                 self.assertIn("PNG, JPG, JPEG", str(ctx.exception))
+
+        with self.assertRaises(LLMValidationError) as ctx:
+            await provider.analizar_vision(b"bytes", "", "¿qué es?")
+        self.assertIn("no vacía", str(ctx.exception))
+
+    async def test_analizar_vision_argumentos_invalidos_sin_api_key_lanza_validation_error(self):
+        """Comprueba que la validación de extensión y argumentos ocurre ANTES de inicializar cliente."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("GROQ_API_KEY", None)
+            provider = GroqProvider()  # sin API key
+
+            # 1. Extensión no admitida -> debe fallar con LLMValidationError (NO LLMConfigurationError)
+            with self.assertRaises(LLMValidationError) as ctx:
+                await provider.analizar_vision(b"dummy_bytes", "gif", "¿qué ves?")
+            self.assertIn("no admitida", str(ctx.exception))
+
+            # 2. Extensión vacía -> debe fallar con LLMValidationError
+            with self.assertRaises(LLMValidationError) as ctx:
+                await provider.analizar_vision(b"dummy_bytes", "", "¿qué ves?")
+            self.assertIn("no vacía", str(ctx.exception))
+
+            # 3. Bytes vacíos -> debe fallar con LLMValidationError
+            with self.assertRaises(LLMValidationError) as ctx:
+                await provider.analizar_vision(b"", "png", "¿qué ves?")
+            self.assertIn("imagen_bytes debe ser un objeto bytes no vacío", str(ctx.exception))
+
+            # 4. Pregunta vacía -> debe fallar con LLMValidationError
+            with self.assertRaises(LLMValidationError) as ctx:
+                await provider.analizar_vision(b"dummy_bytes", "png", "   ")
+            self.assertIn("pregunta debe ser una cadena de texto no vacía", str(ctx.exception))
 
     async def test_analizar_vision_parametros_historicos_fijados(self):
         mock_client = mock.MagicMock()

@@ -365,10 +365,15 @@ class GroqProvider(LLMProvider):
     ) -> str:
         """Analiza una imagen codificada en base64 con el modelo de visión de Groq.
 
-        Valida explícitamente que la extensión corresponda a PNG, JPG o JPEG,
-        rechazando cualquier formato no admitido con LLMValidationError.
+        Valida explícitamente los argumentos y la extensión (PNG, JPG, JPEG) antes
+        de inicializar el cliente o acceder a credenciales.
         """
-        client = self._get_client()
+        # 1. Validación de argumentos antes de inicializar cliente o consultar credenciales
+        if not isinstance(extension, str) or not extension.strip():
+            raise LLMValidationError(
+                "La extensión de imagen debe ser una cadena no vacía.",
+                provider="groq",
+            )
 
         ext_limpia = extension.strip().lstrip(".").lower()
         if ext_limpia not in EXTENSIONES_VISION_PERMITIDAS:
@@ -377,6 +382,21 @@ class GroqProvider(LLMProvider):
                 provider="groq",
             )
         mime_type = EXTENSIONES_VISION_PERMITIDAS[ext_limpia]
+
+        if not isinstance(imagen_bytes, bytes) or len(imagen_bytes) == 0:
+            raise LLMValidationError(
+                "imagen_bytes debe ser un objeto bytes no vacío.",
+                provider="groq",
+            )
+
+        if not isinstance(pregunta, str) or not pregunta.strip():
+            raise LLMValidationError(
+                "pregunta debe ser una cadena de texto no vacía.",
+                provider="groq",
+            )
+
+        # 2. Inicialización perezosa del cliente
+        client = self._get_client()
 
         imagen_b64 = base64.b64encode(imagen_bytes).decode("utf-8")
         data_uri = f"data:{mime_type};base64,{imagen_b64}"
