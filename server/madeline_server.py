@@ -63,6 +63,41 @@ MODEL = "openai/gpt-oss-120b"
 # de junio de 2026). Este es el reemplazo que ellos mismos recomiendan
 # para casos con function calling — sigue soportando tools igual.
 
+from services.llm import (
+    LLMError,
+    LLMMessage,
+    LLMProvider,
+    LLMRateLimitError,
+    LLMRequest,
+    LLMResponse,
+    LLMTimeoutError,
+    LLMToolCall,
+    LLMToolCallRejectionError,
+    LLMToolChoice,
+    LLMToolDefinition,
+    GroqProvider,
+)
+
+# Instancia canónica del proveedor LLM del núcleo
+llm_provider: LLMProvider = GroqProvider(
+    client=client,
+    default_model=MODEL,
+    timeout=TIMEOUT_GROQ,
+    max_retries=1,
+)
+
+
+def obtener_llm_provider() -> LLMProvider:
+    """Obtiene la instancia configurada del proveedor LLM para el núcleo."""
+    global llm_provider
+    return llm_provider
+
+
+def fijar_llm_provider(proveedor: LLMProvider) -> None:
+    """Permite inyectar un proveedor LLM alternativo o simulado (ej. pruebas agnósticas)."""
+    global llm_provider
+    llm_provider = proveedor
+
 from core.models import (
     TurnoConversacion,
     AccionLocalReciente,
@@ -4223,26 +4258,30 @@ async def llamar_groq(parametros: dict):
 async def resumir_busqueda(pregunta: str, resultados_web: str) -> str:
     """Segunda llamada, lo más barata posible: sin historial, sin
     tools, prompt corto y snippets recortados (~500 tokens en total)."""
-    parametros = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt_con_fecha(SYSTEM_PROMPT_BUSQUEDA)},
-            {"role": "user", "content": f"Pregunta: {pregunta}\n\n{resultados_web[:1500]}"},
+    solicitud = LLMRequest(
+        mensajes=[
+            LLMMessage.system(system_prompt_con_fecha(SYSTEM_PROMPT_BUSQUEDA)),
+            LLMMessage.user(f"Pregunta: {pregunta}\n\n{resultados_web[:1500]}"),
         ],
-        "temperature": 0.2,
-        "max_completion_tokens": 250,
-        "reasoning_effort": "low",
-    }
+        model=MODEL,
+        temperature=0.2,
+        max_tokens=250,
+        reasoning_effort="low",
+    )
 
     try:
-        respuesta = await llamar_groq(parametros)
-        texto = limpiar_texto_para_voz(respuesta.choices[0].message.content or "")
-        if respuesta.choices[0].finish_reason == "length":
+        respuesta: LLMResponse = await llm_provider.generar_respuesta(solicitud)
+        texto = limpiar_texto_para_voz(respuesta.texto or "")
+        if respuesta.finish_reason == "length":
             texto = recortar_a_oracion_completa(texto)
         if texto:
             return texto
-    except (SinCuotaGroq, HTTPException):
-        pass
+    except LLMRateLimitError:
+        print("[!] Resumen de búsqueda: proveedor sin cuota, usando fallback con el primer resultado.")
+    except LLMTimeoutError as err:
+        print(f"[!] Resumen de búsqueda: timeout del proveedor LLM ({err}), usando fallback con el primer resultado.")
+    except (LLMError, HTTPException) as err:
+        print(f"[!] Resumen de búsqueda: error al generar resumen ({err}), usando fallback con el primer resultado.")
 
     # Sin cuota o sin respuesta: al menos el primer resultado, limpio.
     lineas = [l for l in resultados_web.splitlines()[1:] if l.strip()]
@@ -4614,74 +4653,106 @@ async def _procesar_mensaje(
                 audio_path=audio_path_response
             )
 
-        # 3. SOLO SI NO ES UN COMANDO LOCAL: usamos Groq con contexto mínimo.
-        mensajes = [{"role": "system", "content": system_prompt_con_fecha(SYSTEM_PROMPT)}]
+        # 3. SOLO SI NO ES UN COMANDO LOCAL: usamos LLM con contexto mínimo.
+        mensajes_llm: list[LLMMessage] = [
+            LLMMessage.system(system_prompt_con_fecha(SYSTEM_PROMPT))
+        ]
 
         contexto = contexto_para_pregunta(mensaje_usuario, origen=origen)
         if contexto:
-            mensajes.append({"role": "system", "content": contexto})
+            mensajes_llm.append(LLMMessage.system(contexto))
 
         # Recuerdos a largo plazo: solo los 2-3 relevantes, o nada.
         recuerdos = await asyncio.to_thread(memoria.contexto_recuerdos, mensaje_usuario)
         if recuerdos:
             print(f"[*] Memoria: {recuerdos}")
-            mensajes.append({"role": "system", "content": recuerdos})
+            mensajes_llm.append(LLMMessage.system(recuerdos))
 
         # Incorporar turnos conversacionales activos según ventana HOT o WARM
         for t in turnos_activos:
             edad = _calcular_edad(t.timestamp)
             if edad <= 60.0:
                 # HOT: siempre se incluye
-                mensajes.append({"role": "user", "content": t.usuario})
-                mensajes.append({"role": "assistant", "content": t.asistente})
+                mensajes_llm.append(LLMMessage.user(t.usuario))
+                mensajes_llm.append(LLMMessage.assistant(t.asistente))
             elif edad <= 300.0:
                 # WARM: solo si hay intención anafórica o de seguimiento
                 if intencion in ("ANAFORA_CONVERSACIONAL", "CORRECCION_USUARIO", "SEGUIMIENTO_ESTADO", "SEGUIMIENTO_PROCEDIMIENTO"):
-                    mensajes.append({"role": "user", "content": t.usuario})
-                    mensajes.append({"role": "assistant", "content": t.asistente})
+                    mensajes_llm.append(LLMMessage.user(t.usuario))
+                    mensajes_llm.append(LLMMessage.assistant(t.asistente))
 
         # Mensaje actual del usuario SIEMPRE al final:
-        mensajes.append({"role": "user", "content": mensaje_usuario})
+        mensajes_llm.append(LLMMessage.user(mensaje_usuario))
 
         tools_mensaje = tools_necesarias(mensaje_usuario)
         registro["ruta"] = "groq"
         registro["tools_enviadas"] = [t["function"]["name"] for t in tools_mensaje]
 
-        parametros = {
-            "model": MODEL,
-            "messages": mensajes,
-            "temperature": 0.2,
-            # gpt-oss espera max_completion_tokens (no max_tokens), y ese
-            # límite incluye los tokens de razonamiento. 350 deja margen
-            # para explicaciones sin ser un cheque en blanco: la regla de
-            # brevedad del prompt hace que casi nunca se use entero.
-            "max_completion_tokens": 350,
-            "reasoning_effort": "low",
-        }
+        tools_definiciones: Optional[list[LLMToolDefinition]] = None
+        tool_choice_obj: Optional[LLMToolChoice] = None
 
         if tools_mensaje:
-            parametros["tools"] = tools_mensaje
-            parametros["tool_choice"] = "auto"
+            tools_definiciones = [
+                LLMToolDefinition(
+                    nombre=t["function"]["name"],
+                    descripcion=t["function"].get("description", ""),
+                    parametros=t["function"].get("parameters", {}),
+                )
+                for t in tools_mensaje
+            ]
+            tool_choice_obj = LLMToolChoice.auto()
+
+        solicitud = LLMRequest(
+            mensajes=mensajes_llm,
+            tools=tools_definiciones,
+            tool_choice=tool_choice_obj,
+            temperature=0.2,
+            max_tokens=350,
+            reasoning_effort="low",
+            model=MODEL,
+        )
 
         try:
-            response = await llamar_groq(parametros)
-        except SinCuotaGroq:
+            response: LLMResponse = await llm_provider.generar_respuesta(solicitud)
+        except LLMRateLimitError:
             registro["ruta"] = "sin_cuota"
             return await responder_sin_cuota(origen)
-
-        response_message = response.choices[0].message
-        finish_reason = response.choices[0].finish_reason
+        except LLMTimeoutError as e:
+            print(f"[!] Timeout del proveedor LLM: {e}")
+            raise HTTPException(status_code=504, detail=f"Tiempo de espera agotado al contactar con la IA: {e}")
+        except LLMToolCallRejectionError as e:
+            print(f"[!] Proveedor LLM rechazó tools (alucinación/inconsistencia), reintentando sin tools: {e}")
+            solicitud_sin_tools = LLMRequest(
+                mensajes=mensajes_llm,
+                tools=None,
+                tool_choice=None,
+                temperature=0.2,
+                max_tokens=350,
+                reasoning_effort="low",
+                model=MODEL,
+            )
+            try:
+                response = await llm_provider.generar_respuesta(solicitud_sin_tools)
+            except LLMRateLimitError:
+                registro["ruta"] = "sin_cuota"
+                return await responder_sin_cuota(origen)
+            except LLMTimeoutError as e2:
+                print(f"[!] Timeout en reintento del proveedor LLM: {e2}")
+                raise HTTPException(status_code=504, detail=f"Tiempo de espera agotado al contactar con la IA: {e2}")
+            except Exception as e2:
+                print(f"[ERROR LLM] {e2}")
+                raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e2}")
+        except Exception as e:
+            print(f"[ERROR LLM] {e}")
+            raise HTTPException(status_code=500, detail=f"Error al contactar con la IA: {e}")
 
         # 5. TOOL CALL
-        if response_message.tool_calls:
+        if response.tool_calls:
             resultados_tool = []
 
-            for tool_call in response_message.tool_calls:
-                fn_name = tool_call.function.name
-                try:
-                    fn_args = json.loads(tool_call.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    fn_args = {}
+            for tool_call in response.tool_calls:
+                fn_name = tool_call.nombre
+                fn_args = tool_call.argumentos
 
                 print(f"[*] Tool call: {fn_name} {fn_args}")
                 registro["acciones"].append([fn_name, fn_args])
@@ -4768,10 +4839,10 @@ async def _procesar_mensaje(
 
         else:
             texto_final = limpiar_texto_para_voz(
-                response_message.content or "No tengo nada que añadir."
+                response.texto or "No tengo nada que añadir."
             )
 
-            if finish_reason == "length":
+            if response.finish_reason == "length":
                 texto_final = recortar_a_oracion_completa(texto_final)
 
             if es_intencion_de_accion(mensaje_usuario) and afirma_ejecucion_accion(texto_final):
@@ -4786,7 +4857,7 @@ async def _procesar_mensaje(
         if origen == "pc":
             historial_chat.sincronizar_desde_turnos(historiales_por_origen["pc"])
 
-        if not response_message.tool_calls or any(
+        if not response.tool_calls or any(
             nombre == "respuesta_busqueda" for nombre, _, _ in resultados_tool
         ):
             memoria.guardar_conversacion(mensaje_usuario, texto_final)

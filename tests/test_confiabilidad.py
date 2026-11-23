@@ -344,6 +344,7 @@ class TestRespuestaCapturaVariadaSinGenerico(unittest.IsolatedAsyncioTestCase):
                     message=mock.Mock(
                         tool_calls=[
                             SimpleNamespace(
+                                id="call_mock_captura",
                                 function=SimpleNamespace(
                                     name="tomar_captura",
                                     arguments="{}",

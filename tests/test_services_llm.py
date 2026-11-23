@@ -39,9 +39,11 @@ from server.services.llm.exceptions import (
     LLMConfigurationError,
     LLMConnectionError,
     LLMError,
+    LLMMalformedResponseError,
     LLMProviderError,
     LLMRateLimitError,
     LLMTimeoutError,
+    LLMToolCallRejectionError,
     LLMValidationError,
 )
 from server.services.llm.providers.groq import GroqProvider
@@ -595,6 +597,53 @@ class TestLLMContracts(unittest.TestCase):
         self.assertEqual(resp.tool_calls[1].nombre, "fn2")
         self.assertEqual(resp.finish_reason, "tool_calls")
 
+    def test_llm_response_validaciones_post_init(self):
+        # texto inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto=123)
+        self.assertIn("texto de la respuesta debe ser str o None", str(ctx.exception))
+
+        # finish_reason tipo inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", finish_reason=456)
+        self.assertIn("finish_reason", str(ctx.exception))
+
+        # finish_reason con espacios
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", finish_reason=" stop ")
+        self.assertIn("no debe contener espacios", str(ctx.exception))
+
+        # finish_reason vacío
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", finish_reason="")
+        self.assertIn("cadena no vacía o None", str(ctx.exception))
+
+        # tool_calls no es lista
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", tool_calls="no_lista")
+        self.assertIn("tool_calls debe ser una lista", str(ctx.exception))
+
+        # tool_calls contiene elementos inválidos
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", tool_calls=["no_es_tool_call"])
+        self.assertIn("debe ser una instancia de LLMToolCall", str(ctx.exception))
+
+        # modelo tipo inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", modelo=123)
+        self.assertIn("modelo de la respuesta debe ser str", str(ctx.exception))
+
+        # proveedor tipo inválido
+        with self.assertRaises(LLMValidationError) as ctx:
+            LLMResponse(texto="ok", proveedor=456)
+        self.assertIn("proveedor de la respuesta debe ser str", str(ctx.exception))
+
+        # neutralidad: proveedor y modelo vacíos por defecto (sin asumir "groq")
+        resp_neutral = LLMResponse(texto="ok")
+        self.assertEqual(resp_neutral.proveedor, "")
+        self.assertEqual(resp_neutral.modelo, "")
+        self.assertFalse(hasattr(resp_neutral, "raw_response"))
+
     def test_contratos_sin_dependencias_groq(self):
         import server.services.llm.base as base_mod
         import server.services.llm.exceptions as exc_mod
@@ -848,6 +897,98 @@ class TestGroqProviderToolCalls(unittest.IsolatedAsyncioTestCase):
             await provider.generar_respuesta(req)
         self.assertIn("no son un JSON válido", str(ctx.exception))
         self.assertIsNotNone(ctx.exception.__cause__)
+
+    async def test_tool_call_sin_id_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        tc = MockGroqToolCall(id=None, name="abrir", arguments='{}')
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content=None, tool_calls=[tc])
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("sin identificador ('id') válido", str(ctx.exception))
+
+    async def test_tool_call_sin_nombre_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        tc = MockGroqToolCall(id="call_x", name="", arguments='{}')
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content=None, tool_calls=[tc])
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("sin nombre de herramienta válido", str(ctx.exception))
+
+    async def test_response_content_invalido_tipo_entero_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content=12345)
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("debe ser str o None, recibido: int", str(ctx.exception))
+
+    async def test_response_content_invalido_tipo_lista_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content=["respuesta", "invalida"])
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("debe ser str o None, recibido: list", str(ctx.exception))
+
+    async def test_response_content_none_sin_tools_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content=None, tool_calls=None)
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("no contiene contenido textual", str(ctx.exception))
+
+    async def test_response_finish_reason_invalido_tipo_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content="Hola", finish_reason=999)
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("finish_reason", str(ctx.exception))
+
+    async def test_response_finish_reason_con_espacios_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content="Hola", finish_reason=" stop ")
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("no debe contener espacios", str(ctx.exception))
+
+    async def test_response_finish_reason_vacio_lanza_malformed_response_error(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content="Hola", finish_reason="")
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        with self.assertRaises(LLMMalformedResponseError) as ctx:
+            await provider.generar_respuesta(req)
+        self.assertIn("cadena no vacía o None", str(ctx.exception))
+
+    async def test_response_finish_reason_none_es_aceptado(self):
+        mock_client = mock.MagicMock()
+        mock_client.chat.completions.create.return_value = MockChatCompletion(content="Hola", finish_reason=None)
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("ejecutá")])
+        resp = await provider.generar_respuesta(req)
+        self.assertEqual(resp.texto, "Hola")
+        self.assertIsNone(resp.finish_reason)
 
 
 class TestGroqProviderVision(unittest.IsolatedAsyncioTestCase):
@@ -1127,6 +1268,57 @@ class TestGroqProviderMapeoExcepciones(unittest.IsolatedAsyncioTestCase):
         self.assertIs(ctx.exception.__cause__, orig_exc)
         self.assertEqual(ctx.exception.provider, "groq")
 
+    async def test_authentication_error_con_mensaje_tool_use_failed_prevalece_auth(self):
+        """Demuestra que un AuthenticationError cuyo mensaje contiene 'tool_use_failed' sigue clasificándose como LLMConfigurationError."""
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=401)
+        orig_exc = groq.AuthenticationError(
+            "tool_use_failed: Invalid API key (401)",
+            response=mock_resp,
+            body={"error": {"message": "tool_use_failed: Invalid key", "type": "invalid_request_error"}},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMConfigurationError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+        self.assertEqual(ctx.exception.provider, "groq")
+
+    async def test_authentication_error_con_mensaje_tool_choice_none_prevalece_auth(self):
+        """Demuestra que un AuthenticationError con 'Tool choice is none' sigue clasificándose como LLMConfigurationError."""
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=401)
+        orig_exc = groq.AuthenticationError(
+            "Tool choice is none in auth 401",
+            response=mock_resp,
+            body={"error": {"message": "Tool choice is none", "type": "invalid_request_error"}},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMConfigurationError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_error_no_api_con_mensaje_tool_use_failed_no_es_rechazo(self):
+        """Demuestra que excepciones que no provienen de la API de Groq no se reclasifican como LLMToolCallRejectionError por contener 'tool_use_failed'."""
+        mock_client = mock.MagicMock()
+        orig_exc = RuntimeError("tool_use_failed: Fallo interno no proveniente de Groq API")
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMProviderError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertNotIsInstance(ctx.exception, LLMToolCallRejectionError)
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
     async def test_api_generic_error_mapping_con_causa(self):
         mock_client = mock.MagicMock()
         mock_resp = self._crear_response_mock(status_code=500)
@@ -1160,6 +1352,151 @@ class TestGroqProviderMapeoExcepciones(unittest.IsolatedAsyncioTestCase):
 
         req = LLMRequest(mensajes=[LLMMessage.user("hi")])
         with self.assertRaises(LLMProviderError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_tool_use_failed_mapping_con_causa(self):
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=400)
+        orig_exc = groq.BadRequestError(
+            "tool_use_failed: El modelo invocó una tool no declarada",
+            response=mock_resp,
+            body={},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMToolCallRejectionError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_tool_choice_none_mapping_con_causa(self):
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=400)
+        orig_exc = groq.BadRequestError(
+            "Tool choice is none pero se solicitaron tools",
+            response=mock_resp,
+            body={},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMToolCallRejectionError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_error_api_otra_categoria_con_mensaje_tool_use_failed_no_es_rechazo(self):
+        """Demuestra que un error de API de otra categoría (ej. 500 InternalServerError) con 'tool_use_failed' no se clasifica como rechazo de tools."""
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=500)
+        orig_exc = groq.InternalServerError(
+            "tool_use_failed: Internal server error (500)",
+            response=mock_resp,
+            body={"error": {"message": "tool_use_failed: error", "code": "internal_error"}},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMProviderError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertNotIsInstance(ctx.exception, LLMToolCallRejectionError)
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_error_api_generico_sin_status_400_con_mensaje_tool_use_failed_no_es_rechazo(self):
+        """Demuestra que un groq.APIError genérico sin código HTTP 400 no activa rechazo de tools."""
+        mock_client = mock.MagicMock()
+        req_http = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        orig_exc = groq.APIError("tool_use_failed: Error genérico sin status 400", request=req_http, body={})
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMProviderError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertNotIsInstance(ctx.exception, LLMToolCallRejectionError)
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_rate_limit_con_mensaje_tool_use_failed_prevalece_rate_limit(self):
+        """Prueba obligatoria: error tipado de rate limit con 'tool_use_failed' en mensaje debe clasificarse como LLMRateLimitError."""
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=429)
+        orig_exc = groq.RateLimitError(
+            "tool_use_failed: Rate limit reached (429)",
+            response=mock_resp,
+            body={"error": {"message": "tool_use_failed: Rate limit reached", "code": "rate_limit_exceeded"}},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMRateLimitError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+        self.assertEqual(ctx.exception.provider, "groq")
+
+    async def test_rate_limit_con_mensaje_tool_choice_none_prevalece_rate_limit(self):
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=429)
+        orig_exc = groq.RateLimitError(
+            "Tool choice is none in 429",
+            response=mock_resp,
+            body={"error": {"message": "Tool choice is none", "code": "rate_limit_exceeded"}},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMRateLimitError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_timeout_con_mensaje_tool_use_failed_prevalece_timeout(self):
+        mock_client = mock.MagicMock()
+        orig_exc = httpx.TimeoutException("tool_use_failed: Read timeout occurred")
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMTimeoutError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_connection_error_con_mensaje_tool_choice_none_prevalece_connection(self):
+        mock_client = mock.MagicMock()
+        orig_exc = httpx.ConnectError("Tool choice is none during connection")
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMConnectionError) as ctx:
+            await provider.generar_respuesta(req)
+
+        self.assertIs(ctx.exception.__cause__, orig_exc)
+
+    async def test_tool_call_rejection_con_body_estructurado(self):
+        mock_client = mock.MagicMock()
+        mock_resp = self._crear_response_mock(status_code=400)
+        orig_exc = groq.BadRequestError(
+            "Bad request",
+            response=mock_resp,
+            body={"error": {"code": "tool_use_failed", "message": "Fallo al procesar herramienta"}},
+        )
+        mock_client.chat.completions.create.side_effect = orig_exc
+        provider = GroqProvider(api_key="gsk_test", client=mock_client)
+
+        req = LLMRequest(mensajes=[LLMMessage.user("hi")])
+        with self.assertRaises(LLMToolCallRejectionError) as ctx:
             await provider.generar_respuesta(req)
 
         self.assertIs(ctx.exception.__cause__, orig_exc)

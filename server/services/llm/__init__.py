@@ -20,9 +20,11 @@ from .exceptions import (
     LLMConfigurationError,
     LLMConnectionError,
     LLMError,
+    LLMMalformedResponseError,
     LLMProviderError,
     LLMRateLimitError,
     LLMTimeoutError,
+    LLMToolCallRejectionError,
     LLMValidationError,
 )
 from .providers.groq import GroqProvider
@@ -43,6 +45,8 @@ __all__ = [
     "LLMRateLimitError",
     "LLMTimeoutError",
     "LLMConnectionError",
+    "LLMToolCallRejectionError",
     "LLMProviderError",
     "LLMValidationError",
+    "LLMMalformedResponseError",
 ]

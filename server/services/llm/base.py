@@ -480,6 +480,38 @@ class LLMResponse:
     modelo: str = ""
     proveedor: str = ""
 
+    def __post_init__(self) -> None:
+        if self.texto is not None and not isinstance(self.texto, str):
+            raise LLMValidationError(
+                f"El texto de la respuesta debe ser str o None, recibido: {type(self.texto).__name__}."
+            )
+        if self.finish_reason is not None:
+            if not isinstance(self.finish_reason, str) or not self.finish_reason.strip():
+                raise LLMValidationError(
+                    f"El motivo de finalización ('finish_reason') debe ser una cadena no vacía o None, recibido: {type(self.finish_reason).__name__}."
+                )
+            if self.finish_reason != self.finish_reason.strip():
+                raise LLMValidationError(
+                    f"El motivo de finalización ('{self.finish_reason}') no debe contener espacios al inicio o al final."
+                )
+        if not isinstance(self.tool_calls, list):
+            raise LLMValidationError(
+                f"tool_calls debe ser una lista de LLMToolCall, recibido: {type(self.tool_calls).__name__}."
+            )
+        for idx, tc in enumerate(self.tool_calls):
+            if not isinstance(tc, LLMToolCall):
+                raise LLMValidationError(
+                    f"El elemento {idx} de tool_calls debe ser una instancia de LLMToolCall, recibido: {type(tc).__name__}."
+                )
+        if not isinstance(self.modelo, str):
+            raise LLMValidationError(
+                f"modelo de la respuesta debe ser str, recibido: {type(self.modelo).__name__}."
+            )
+        if not isinstance(self.proveedor, str):
+            raise LLMValidationError(
+                f"proveedor de la respuesta debe ser str, recibido: {type(self.proveedor).__name__}."
+            )
+
 
 class LLMProvider(ABC):
     """Interfaz abstracta canónica para proveedores de modelos de lenguaje (LLM)."""

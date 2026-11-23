@@ -262,6 +262,7 @@ class TestProteccionEjecucionAccidentalHerramientas(unittest.IsolatedAsyncioTest
 
     async def test_pregunta_explicativa_bloquea_tool_call_accidental(self):
         call_mock = mock.MagicMock()
+        call_mock.id = "call_mock_escritorio"
         call_mock.function.name = "cambiar_escritorio"
         call_mock.function.arguments = json.dumps({"escritorio": 3})
 
@@ -507,6 +508,7 @@ class TestHistorialConversacionalStage32(unittest.IsolatedAsyncioTestCase):
 
         # Llamada a Groq con tool call (bypaseando router_local):
         call_mock = mock.MagicMock()
+        call_mock.id = "call_mock_cancion"
         call_mock.function.name = "info_cancion"
         call_mock.function.arguments = "{}"
 
@@ -673,6 +675,7 @@ class TestStage33ComportamientoConversacional(unittest.IsolatedAsyncioTestCase):
     async def test_T33_INT_04_seguimiento_factico_tras_tool_groq_sin_reinvocacion(self):
         """Consulta sobre una herramienta previa se responde conversacionalmente sin re-invocar tools."""
         call_tool = mock.MagicMock()
+        call_tool.id = "call_mock_cancion_2"
         call_tool.function.name = "info_cancion"
         call_tool.function.arguments = json.dumps({})
 
@@ -933,6 +936,7 @@ class TestStage33ComportamientoConversacional(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t["function"]["name"] for t in tools], ["buscar_en_web"])
 
         call_mock = mock.MagicMock()
+        call_mock.id = "call_mock_steam"
         call_mock.function.name = "abrir_aplicacion"
         call_mock.function.arguments = json.dumps({"app_name": "steam"})
 

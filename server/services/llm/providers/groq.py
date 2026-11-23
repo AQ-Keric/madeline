@@ -29,9 +29,11 @@ from ..exceptions import (
     LLMConfigurationError,
     LLMConnectionError,
     LLMError,
+    LLMMalformedResponseError,
     LLMProviderError,
     LLMRateLimitError,
     LLMTimeoutError,
+    LLMToolCallRejectionError,
     LLMValidationError,
 )
 
@@ -99,28 +101,75 @@ def _limpiar_respuesta_vision(texto: str) -> str:
 
 
 def _mapear_error_groq(exc: Exception) -> Exception:
-    """Mapea excepciones del SDK de Groq y transporte HTTP a excepciones del dominio LLM."""
-    if isinstance(exc, LLMError):
-        return exc
+    """Mapea excepciones del SDK de Groq y transporte HTTP a excepciones del dominio LLM.
 
+    Prioriza estrictamente todos los tipos conocidos del SDK y transporte antes de interpretar
+    mensajes de error:
+    1. Errores tipados de rate limit (groq.RateLimitError).
+    2. Errores tipados de timeout (groq.APITimeoutError, httpx.TimeoutException).
+    3. Errores tipados de conexión/transporte (groq.APIConnectionError, httpx.ConnectError).
+    4. Errores tipados de autenticación (groq.AuthenticationError).
+    5. Otros errores ya pertenecientes al contrato neutral (LLMError).
+    6. Rechazo recuperable de function calling (restringido a errores HTTP 400 groq.BadRequestError).
+    7. Errores generales de API o transporte HTTP (groq.APIError, httpx.HTTPError).
+    8. Error inesperado.
+    """
+    # 1. Errores tipados de rate limit
     if isinstance(exc, groq.RateLimitError):
         return LLMRateLimitError(str(exc), provider="groq")
 
+    # 2. Errores tipados de timeout
     if isinstance(exc, (groq.APITimeoutError, httpx.TimeoutException)):
         return LLMTimeoutError(str(exc), provider="groq")
 
+    # 3. Errores tipados de conexión/transporte
     if isinstance(exc, (groq.APIConnectionError, httpx.ConnectError)):
         return LLMConnectionError(str(exc), provider="groq")
 
+    # 4. Errores tipados de autenticación
     if isinstance(exc, groq.AuthenticationError):
         return LLMConfigurationError(f"Error de autenticación con Groq: {exc}", provider="groq")
 
+    # 5. Otros errores ya pertenecientes al contrato neutral
+    if isinstance(exc, LLMError):
+        return exc
+
+    # 6. Rechazo recuperable de function calling: estrictamente restringido a errores HTTP 400 (groq.BadRequestError)
+    es_error_400 = isinstance(exc, groq.BadRequestError) or (
+        isinstance(exc, groq.APIStatusError) and getattr(exc, "status_code", None) == 400
+    )
+    if es_error_400:
+        es_rechazo = False
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error_dict = body.get("error")
+            if isinstance(error_dict, dict):
+                code = error_dict.get("code")
+                if code in ("tool_use_failed",):
+                    es_rechazo = True
+                err_msg = error_dict.get("message")
+                if isinstance(err_msg, str) and ("tool_use_failed" in err_msg or "Tool choice is none" in err_msg):
+                    es_rechazo = True
+
+        if not es_rechazo:
+            msg = str(exc)
+            if "tool_use_failed" in msg or "Tool choice is none" in msg:
+                es_rechazo = True
+
+        if es_rechazo:
+            return LLMToolCallRejectionError(str(exc), provider="groq")
+
+        return LLMProviderError(str(exc), provider="groq")
+
+    # 7. Errores generales de API de Groq (500, 404, etc.)
     if isinstance(exc, groq.APIError):
         return LLMProviderError(str(exc), provider="groq")
 
+    # 8. Errores de transporte HTTP genéricos
     if isinstance(exc, httpx.HTTPError):
         return LLMProviderError(str(exc), provider="groq")
 
+    # 9. Error inesperado
     return LLMProviderError(f"Error inesperado del proveedor Groq: {exc}", provider="groq")
 
 
@@ -260,35 +309,125 @@ class GroqProvider(LLMProvider):
         return "auto"
 
     def _procesar_respuesta(self, response: Any) -> LLMResponse:
-        """Convierte una respuesta de Groq en un LLMResponse tipado."""
+        """Convierte una respuesta de Groq en un LLMResponse tipado.
+
+        Aplica validaciones estrictas sobre la estructura del payload y los tool calls:
+        no fabrica IDs ni nombres artificiales ante datos ausentes o malformados.
+        """
         try:
-            choice = response.choices[0]
-            message = choice.message
-            texto = getattr(message, "content", None)
-            finish_reason = getattr(choice, "finish_reason", None)
-            modelo = getattr(response, "model", self._default_model)
+            choices = getattr(response, "choices", None)
+            if not choices or not isinstance(choices, (list, tuple)):
+                raise LLMMalformedResponseError(
+                    "La respuesta de Groq no contiene una lista válida de 'choices'.",
+                    provider="groq",
+                )
+
+            choice = choices[0]
+            message = getattr(choice, "message", None)
+            if message is None:
+                raise LLMMalformedResponseError(
+                    "La primera opción de respuesta ('choice') no contiene el atributo 'message'.",
+                    provider="groq",
+                )
+
+            texto_raw = getattr(message, "content", None)
+            if texto_raw is not None and not isinstance(texto_raw, str):
+                raise LLMMalformedResponseError(
+                    f"El contenido del mensaje ('content') debe ser str o None, recibido: {type(texto_raw).__name__}.",
+                    provider="groq",
+                )
+            texto = texto_raw
+
+            finish_reason_raw = getattr(choice, "finish_reason", None)
+            if finish_reason_raw is not None:
+                if not isinstance(finish_reason_raw, str) or not finish_reason_raw.strip():
+                    raise LLMMalformedResponseError(
+                        f"El motivo de finalización ('finish_reason') debe ser una cadena no vacía o None, recibido: {type(finish_reason_raw).__name__}.",
+                        provider="groq",
+                    )
+                if finish_reason_raw != finish_reason_raw.strip():
+                    raise LLMMalformedResponseError(
+                        f"El motivo de finalización ('{finish_reason_raw}') no debe contener espacios al inicio o al final.",
+                        provider="groq",
+                    )
+                finish_reason = finish_reason_raw
+            else:
+                finish_reason = None
+
+            modelo_raw = getattr(response, "model", self._default_model)
+            if not isinstance(modelo_raw, str) or not modelo_raw.strip():
+                modelo = self._default_model
+            else:
+                modelo = modelo_raw.strip()
 
             raw_tool_calls = getattr(message, "tool_calls", None)
             tool_calls: list[LLMToolCall] = []
 
-            if raw_tool_calls:
-                for tc in raw_tool_calls:
-                    tc_id = getattr(tc, "id", "")
-                    fn = getattr(tc, "function", None)
-                    if fn is not None:
-                        fn_name = getattr(fn, "name", "")
-                        fn_args = getattr(fn, "arguments", "")
-                    else:
-                        fn_name = getattr(tc, "name", "")
-                        fn_args = getattr(tc, "arguments", "")
-
-                    tool_call = LLMToolCall.from_raw(
-                        id=tc_id,
-                        nombre=fn_name,
-                        raw_arguments=fn_args,
+            if raw_tool_calls is not None:
+                if not isinstance(raw_tool_calls, (list, tuple)):
+                    raise LLMMalformedResponseError(
+                        f"tool_calls esperado como lista o tupla, recibido: {type(raw_tool_calls).__name__}",
                         provider="groq",
                     )
+
+                for tc in raw_tool_calls:
+                    tc_id = getattr(tc, "id", None)
+                    if not isinstance(tc_id, str) or not tc_id.strip():
+                        raise LLMMalformedResponseError(
+                            "Tool call recibido sin identificador ('id') válido.",
+                            provider="groq",
+                        )
+                    if tc_id != tc_id.strip():
+                        raise LLMMalformedResponseError(
+                            f"El identificador del tool call ('{tc_id}') no debe contener espacios al inicio o al final.",
+                            provider="groq",
+                        )
+
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        fn_name = getattr(fn, "name", None)
+                        fn_args = getattr(fn, "arguments", None)
+                    else:
+                        fn_name = getattr(tc, "name", None)
+                        fn_args = getattr(tc, "arguments", None)
+
+                    if not isinstance(fn_name, str) or not fn_name.strip():
+                        raise LLMMalformedResponseError(
+                            "Tool call recibido sin nombre de herramienta válido.",
+                            provider="groq",
+                        )
+                    if fn_name != fn_name.strip():
+                        raise LLMMalformedResponseError(
+                            f"El nombre del tool call ('{fn_name}') no debe contener espacios al inicio o al final.",
+                            provider="groq",
+                        )
+
+                    if fn_args is None:
+                        raise LLMMalformedResponseError(
+                            f"Tool call '{fn_name}' recibido sin argumentos ('arguments' es None).",
+                            provider="groq",
+                        )
+
+                    try:
+                        tool_call = LLMToolCall.from_raw(
+                            id=tc_id,
+                            nombre=fn_name,
+                            raw_arguments=fn_args,
+                            provider="groq",
+                        )
+                    except LLMValidationError as val_err:
+                        raise LLMMalformedResponseError(
+                            f"Argumentos malformados en tool call '{fn_name}': {val_err.mensaje}",
+                            provider="groq",
+                        ) from val_err
+
                     tool_calls.append(tool_call)
+
+            if texto is None and not tool_calls:
+                raise LLMMalformedResponseError(
+                    "La respuesta de Groq no contiene contenido textual ('content') ni llamadas a herramientas ('tool_calls') válidas.",
+                    provider="groq",
+                )
 
             return LLMResponse(
                 texto=texto,

@@ -37,9 +37,27 @@ class LLMConnectionError(LLMError):
     """Fallo de conexión de red o transporte con el proveedor LLM."""
 
 
+class LLMToolCallRejectionError(LLMError):
+    """Rechazo recuperable de una solicitud de function calling por parte del proveedor.
+
+    Ocurre cuando el modelo o proveedor rechaza la llamada debido a una inconsistencia
+    o alucinación de herramientas no declaradas (ej. error 'tool_use_failed' o
+    'Tool choice is none'). Señala al núcleo conversacional que la petición puede
+    reintentarse exactamente una vez sin herramientas.
+    """
+
+
 class LLMProviderError(LLMError):
     """Error genérico del proveedor LLM o fallo al procesar la respuesta."""
 
 
 class LLMValidationError(LLMProviderError):
     """Error de validación en datos de entrada del dominio LLM (mensajes, esquemas, extensiones)."""
+
+
+class LLMMalformedResponseError(LLMValidationError):
+    """Respuesta del proveedor malformada, incompleta o que viola el contrato neutral.
+
+    Ocurre cuando el payload retornado por el proveedor carece de campos obligatorios
+    (ej. tool call sin id, sin nombre o con argumentos JSON corruptos).
+    """

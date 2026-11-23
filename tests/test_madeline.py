@@ -263,6 +263,7 @@ class TestCompatibilidadHyprland(unittest.TestCase):
 
 def respuesta_groq_con_tool(nombre: str, argumentos: str):
     tool_call = SimpleNamespace(
+        id="call_mock_1",
         function=SimpleNamespace(name=nombre, arguments=argumentos)
     )
     mensaje = SimpleNamespace(tool_calls=[tool_call], content=None)
