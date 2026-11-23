@@ -4,6 +4,7 @@ if __name__ == "__main__":
 
 import asyncio
 import difflib
+import inspect
 import os
 import random
 import re
@@ -97,6 +98,29 @@ def fijar_llm_provider(proveedor: LLMProvider) -> None:
     """Permite inyectar un proveedor LLM alternativo o simulado (ej. pruebas agnósticas)."""
     global llm_provider
     llm_provider = proveedor
+
+
+from services.stt import STTProvider, GroqSTTProvider
+
+# Instancia canónica del proveedor STT para transcripción de audio
+stt_provider: STTProvider = GroqSTTProvider(
+    client=client,
+    default_model=os.getenv("MADELINE_WHISPER_MODELO", "whisper-large-v3-turbo"),
+    timeout=TIMEOUT_GROQ,
+    max_retries=1,
+)
+
+
+def obtener_stt_provider() -> STTProvider:
+    """Obtiene la instancia configurada del proveedor STT."""
+    global stt_provider
+    return stt_provider
+
+
+def fijar_stt_provider(proveedor: STTProvider) -> None:
+    """Permite inyectar un proveedor STT alternativo o simulado (ej. pruebas)."""
+    global stt_provider
+    stt_provider = proveedor
 
 from core.models import (
     TurnoConversacion,
@@ -672,101 +696,182 @@ def limpiar_respuesta_vision(texto: str) -> str:
     return limpiar_texto_para_voz(texto)
 
 
-def analizar_pantalla(pregunta: str) -> str:
-    """Toma una captura de pantalla y la manda, junto con la
-    pregunta, a un modelo con visión — para cosas tipo '¿qué error es
-    este?' o '¿qué aplicación tengo abierta?'.
+async def analizar_pantalla(pregunta: str) -> Resultado:
+    """Toma una captura de pantalla y la envía junto con la pregunta a un modelo
+    con visión a través del proveedor LLM agnóstico.
 
-    Es una llamada A PARTE del flujo normal de router_local/Groq: no
-    pasa por tools_necesarias ni por el modelo de texto de siempre,
-    porque necesita mandar una imagen. Cuando se dispara por el
-    patrón local (extraer_pedido_analisis_pantalla), es UNA sola
-    llamada a Groq. Cuando la dispara Groq como herramienta libre,
-    son dos (la que decide llamar la herramienta + esta), como
-    cualquier otra tool — nada fuera de lo normal.
+    No bloquea el event loop principal: la captura y lectura de archivo se ejecutan
+    en hilos de trabajo mediante el executor de asyncio, y la inferencia de visión se
+    delega de forma asíncrona a `llm_provider.analizar_vision()`.
 
-    A diferencia de antes, NO borra la captura al terminar: la deja
-    disponible para que procesar_mensaje también te la devuelva como
-    imagen (ver ULTIMA_CAPTURA_ANALISIS más abajo), igual que ya hace
-    el comando de captura normal."""
+    A diferencia de antes, NO borra la captura al terminar exitosamente: la deja
+    disponible para que procesar_mensaje también la devuelva como imagen al cliente
+    (a través de Resultado.evidencia["captura_id"]), igual que hace el comando de captura normal.
+    """
     global ULTIMA_CAPTURA_ANALISIS
     ULTIMA_CAPTURA_ANALISIS = None
 
     # 1280 px en vez de 1920: el modelo de visión cobra por
     # resolución, así gasta ~la mitad de tokens y el texto en
     # pantalla se sigue leyendo bien.
-    resultado_captura = tomar_captura(ancho_max=1280)
+    cancel_token = [False]
+    captura_holder = [None]
+
+    def _extraer_cid(res):
+        if hasattr(res, "evidencia") and res.evidencia.get("captura_id"):
+            return str(res.evidencia["captura_id"])
+        if res and str(res).startswith("CAPTURA_LISTA:"):
+            return str(res).split(":", 1)[1]
+        return None
+
+    def _limpiar_archivo_captura(res_captura):
+        cid = _extraer_cid(res_captura)
+        if cid:
+            r = ruta_captura_disponible(cid)
+            if r and os.path.exists(r):
+                try:
+                    os.remove(r)
+                except Exception:
+                    pass
+
+    def _tomar_captura_con_limpieza():
+        res = tomar_captura(ancho_max=1280)
+        captura_holder[0] = res
+        if cancel_token[0]:
+            # El await fue cancelado mientras tomar_captura() corría en el worker thread.
+            # La función terminó de escribir/comprimir; limpiamos la captura huérfana de inmediato.
+            _limpiar_archivo_captura(res)
+        return res
+
+    try:
+        resultado_captura = await asyncio.to_thread(_tomar_captura_con_limpieza)
+    except asyncio.CancelledError:
+        cancel_token[0] = True
+        # Si el worker terminó antes de recibir la cancelación (o durante la propagación),
+        # limpiamos el archivo recién creado para evitar capturas huérfanas en la ventana residual.
+        if captura_holder[0]:
+            _limpiar_archivo_captura(captura_holder[0])
+        raise
 
     if not resultado_captura.startswith("CAPTURA_LISTA"):
-        return resultado_captura
+        return normalizar_resultado(resultado_captura, "analizar_pantalla")
 
-    captura_id = resultado_captura.split(":", 1)[1]
+    captura_id = str(resultado_captura).split(":", 1)[1]
     ruta = ruta_captura_disponible(captura_id)
 
     if not ruta:
-        return "No pude tomar la captura para analizarla."
+        return Resultado(
+            ok=False,
+            mensaje="No pude tomar la captura para analizarla.",
+            evidencia={"captura_id": captura_id, "encontrada": False},
+            estado=EstadoResultado.FAILURE,
+        )
 
     try:
-        with open(ruta, "rb") as f:
-            imagen_b64 = base64.b64encode(f.read()).decode("utf-8")
+        def _leer_imagen() -> bytes:
+            with open(ruta, "rb") as f:
+                return f.read()
 
+        imagen_bytes = await asyncio.to_thread(_leer_imagen)
         extension = "jpeg" if ruta.endswith(".jpg") else "png"
 
-        instruccion = (
-            "Respondé SIEMPRE en español, en una o dos frases breves, "
-            "en texto plano sin markdown (sin asteriscos ni negritas) "
-            "porque tu respuesta se va a leer en voz alta. Pregunta: "
-        )
-
-        respuesta = client.chat.completions.create(
+        prov = obtener_llm_provider()
+        texto_respuesta = await prov.analizar_vision(
+            imagen_bytes=imagen_bytes,
+            extension=extension,
+            pregunta=pregunta,
             model=MODEL_VISION,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": instruccion + pregunta},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/{extension};base64,{imagen_b64}"
-                            },
-                        },
-                    ],
-                }
-            ],
-            temperature=0.3,
-            max_completion_tokens=300,
-            # Apaga el modo "thinking" de Qwen — sin esto, a veces
-            # manda todo el razonamiento en vez de solo la respuesta.
-            reasoning_effort="none",
-        )
-
-        texto_respuesta = limpiar_respuesta_vision(
-            respuesta.choices[0].message.content
         )
 
         if not texto_respuesta:
-            return (
-                "El modelo se quedó pensando y no llegó a responder a "
-                "tiempo. Probá de nuevo, a veces con la segunda pasada "
-                "alcanza."
+            if os.path.exists(ruta):
+                try:
+                    os.remove(ruta)
+                except Exception:
+                    pass
+            return Resultado(
+                ok=False,
+                mensaje="El modelo se quedó pensando y no llegó a responder a tiempo. Probá de nuevo, a veces con la segunda pasada alcanza.",
+                evidencia={"captura_id": captura_id, "pensando": True},
+                estado=EstadoResultado.FAILURE,
             )
 
-        # Guardamos el ID para que procesar_mensaje devuelva también la
-        # foto analizada. El archivo se borra recién cuando el
-        # cliente la pida por /captura/{id} (mismo mecanismo que la
-        # captura normal, ver /captura/{captura_id} más abajo).
+        # Asignamos la global para compatibilidad con código/tests legacy
         ULTIMA_CAPTURA_ANALISIS = captura_id
 
-        return texto_respuesta
+        # Retornamos Resultado con evidencia que porta el captura_id de forma atómica e individual
+        return Resultado(
+            ok=True,
+            mensaje=texto_respuesta,
+            evidencia={"captura_id": captura_id},
+            estado=EstadoResultado.SUCCESS,
+        )
 
+    except asyncio.CancelledError:
+        # Cancelado durante lectura o inferencia de visión:
+        # La captura ya fue creada en disco, pero la solicitud fue cancelada por el cliente.
+        # Ningún hilo worker está escribiendo en el archivo en este punto.
+        # Eliminamos la captura para evitar archivos huérfanos y relanzamos la cancelación.
+        if ruta and os.path.exists(ruta):
+            try:
+                os.remove(ruta)
+            except Exception:
+                pass
+        raise
+    except LLMRateLimitError as e:
+        print(f"[ERROR VISION] {e}")
+        if os.path.exists(ruta):
+            try:
+                os.remove(ruta)
+            except Exception:
+                pass
+        return Resultado(
+            ok=False,
+            mensaje="Keric, me quedé sin cuota de Groq por ahora. Las órdenes directas siguen funcionando; las preguntas tendrán que esperar un ratito.",
+            evidencia={"captura_id": captura_id, "error": str(e), "tipo_error": "rate_limit"},
+            estado=EstadoResultado.FAILURE,
+        )
+    except LLMTimeoutError as e:
+        print(f"[ERROR VISION] {e}")
+        if os.path.exists(ruta):
+            try:
+                os.remove(ruta)
+            except Exception:
+                pass
+        return Resultado(
+            ok=False,
+            mensaje="No pude analizar la pantalla: el tiempo de espera se agotó.",
+            evidencia={"captura_id": captura_id, "error": str(e), "tipo_error": "timeout"},
+            estado=EstadoResultado.FAILURE,
+        )
+    except LLMError as e:
+        print(f"[ERROR VISION] {e}")
+        if os.path.exists(ruta):
+            try:
+                os.remove(ruta)
+            except Exception:
+                pass
+        return Resultado(
+            ok=False,
+            mensaje=f"No pude analizar la pantalla: {e.mensaje or str(e)}",
+            evidencia={"captura_id": captura_id, "error": str(e), "tipo_error": "llm_error"},
+            estado=EstadoResultado.FAILURE,
+        )
     except Exception as e:
         print(f"[ERROR VISION] {e}")
         # Acá sí falló de verdad y no hay nada que mostrar — borramos
         # la captura para no dejar basura en /tmp.
         if os.path.exists(ruta):
-            os.remove(ruta)
-        return f"No pude analizar la pantalla: {e}"
+            try:
+                os.remove(ruta)
+            except Exception:
+                pass
+        return Resultado(
+            ok=False,
+            mensaje=f"No pude analizar la pantalla: {e}",
+            evidencia={"captura_id": captura_id, "error": str(e), "tipo_error": "exception"},
+            estado=EstadoResultado.FAILURE,
+        )
 
 
 HEADERS_BUSQUEDA = {
@@ -3702,12 +3807,63 @@ def respuesta_local(nombre: str, args: dict, resultado) -> str:
     return f"{elegir_variada(MULETILLAS)} {nucleo}."
 
 
-def ejecutar_comandos_locales(comandos, origen: str = "pc"):
-    """Ejecuta todos los comandos detectados en orden."""
+async def ejecutar_comandos_locales_async(comandos, origen: str = "pc"):
+    """Ejecuta todos los comandos detectados en orden (soporta awaitables con await)."""
     resultados = []
 
     for nombre, args in comandos:
         resultado = ejecutar_comando_local(nombre, args)
+        if inspect.isawaitable(resultado):
+            resultado = await resultado
+        res_norm = normalizar_resultado(resultado, nombre)
+        resultados.append((nombre, args, res_norm))
+
+        if nombre == "info_cancion":
+            texto = res_norm.mensaje
+            if texto.startswith("Actualmente está sonando:"):
+                memoria_contexto["cancion"] = texto.replace(
+                    "Actualmente está sonando:", ""
+                ).strip()
+
+        memoria_contexto.fijar_ultimo_resultado(res_norm, origen=origen)
+        acciones_locales_recientes[origen] = AccionLocalReciente(
+            comando=nombre,
+            args=args,
+            resultado=res_norm,
+            timestamp=time.monotonic(),
+            origen=origen,
+        )
+
+    return resultados
+
+
+def ejecutar_comandos_locales(comandos, origen: str = "pc"):
+    """Ejecuta todos los comandos detectados en orden (interfaz síncrona retrocompatible).
+
+    ADVERTENCIA DE CONCURRENCIA:
+    Si se invoca desde un hilo con un event loop activo y algún comando retorna
+    un objeto awaitable (por ejemplo, `analizar_pantalla()`), este adaptador delega
+    la corrutina a un `ThreadPoolExecutor(max_workers=1)` y espera síncronamente
+    con `.result()`. Esto bloqueará el hilo llamador mientras finaliza la operación.
+    El flujo principal de `_procesar_mensaje()` utiliza exclusivamente la versión
+    asíncrona `ejecutar_comandos_locales_async()` con `await`, por lo que no depende
+    de este adaptador ni sufre bloqueos de hilo.
+    """
+    resultados = []
+
+    for nombre, args in comandos:
+        resultado = ejecutar_comando_local(nombre, args)
+        if inspect.isawaitable(resultado):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    resultado = pool.submit(asyncio.run, resultado).result()
+            else:
+                resultado = asyncio.run(resultado)
         res_norm = normalizar_resultado(resultado, nombre)
         resultados.append((nombre, args, res_norm))
 
@@ -4087,7 +4243,14 @@ def ejecutar_comando_local(nombre: str, args: dict):
         return abrir_pestanas_busqueda(**args)
 
     if nombre == "analizar_pantalla":
-        return analizar_pantalla(**args)
+        coro = analizar_pantalla(**args)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            return asyncio.run(coro)
+        return coro
 
     if nombre == "info_cancion":
         return info_cancion()
@@ -4498,7 +4661,7 @@ async def _procesar_mensaje(
             status_code=400,
             detail="El origen debe ser 'pc' o 'telefono'."
         )
-    global historial_chat, ULTIMA_CAPTURA_ANALISIS
+    global historial_chat
 
     async with obtener_lock_origen(origen):
         mensaje_usuario = request.message.strip()
@@ -4595,7 +4758,7 @@ async def _procesar_mensaje(
             registro["ruta"] = "router"
             registro["acciones"] = [[nombre, args] for nombre, args in comandos]
 
-            resultados = ejecutar_comandos_locales(comandos, origen=origen)
+            resultados = await ejecutar_comandos_locales_async(comandos, origen=origen)
 
             for nombre, args, resultado in resultados:
                 print(
@@ -4629,14 +4792,15 @@ async def _procesar_mensaje(
             # ANÁLISIS DE PANTALLA (también devuelve la foto analizada)
             # --------------------------------------------------------
 
-            hubo_analisis_pantalla = any(
-                nombre == "analizar_pantalla" for nombre, args, resultado in resultados
-            )
+            captura_id_analisis = None
+            for nombre, args, res_norm in resultados:
+                if nombre == "analizar_pantalla":
+                    if getattr(res_norm, "ok", True):
+                        captura_id_analisis = getattr(res_norm, "evidencia", {}).get("captura_id")
+                    break
 
-            if hubo_analisis_pantalla and ULTIMA_CAPTURA_ANALISIS:
-                if ruta_captura_disponible(ULTIMA_CAPTURA_ANALISIS):
-                    image_path_response = f"/captura/{ULTIMA_CAPTURA_ANALISIS}"
-                ULTIMA_CAPTURA_ANALISIS = None
+            if captura_id_analisis and ruta_captura_disponible(captura_id_analisis):
+                image_path_response = f"/captura/{captura_id_analisis}"
 
             # --------------------------------------------------------
             # VOZ
@@ -4785,6 +4949,8 @@ async def _procesar_mensaje(
                         extra = {"mensaje": mensaje_usuario} if fn_name in TOOLS_CON_MENSAJE else {}
                         try:
                             resultado = TOOLS_FUNCIONES[fn_name](**fn_args, **extra)
+                            if inspect.isawaitable(resultado):
+                                resultado = await resultado
                         except TypeError as e:
                             resultado = f"Error: argumentos inválidos para {fn_name}: {e}"
                 else:
@@ -4803,6 +4969,11 @@ async def _procesar_mensaje(
                         image_path_response = f"/captura/{captura_id_groq}"
                         if origen == "pc":
                             enviar_captura_al_telefono(captura_id_groq)
+
+                if fn_name == "analizar_pantalla":
+                    captura_id_vision = getattr(resultado, "evidencia", {}).get("captura_id")
+                    if captura_id_vision and ruta_captura_disponible(captura_id_vision):
+                        image_path_response = f"/captura/{captura_id_vision}"
 
                 if fn_name == "buscar_en_web" and not str(resultado).startswith(PREFIJOS_ERROR):
                     resultado = await resumir_busqueda(mensaje_usuario, resultado)
@@ -4827,15 +4998,6 @@ async def _procesar_mensaje(
 
             if not texto_final:
                 texto_final = "Operación realizada."
-
-            hubo_analisis_pantalla = any(
-                nombre == "analizar_pantalla" for nombre, args, resultado in resultados_tool
-            )
-
-            if hubo_analisis_pantalla and ULTIMA_CAPTURA_ANALISIS:
-                if ruta_captura_disponible(ULTIMA_CAPTURA_ANALISIS):
-                    image_path_response = f"/captura/{ULTIMA_CAPTURA_ANALISIS}"
-                ULTIMA_CAPTURA_ANALISIS = None
 
         else:
             texto_final = limpiar_texto_para_voz(

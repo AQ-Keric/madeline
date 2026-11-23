@@ -3,13 +3,29 @@
 import asyncio
 import os
 import re
-from groq import RateLimitError
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from core.models import ChatRequest, ChatResponse, ComandoTexto
+from services.stt import (
+    STTConfigurationError,
+    STTConnectionError,
+    STTEmptyTranscriptionError,
+    STTError,
+    STTMalformedResponseError,
+    STTProvider,
+    STTProviderError,
+    STTRateLimitError,
+    STTTimeoutError,
+    STTValidationError,
+)
 
 router = APIRouter(tags=["audio"])
 
 import madeline_server as server
+
+
+def get_stt_provider() -> STTProvider:
+    """Resuelve la instancia del proveedor STT configurada en el servidor."""
+    return server.obtener_stt_provider()
 
 
 @router.post("/callar")
@@ -30,7 +46,8 @@ async def bienvenida_endpoint():
 @router.post("/comando_audio", response_model=ChatResponse)
 async def comando_audio_endpoint(
     audio: UploadFile = File(...),
-    origen: str = "pc"
+    origen: str = "pc",
+    provider: STTProvider = Depends(get_stt_provider),
 ):
     """Recibe audio, lo transcribe con Whisper y lo envía al cerebro."""
     origen = origen.lower().strip()
@@ -45,19 +62,61 @@ async def comando_audio_endpoint(
 
     try:
         contenido = await audio.read()
-        transcripcion = await asyncio.to_thread(
-            server.client.audio.transcriptions.create,
-            file=(audio.filename or "audio.wav", contenido),
-            model=os.getenv("MADELINE_WHISPER_MODELO", "whisper-large-v3-turbo"),
+        filename = audio.filename or "audio.wav"
+        mensaje_usuario = await provider.transcribir(
+            audio_bytes=contenido,
+            filename=filename,
             language="es",
             prompt=server.PISTA_VOCABULARIO,
+            model=os.getenv("MADELINE_WHISPER_MODELO", "whisper-large-v3-turbo"),
         )
-        mensaje_usuario = transcripcion.text.strip()
-    except RateLimitError:
+    except STTRateLimitError:
         return await server.responder_sin_cuota(origen)
+    except STTValidationError as e:
+        print(f"[ERROR WHISPER] Validación de audio fallida: {e}")
+        raise HTTPException(status_code=400, detail=f"Audio inválido: {e.mensaje}")
+    except STTTimeoutError as e:
+        print(f"[ERROR WHISPER] Timeout en transcripción: {e}")
+        raise HTTPException(
+            status_code=504,
+            detail="Error procesando el audio: tiempo de espera agotado.",
+        )
+    except STTConfigurationError as e:
+        print(f"[ERROR WHISPER] Error de configuración: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error de configuración del servicio de audio: {e.mensaje}",
+        )
+    except STTConnectionError as e:
+        print(f"[ERROR WHISPER] Error de conexión: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error de conexión con el proveedor de audio: {e.mensaje}",
+        )
+    except STTEmptyTranscriptionError as e:
+        print(f"[ERROR WHISPER] Transcripción vacía / sin voz: {e}")
+        raise HTTPException(status_code=400, detail="No se detectó voz.")
+    except STTMalformedResponseError as e:
+        print(f"[ERROR WHISPER] Respuesta malformada: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando el audio: {e.mensaje}",
+        )
+    except STTProviderError as e:
+        print(f"[ERROR WHISPER] Error del proveedor: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error procesando el audio: {e.mensaje}",
+        )
+    except asyncio.CancelledError:
+        raise
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[ERROR WHISPER] {e}")
+        print(f"[ERROR WHISPER] Error inesperado: {e}")
         raise HTTPException(status_code=500, detail=f"Error procesando el audio: {e}")
+
+    mensaje_usuario = mensaje_usuario.strip()
 
     if re.search(server.ALUCINACIONES_WHISPER, mensaje_usuario, re.IGNORECASE):
         mensaje_usuario = ""

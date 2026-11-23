@@ -29,6 +29,7 @@ Verifica:
 26. El flujo conversacional del núcleo opera exclusivamente vía LLMProvider sin acceder al SDK de Groq.
 """
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -77,6 +78,8 @@ class MockAgnosticLLMProvider(LLMProvider):
         self._nombre = "mock_agnostico"
         self.solicitudes: list[LLMRequest] = []
         self._respuestas_cola: list[Any] = list(respuestas or [])
+        self.vision_calls: list[dict[str, Any]] = []
+        self._vision_respuestas_cola: list[Any] = []
 
     @property
     def nombre(self) -> str:
@@ -84,6 +87,9 @@ class MockAgnosticLLMProvider(LLMProvider):
 
     def encolar_respuesta(self, resp_o_exc: Any) -> None:
         self._respuestas_cola.append(resp_o_exc)
+
+    def encolar_respuesta_vision(self, resp_o_exc: Any) -> None:
+        self._vision_respuestas_cola.append(resp_o_exc)
 
     async def generar_respuesta(self, solicitud: LLMRequest) -> LLMResponse:
         self.solicitudes.append(solicitud)
@@ -105,6 +111,17 @@ class MockAgnosticLLMProvider(LLMProvider):
         pregunta: str,
         model: Optional[str] = None,
     ) -> str:
+        self.vision_calls.append({
+            "imagen_bytes": imagen_bytes,
+            "extension": extension,
+            "pregunta": pregunta,
+            "model": model,
+        })
+        if self._vision_respuestas_cola:
+            siguiente = self._vision_respuestas_cola.pop(0)
+            if isinstance(siguiente, Exception):
+                raise siguiente
+            return siguiente
         return "Visión mock"
 
 
@@ -838,6 +855,522 @@ class TestLLMCoreIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.response, "Respuesta completamente independiente de Groq.")
         self.assertEqual(len(proveedor_externo.solicitudes), 1)
         self.assertIsInstance(proveedor_externo.solicitudes[0], LLMRequest)
+
+    async def test_analizar_pantalla_despacha_via_llm_provider_sin_acceder_al_sdk_groq(self):
+        """27. analizar_pantalla delega en prov.analizar_vision() sin invocar client.chat.completions.create."""
+        captura_id = "test_vision_01"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRdummy_png")
+
+        self.mock_provider.encolar_respuesta_vision("Veo una ventana con VS Code abierta.")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+                with mock.patch.object(ms.client.chat.completions, "create") as mock_groq_create:
+                    texto = await ms.analizar_pantalla("¿qué ventana tengo abierta?")
+                    mock_groq_create.assert_not_called()
+
+            self.assertEqual(texto, "Veo una ventana con VS Code abierta.")
+            self.assertEqual(len(self.mock_provider.vision_calls), 1)
+            call = self.mock_provider.vision_calls[0]
+            self.assertEqual(call["extension"], "png")
+            self.assertEqual(call["pregunta"], "¿qué ventana tengo abierta?")
+            self.assertEqual(call["model"], ms.MODEL_VISION)
+            self.assertEqual(ms.ULTIMA_CAPTURA_ANALISIS, captura_id)
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_analizar_pantalla_asincrono_no_bloquea_event_loop(self):
+        """28. analizar_pantalla es una función asíncrona (coroutine) que no bloquea la concurrencia."""
+        import inspect
+        self.assertTrue(inspect.iscoroutinefunction(ms.analizar_pantalla))
+
+        captura_id = "test_vision_async_02"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        flag_concurrente = False
+
+        async def _tarea_concurrente():
+            nonlocal flag_concurrente
+            await asyncio.sleep(0.005)
+            flag_concurrente = True
+
+        async def _vision_lenta(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return "Análisis asíncrono completado."
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+                with mock.patch.object(self.mock_provider, "analizar_vision", side_effect=_vision_lenta):
+                    t1 = asyncio.create_task(_tarea_concurrente())
+                    t2 = asyncio.create_task(ms.analizar_pantalla("¿qué ves?"))
+                    res_vision, _ = await asyncio.gather(t2, t1)
+
+            self.assertEqual(res_vision, "Análisis asíncrono completado.")
+            self.assertTrue(flag_concurrente, "La tarea concurrente debió progresar mientras corría el análisis de visión.")
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_analizar_pantalla_flujo_completo_chat_router_local(self):
+        """29. Pedido de visión vía router local se resuelve de forma no bloqueante y adjunta imagen."""
+        captura_id = "test_vision_router_03"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        self.mock_provider.encolar_respuesta_vision("Hay un navegador con documentación técnica.")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+                resp = await ms.procesar_mensaje(
+                    ms.ChatRequest(message="analiza mi pantalla y dime qué ves"),
+                    origen="pc"
+                )
+
+            self.assertIn("Hay un navegador con documentación técnica.", resp.response)
+            self.assertEqual(resp.image_path, f"/captura/{captura_id}")
+            self.assertEqual(ms.ULTIMA_CAPTURA_ANALISIS, captura_id)
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_analizar_pantalla_flujo_completo_chat_tool_call(self):
+        """30. LLM invocando tool call analizar_pantalla ejecuta la corrutina con await y adjunta imagen."""
+        captura_id = "test_vision_tool_04"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        # El LLM decide invocar la herramienta analizar_pantalla
+        self.mock_provider.encolar_respuesta(
+            LLMResponse(
+                tool_calls=[
+                    LLMToolCall(
+                        id="call_vision_123",
+                        nombre="analizar_pantalla",
+                        argumentos={"pregunta": "mira esto detalladamente"},
+                    )
+                ]
+            )
+        )
+        self.mock_provider.encolar_respuesta_vision("Es un diagrama de arquitectura limpia.")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+                resp = await ms.procesar_mensaje(
+                    ms.ChatRequest(message="Mira esto detalladamente"),
+                    origen="pc"
+                )
+
+            self.assertIn("Es un diagrama de arquitectura limpia.", resp.response)
+            self.assertEqual(resp.image_path, f"/captura/{captura_id}")
+            self.assertEqual(ms.ULTIMA_CAPTURA_ANALISIS, captura_id)
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_analizar_pantalla_manejo_error_rate_limit(self):
+        """31. LLMRateLimitError en visión entrega mensaje amigable y limpia el archivo temporal."""
+        captura_id = "test_vision_rl_05"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        self.mock_provider.encolar_respuesta_vision(
+            LLMRateLimitError("Cuota agotada en visión", provider="groq")
+        )
+
+        with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+            res = await ms.analizar_pantalla("¿qué ves?")
+
+        self.assertIn("me quedé sin cuota de Groq por ahora", res)
+        self.assertFalse(os.path.exists(ruta_tmp), "El archivo temporal debió eliminarse al fallar el análisis.")
+        self.assertIsNone(ms.ULTIMA_CAPTURA_ANALISIS)
+
+    async def test_analizar_pantalla_manejo_error_timeout(self):
+        """32. LLMTimeoutError en visión entrega mensaje claro y limpia el archivo temporal."""
+        captura_id = "test_vision_to_06"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        self.mock_provider.encolar_respuesta_vision(
+            LLMTimeoutError("Timeout de conexión con visión", provider="groq")
+        )
+
+        with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+            res = await ms.analizar_pantalla("¿qué ves?")
+
+        self.assertIn("tiempo de espera se agotó", res)
+        self.assertFalse(os.path.exists(ruta_tmp))
+        self.assertIsNone(ms.ULTIMA_CAPTURA_ANALISIS)
+
+    async def test_analizar_pantalla_manejo_error_llm_general(self):
+        """33. LLMError general en visión es capturado con registro y limpieza sin lanzar excepción no controlada."""
+        captura_id = "test_vision_err_07"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        self.mock_provider.encolar_respuesta_vision(
+            LLMError("Fallo interno del modelo de visión", provider="groq")
+        )
+
+        with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+            res = await ms.analizar_pantalla("¿qué ves?")
+
+        self.assertIn("No pude analizar la pantalla: Fallo interno del modelo de visión", res)
+        self.assertFalse(os.path.exists(ruta_tmp))
+        self.assertIsNone(ms.ULTIMA_CAPTURA_ANALISIS)
+
+    async def test_analizar_pantalla_respuesta_vacia_modelo_pensando(self):
+        """34. Respuesta vacía de visión (thinking sin respuesta final) produce aviso amigable."""
+        captura_id = "test_vision_empty_08"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        self.mock_provider.encolar_respuesta_vision("")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+                res = await ms.analizar_pantalla("¿qué ves?")
+
+            self.assertIn("El modelo se quedó pensando y no llegó a responder a tiempo", res)
+            self.assertIsNone(ms.ULTIMA_CAPTURA_ANALISIS)
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_analizar_pantalla_compatibilidad_invocacion_sincrona(self):
+        """35. ejecutar_comando_local('analizar_pantalla', ...) soporta ejecución síncrona sin loop activo."""
+        import concurrent.futures
+
+        captura_id = "test_vision_sync_09"
+        ruta_tmp = f"/tmp/captura_madeline_{captura_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        self.mock_provider.encolar_respuesta_vision("Ejecución síncrona exitosa.")
+
+        def _llamar_en_hilo_sin_loop():
+            # En un hilo separado no hay event loop activo por defecto
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{captura_id}"):
+                return ms.ejecutar_comando_local("analizar_pantalla", {"pregunta": "sync check"})
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                res_sync = await asyncio.to_thread(_llamar_en_hilo_sin_loop)
+
+            self.assertEqual(res_sync, "Ejecución síncrona exitosa.")
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_analisis_simultaneo_pc_telefono_orden_inverso_y_aislamiento_capturas(self):
+        """36. Dos análisis simultáneos (PC y Teléfono) con finalización en orden inverso aíslan sus capturas."""
+        cap_pc = "simultaneo_pc_10"
+        cap_tel = "simultaneo_tel_10"
+        ruta_pc = f"/tmp/captura_madeline_{cap_pc}.png"
+        ruta_tel = f"/tmp/captura_madeline_{cap_tel}.png"
+
+        with open(ruta_pc, "wb") as f:
+            f.write(b"\x89PNG\r\npc")
+        with open(ruta_tel, "wb") as f:
+            f.write(b"\x89PNG\r\ntel")
+
+        # Mock de captura para entregar el ID correspondiente a cada invocación
+        llamadas_captura = []
+
+        def _mock_tomar_captura(ancho_max=1280):
+            if not llamadas_captura:
+                llamadas_captura.append(cap_pc)
+                return ms.Resultado(ok=True, mensaje=f"CAPTURA_LISTA:{cap_pc}", evidencia={"captura_id": cap_pc})
+            llamadas_captura.append(cap_tel)
+            return ms.Resultado(ok=True, mensaje=f"CAPTURA_LISTA:{cap_tel}", evidencia={"captura_id": cap_tel})
+
+        # Mock de visión: Teléfono termina PRIMERO (0.01s), PC termina SEGUNDO (0.04s)
+        async def _mock_analizar_vision(imagen_bytes, extension, pregunta, model=None):
+            if b"pc" in imagen_bytes or "pc" in pregunta:
+                await asyncio.sleep(0.04)
+                return "Análisis para PC completado"
+            await asyncio.sleep(0.01)
+            return "Análisis para Teléfono completado"
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", side_effect=_mock_tomar_captura):
+                with mock.patch.object(self.mock_provider, "analizar_vision", side_effect=_mock_analizar_vision):
+                    # Despachar simultáneamente desde PC y Teléfono
+                    task_pc = asyncio.create_task(
+                        ms.procesar_mensaje(ms.ChatRequest(message="analiza mi pantalla y dime de pc"), origen="pc")
+                    )
+                    task_tel = asyncio.create_task(
+                        ms.procesar_mensaje(ms.ChatRequest(message="analiza mi pantalla y dime de tel"), origen="telefono")
+                    )
+                    resp_pc, resp_tel = await asyncio.gather(task_pc, task_tel)
+
+            # Verificar que no hubo asociación cruzada a pesar del orden de finalización invertido
+            self.assertIn("Análisis para PC completado", resp_pc.response)
+            self.assertEqual(resp_pc.image_path, f"/captura/{cap_pc}")
+
+            self.assertIn("Análisis para Teléfono completado", resp_tel.response)
+            self.assertEqual(resp_tel.image_path, f"/captura/{cap_tel}")
+
+            # Ambas capturas deben permanecer en disco para que /captura/{id} las entregue al cliente
+            self.assertTrue(os.path.exists(ruta_pc))
+            self.assertTrue(os.path.exists(ruta_tel))
+        finally:
+            if os.path.exists(ruta_pc):
+                os.remove(ruta_pc)
+            if os.path.exists(ruta_tel):
+                os.remove(ruta_tel)
+
+    async def test_analisis_simultaneo_uno_exitoso_otro_falla_no_corrompe_captura(self):
+        """37. Una inferencia exitosa simultánea con una fallida no pierde ni borra la captura exitosa."""
+        cap_ok = "simultaneo_ok_11"
+        cap_fail = "simultaneo_fail_11"
+        ruta_ok = f"/tmp/captura_madeline_{cap_ok}.png"
+        ruta_fail = f"/tmp/captura_madeline_{cap_fail}.png"
+
+        with open(ruta_ok, "wb") as f:
+            f.write(b"\x89PNG\r\nok")
+        with open(ruta_fail, "wb") as f:
+            f.write(b"\x89PNG\r\nfail")
+
+        llamadas = []
+
+        def _mock_captura(ancho_max=1280):
+            if not llamadas:
+                llamadas.append(cap_ok)
+                return ms.Resultado(ok=True, mensaje=f"CAPTURA_LISTA:{cap_ok}", evidencia={"captura_id": cap_ok})
+            llamadas.append(cap_fail)
+            return ms.Resultado(ok=True, mensaje=f"CAPTURA_LISTA:{cap_fail}", evidencia={"captura_id": cap_fail})
+
+        async def _mock_vision(imagen_bytes, extension, pregunta, model=None):
+            if b"ok" in imagen_bytes or "ok" in pregunta:
+                await asyncio.sleep(0.03)
+                return "Inferencia exitosa de PC"
+            await asyncio.sleep(0.01)
+            raise LLMRateLimitError("Cuota agotada en visión móvil", provider="groq")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", side_effect=_mock_captura):
+                with mock.patch.object(self.mock_provider, "analizar_vision", side_effect=_mock_vision):
+                    task_ok = asyncio.create_task(
+                        ms.procesar_mensaje(ms.ChatRequest(message="analiza mi pantalla y consulta ok"), origen="pc")
+                    )
+                    task_fail = asyncio.create_task(
+                        ms.procesar_mensaje(ms.ChatRequest(message="analiza mi pantalla y consulta fail"), origen="telefono")
+                    )
+                    resp_ok, resp_fail = await asyncio.gather(task_ok, task_fail)
+
+            # La solicitud exitosa conserva su imagen y respuesta
+            self.assertIn("Inferencia exitosa de PC", resp_ok.response)
+            self.assertEqual(resp_ok.image_path, f"/captura/{cap_ok}")
+            self.assertTrue(os.path.exists(ruta_ok), "La captura exitosa debe preservarse en disco.")
+
+            # La solicitud fallida no tiene imagen y su archivo temporal fue limpiado
+            self.assertIn("me quedé sin cuota de Groq por ahora", resp_fail.response)
+            self.assertIsNone(resp_fail.image_path)
+            self.assertFalse(os.path.exists(ruta_fail), "La captura fallida debe eliminarse de disco.")
+        finally:
+            if os.path.exists(ruta_ok):
+                os.remove(ruta_ok)
+            if os.path.exists(ruta_fail):
+                os.remove(ruta_fail)
+
+    async def test_cancelacion_durante_inferencia_vision_limpia_archivo(self):
+        """38. Cancelar el await durante la inferencia de visión elimina el archivo temporal sin dejar huérfanos."""
+        cap_id = "cancel_infer_12"
+        ruta_tmp = f"/tmp/captura_madeline_{cap_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndummy")
+
+        evento_inicio_vision = asyncio.Event()
+
+        async def _vision_lenta(*args, **kwargs):
+            evento_inicio_vision.set()
+            await asyncio.sleep(1.0)
+            return "No debería llegar aquí"
+
+        with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{cap_id}"):
+            with mock.patch.object(self.mock_provider, "analizar_vision", side_effect=_vision_lenta):
+                task = asyncio.create_task(ms.analizar_pantalla("¿qué ves?"))
+                await evento_inicio_vision.wait()
+                # Cancelar la tarea mientras espera en el proveedor de visión
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        # El bloque de cancelación debió eliminar el archivo temporal
+        self.assertFalse(os.path.exists(ruta_tmp), "El archivo temporal debió eliminarse al cancelarse la tarea.")
+
+    async def test_cancelacion_durante_creacion_captura_limpia_post_terminacion(self):
+        """39. Cancelar el await mientras el worker thread ejecuta tomar_captura() limpia el archivo al terminar."""
+        cap_id = "cancel_screen_13"
+        ruta_tmp = f"/tmp/captura_madeline_{cap_id}.png"
+
+        def _tomar_captura_lenta(ancho_max=1280):
+            time.sleep(0.04)
+            with open(ruta_tmp, "wb") as f:
+                f.write(b"\x89PNG\r\ncreada_por_worker")
+            return ms.Resultado(ok=True, mensaje=f"CAPTURA_LISTA:{cap_id}", evidencia={"captura_id": cap_id})
+
+        with mock.patch.object(ms, "tomar_captura", side_effect=_tomar_captura_lenta):
+            task = asyncio.create_task(ms.analizar_pantalla("¿qué ves?"))
+            # Cancelar inmediatamente antes de que el worker termine
+            await asyncio.sleep(0.005)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        # Esperar a que el worker thread en segundo plano termine de ejecutar
+        await asyncio.sleep(0.08)
+
+        # El callback del executor debió limpiar el archivo post-terminación sin interrumpir el worker
+        self.assertFalse(os.path.exists(ruta_tmp), "El worker terminado debió ser limpiado por el callback del executor.")
+
+    async def test_preservacion_captura_exitosa_para_entrega_cliente(self):
+        """40. Las capturas de análisis exitosos no se eliminan y quedan listas para /captura/{id}."""
+        cap_id = "deliver_ok_14"
+        ruta_tmp = f"/tmp/captura_madeline_{cap_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ndata")
+
+        self.mock_provider.encolar_respuesta_vision("Ventana de terminal activa.")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{cap_id}"):
+                res = await ms.analizar_pantalla("¿qué ventana tengo?")
+
+            self.assertTrue(res.ok)
+            self.assertEqual(res.evidencia.get("captura_id"), cap_id)
+            self.assertTrue(os.path.exists(ruta_tmp), "El archivo temporal debe preservarse para la entrega al usuario.")
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_despacho_asincrono_con_awaitables_y_compatibilidad_sincrona(self):
+        """41. ejecutar_comandos_locales_async despacha herramientas síncronas y awaitables sin advertencias de runtime."""
+        # Herramienta síncrona
+        res_sync = ms.ejecutar_comando_local("volumen", {"accion": "fijar", "porcentaje": 35})
+        self.assertFalse(inspect.isawaitable(res_sync))
+
+        # Herramienta asíncrona
+        res_async = ms.ejecutar_comando_local("analizar_pantalla", {"pregunta": "test awaitable"})
+        self.assertTrue(inspect.isawaitable(res_async))
+        res_async.close()
+
+        # Despacho combinado en ejecutar_comandos_locales_async
+        cap_id = "combined_15"
+        ruta_tmp = f"/tmp/captura_madeline_{cap_id}.png"
+        with open(ruta_tmp, "wb") as f:
+            f.write(b"\x89PNG\r\ncombined")
+
+        self.mock_provider.encolar_respuesta_vision("Pantalla analizada en despacho mixto.")
+
+        try:
+            with mock.patch.object(ms, "tomar_captura", return_value=f"CAPTURA_LISTA:{cap_id}"):
+                resultados = await ms.ejecutar_comandos_locales_async([
+                    ("volumen", {"accion": "fijar", "porcentaje": 40}),
+                    ("analizar_pantalla", {"pregunta": "test"}),
+                ])
+
+            self.assertEqual(len(resultados), 2)
+            self.assertEqual(resultados[0][0], "volumen")
+            self.assertTrue(resultados[0][2].ok)
+
+            self.assertEqual(resultados[1][0], "analizar_pantalla")
+            self.assertTrue(resultados[1][2].ok)
+            self.assertEqual(resultados[1][2].evidencia.get("captura_id"), cap_id)
+        finally:
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    async def test_cancelacion_en_ventana_post_worker_captura_holder_limpia_archivo(self):
+        """42. Cancelación en la ventana residual (worker terminó con cancel_token=False pero corrutina cancelada)."""
+        cap_id = "holder_clean_16"
+        ruta_tmp = f"/tmp/captura_madeline_{cap_id}.png"
+
+        def _worker_tomar_captura(ancho_max=1280):
+            with open(ruta_tmp, "wb") as f:
+                f.write(b"\x89PNG\r\ncreada_por_worker_post")
+            return ms.Resultado(ok=True, mensaje=f"CAPTURA_LISTA:{cap_id}", evidencia={"captura_id": cap_id})
+
+        real_to_thread = asyncio.to_thread
+
+        async def _to_thread_cancelado_justo_al_terminar_worker(func, *args, **kwargs):
+            # Ejecuta el worker normalmente: se guarda en captura_holder y cancel_token es False
+            res = await real_to_thread(func, *args, **kwargs)
+            # Simula que la tarea asyncio recibió cancelación inmediatamente tras la finalización del worker
+            raise asyncio.CancelledError()
+
+        with mock.patch.object(ms, "tomar_captura", side_effect=_worker_tomar_captura):
+            with mock.patch("asyncio.to_thread", side_effect=_to_thread_cancelado_justo_al_terminar_worker):
+                with self.assertRaises(asyncio.CancelledError):
+                    await ms.analizar_pantalla("¿qué ves?")
+
+        # captura_holder debió permitir al bloque except CancelledError limpiar el archivo creado
+        self.assertFalse(os.path.exists(ruta_tmp), "El archivo debió eliminarse mediante captura_holder en la ventana residual.")
+
+    async def test_solicitud_sin_evidencia_no_consume_captura_global_de_otra(self):
+        """43. Una solicitud cuya herramienta no aporta evidencia no asocia captura ni consume la global de otra."""
+        cap_global_ajena = "global_ajena_17"
+        ruta_ajena = f"/tmp/captura_madeline_{cap_global_ajena}.png"
+        with open(ruta_ajena, "wb") as f:
+            f.write(b"\x89PNG\r\najena")
+
+        # Se fija una captura global previa (simulando otra solicitud o estado residual externo)
+        ms.ULTIMA_CAPTURA_ANALISIS = cap_global_ajena
+
+        # Resultado de herramienta sin evidencia de captura_id
+        resultado_sin_evidencia = ms.Resultado(
+            ok=True,
+            mensaje="Análisis completado sin captura asociada",
+            evidencia={},
+        )
+
+        try:
+            # 1. Camino router local
+            with mock.patch.object(ms, "ejecutar_comandos_locales_async", return_value=[
+                ("analizar_pantalla", {"pregunta": "dime qué ves"}, resultado_sin_evidencia)
+            ]):
+                req = ms.ChatRequest(message="analiza mi pantalla y dime qué ves")
+                resp = await ms.procesar_mensaje(req, origen="pc")
+
+            # No debe asociar imagen porque falta evidencia individual
+            self.assertIsNone(resp.image_path, "No debe asociarse imagen si falta evidencia individual.")
+            # La variable global de compatibilidad externa no debe haber sido consumida como fallback
+            self.assertEqual(ms.ULTIMA_CAPTURA_ANALISIS, cap_global_ajena)
+            self.assertTrue(os.path.exists(ruta_ajena), "El archivo ajeno no debe ser alterado.")
+
+            # 2. Camino tool calls
+            self.mock_provider.encolar_respuesta(
+                LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            id="tc_sin_evidencia",
+                            nombre="analizar_pantalla",
+                            argumentos={"pregunta": "mira esto"},
+                        )
+                    ]
+                )
+            )
+            with mock.patch.dict(ms.TOOLS_FUNCIONES, {"analizar_pantalla": mock.AsyncMock(return_value=resultado_sin_evidencia)}):
+                resp_tool = await ms.procesar_mensaje(ms.ChatRequest(message="Mira esto detalladamente"), origen="pc")
+
+            self.assertIsNone(resp_tool.image_path, "Tool call sin evidencia no debe asociar imagen.")
+            self.assertEqual(ms.ULTIMA_CAPTURA_ANALISIS, cap_global_ajena)
+            self.assertTrue(os.path.exists(ruta_ajena))
+        finally:
+            ms.ULTIMA_CAPTURA_ANALISIS = None
+            if os.path.exists(ruta_ajena):
+                os.remove(ruta_ajena)
 
 
 if __name__ == "__main__":
