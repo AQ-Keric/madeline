@@ -2,7 +2,8 @@
 
 Provee la interfaz común LLMProvider, modelos de dominio LLMMessage, LLMRole,
 LLMToolDefinition, LLMToolChoice, LLMRequest, LLMResponse y LLMToolCall,
-la jerarquía canónica de excepciones y adaptadores concretos como GroqProvider.
+la jerarquía canónica de excepciones, el coordinador local OllamaCoordinator,
+la fábrica crear_proveedor_llm y adaptadores concretos (GroqProvider, OllamaProvider).
 """
 
 from .base import (
@@ -16,6 +17,12 @@ from .base import (
     LLMToolChoiceMode,
     LLMToolDefinition,
 )
+from .coordinator import (
+    EstadoEndpoint,
+    EstadoTicket,
+    OllamaCoordinator,
+    SlotTicket,
+)
 from .exceptions import (
     LLMConfigurationError,
     LLMConnectionError,
@@ -27,7 +34,10 @@ from .exceptions import (
     LLMToolCallRejectionError,
     LLMValidationError,
 )
+from .factory import crear_proveedor_llm
 from .providers.groq import GroqProvider
+from .providers.ollama import OllamaProvider
+from .providers.ollama_lifecycle import OllamaServerManager
 
 __all__ = [
     "LLMProvider",
@@ -40,6 +50,13 @@ __all__ = [
     "LLMToolChoice",
     "LLMToolChoiceMode",
     "GroqProvider",
+    "OllamaProvider",
+    "OllamaServerManager",
+    "OllamaCoordinator",
+    "EstadoTicket",
+    "EstadoEndpoint",
+    "SlotTicket",
+    "crear_proveedor_llm",
     "LLMError",
     "LLMConfigurationError",
     "LLMRateLimitError",
